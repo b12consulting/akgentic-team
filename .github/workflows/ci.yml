@@ -26,6 +26,14 @@ jobs:
           git fetch origin ${{ github.head_ref || github.ref_name }}
           git checkout FETCH_HEAD
 
+      - name: Ensure team package in workspace
+        run: |
+          if ! grep -q 'akgentic-team' pyproject.toml; then
+            sed -i 's/"akgentic-catalog",/"akgentic-catalog",\n    "akgentic-team",/' pyproject.toml
+            sed -i 's|"packages/akgentic-catalog",|"packages/akgentic-catalog",\n    "packages/akgentic-team",|' pyproject.toml
+            sed -i 's/akgentic-catalog = { workspace = true }/akgentic-catalog = { workspace = true }\nakgentic-team = { workspace = true }/' pyproject.toml
+          fi
+
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
