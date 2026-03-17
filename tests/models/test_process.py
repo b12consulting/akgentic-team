@@ -42,13 +42,13 @@ class TestTeamStatus:
             assert isinstance(status, str)
 
     def test_string_comparison_running(self) -> None:
-        assert TeamStatus.RUNNING == "running"
+        assert TeamStatus.RUNNING.value == "running"
 
     def test_string_comparison_stopped(self) -> None:
-        assert TeamStatus.STOPPED == "stopped"
+        assert TeamStatus.STOPPED.value == "stopped"
 
     def test_string_comparison_deleted(self) -> None:
-        assert TeamStatus.DELETED == "deleted"
+        assert TeamStatus.DELETED.value == "deleted"
 
 
 class TestProcess:
@@ -127,7 +127,7 @@ class TestPersistedEvent:
         data = event.model_dump()
         restored = PersistedEvent.model_validate(data)
         assert type(restored.event) is UserMessage
-        assert restored.event.content == "hello world"  # type: ignore[attr-defined]
+        assert restored.event.content == "hello world"
 
     def test_polymorphic_event_is_not_base_message(self) -> None:
         user_msg = UserMessage(content="specific")
@@ -137,7 +137,7 @@ class TestPersistedEvent:
         assert type(restored.event) is not Message
 
 
-class SampleAgentStateSnapshot:
+class TestAgentStateSnapshot:
     """Tests for AgentStateSnapshot model."""
 
     def test_construction(self) -> None:
@@ -159,7 +159,7 @@ class SampleAgentStateSnapshot:
         data = snapshot.model_dump()
         restored = AgentStateSnapshot.model_validate(data)
         assert type(restored.state) is SampleAgentState
-        assert restored.state.task_count == 10  # type: ignore[attr-defined]
+        assert restored.state.task_count == 10
 
     def test_polymorphic_state_is_not_base_state(self) -> None:
         state = SampleAgentState(task_count=3)

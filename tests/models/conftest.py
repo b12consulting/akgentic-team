@@ -11,7 +11,7 @@ from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.core.messages.message import UserMessage
+from akgentic.core.messages.message import Message, UserMessage
 
 from akgentic.team.models import (
     AgentStateSnapshot,
@@ -190,7 +190,7 @@ def make_process(
 def make_persisted_event(
     team_id: uuid.UUID | None = None,
     sequence: int = 0,
-    event: UserMessage | None = None,
+    event: Message | None = None,
 ) -> PersistedEvent:
     """Create a PersistedEvent with sensible defaults for testing.
 
