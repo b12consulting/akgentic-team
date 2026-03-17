@@ -6,6 +6,7 @@ re-exported here via explicit __all__.
 
 from __future__ import annotations
 
+from akgentic.team.factory import TeamFactory
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -33,6 +34,7 @@ __all__: list[str] = [
     "ServiceRegistry",
     "TeamCard",
     "TeamCardMember",
+    "TeamFactory",
     "TeamRuntime",
     "TeamStatus",
 ]
