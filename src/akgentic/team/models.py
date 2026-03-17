@@ -7,6 +7,8 @@ AgentStateSnapshot.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import Field, PrivateAttr
@@ -15,6 +17,7 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
+from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -283,3 +286,60 @@ class TeamRuntime(SerializableBaseModel):
     def supervisor_proxies(self) -> dict[str, Akgent[Any, Any]]:
         """Read-only access to the supervisor proxies."""
         return self._supervisor_proxies
+
+
+# --- Persistence Models ---
+
+
+class TeamStatus(StrEnum):
+    """Lifecycle states for a team instance."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+    DELETED = "deleted"
+
+
+class Process(SerializableBaseModel):
+    """Persisted team metadata for crash recovery.
+
+    Stores the TeamCard blueprint so the team can be rebuilt on resume,
+    along with lifecycle status and audit fields. This is NOT the
+    TeamRuntime -- addresses are stale after stop/crash.
+    """
+
+    team_id: uuid.UUID = Field(description="Unique identifier for this team instance")
+    team_card: TeamCard = Field(description="Declarative team definition for rebuilding on resume")
+    status: TeamStatus = Field(description="Current lifecycle state of the team")
+    user_id: str = Field(default="cli", description="Identifier of the user who owns this team")
+    user_email: str = Field(default="", description="Email of the user who owns this team")
+    created_at: datetime = Field(description="Timestamp when the team was created")
+    updated_at: datetime = Field(description="Timestamp of the last status change")
+
+
+class PersistedEvent(SerializableBaseModel):
+    """Append-only event log entry for event-sourced persistence.
+
+    Each entry captures a single event (Message subclass) with its
+    sequence number for ordered replay during team restoration.
+    """
+
+    team_id: uuid.UUID = Field(description="Team instance this event belongs to")
+    sequence: int = Field(description="Monotonically increasing event sequence number")
+    event: Message = Field(description="Polymorphic event payload preserving concrete Message type")
+    timestamp: datetime = Field(description="Timestamp when the event was persisted")
+
+
+class AgentStateSnapshot(SerializableBaseModel):
+    """Overwrite-strategy snapshot of an agent's state.
+
+    Captures the latest state of a single agent for fast recovery
+    without full event replay. Each snapshot overwrites the previous
+    one for the same (team_id, agent_id) pair.
+    """
+
+    team_id: uuid.UUID = Field(description="Team instance this snapshot belongs to")
+    agent_id: str = Field(description="Identifier of the agent whose state is captured")
+    state: BaseState = Field(
+        description="Polymorphic agent state preserving concrete BaseState type"
+    )
+    updated_at: datetime = Field(description="Timestamp when the snapshot was taken")
