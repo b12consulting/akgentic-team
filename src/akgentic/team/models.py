@@ -103,8 +103,18 @@ class TeamCard(SerializableBaseModel):
         Args:
             member: The member node to start from.
             result: Accumulator dict to populate with discovered cards.
+
+        Raises:
+            ValueError: If a duplicate config name is detected in the tree.
         """
-        result[member.card.config.name] = member.card
+        name = member.card.config.name
+        if name in result:
+            msg = (
+                f"Duplicate config name '{name}' in team member tree. "
+                f"Each AgentCard must have a unique config.name."
+            )
+            raise ValueError(msg)
+        result[name] = member.card
         for child in member.members:
             TeamCard._collect_cards(child, result)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
+
 from akgentic.team.models import TeamCard, TeamCardMember
 
 
@@ -49,7 +50,7 @@ def make_team_card(
     )
     members: list[TeamCardMember] = []
     if member_names and member_roles:
-        for mname, mrole in zip(member_names, member_roles):
+        for mname, mrole in zip(member_names, member_roles, strict=True):
             members.append(
                 TeamCardMember(card=make_agent_card(name=mname, role=mrole)),
             )

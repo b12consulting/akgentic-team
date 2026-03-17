@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 from akgentic.core.agent_card import AgentCard
-from akgentic.core.agent_config import BaseConfig
+from akgentic.core.messages import UserMessage
+
 from akgentic.team.models import TeamCard, TeamCardMember
 
 from .conftest import make_agent_card, make_team_card
@@ -119,6 +121,37 @@ class TestTeamCard:
         team = make_team_card()
         assert team.message_types == []
 
+    def test_agent_cards_raises_on_duplicate_config_name(self) -> None:
+        """agent_cards raises ValueError when two members share config.name."""
+        entry = TeamCardMember(card=make_agent_card(name="entry", role="Entry"))
+        dupe1 = TeamCardMember(card=make_agent_card(name="dupe", role="Role1"))
+        dupe2 = TeamCardMember(card=make_agent_card(name="dupe", role="Role2"))
+        team = TeamCard(
+            name="dupe-team",
+            description="Duplicate names",
+            entry_point=entry,
+            members=[dupe1, dupe2],
+        )
+        with pytest.raises(ValueError, match="Duplicate config name 'dupe'"):
+            team.agent_cards
+
+    def test_supervisors_includes_entry_point_with_subordinates(self) -> None:
+        """Entry point with subordinates is detected as a supervisor."""
+        child = TeamCardMember(card=make_agent_card(name="child", role="Child"))
+        entry = TeamCardMember(
+            card=make_agent_card(name="boss", role="Boss"),
+            members=[child],
+        )
+        team = TeamCard(
+            name="entry-sup-team",
+            description="Entry point supervises",
+            entry_point=entry,
+            members=[],
+        )
+        sups = team.supervisors
+        assert len(sups) == 1
+        assert sups[0].config.name == "boss"
+
 
 class TestTeamCardSerialization:
     """Tests for serialization round-trip of TeamCard and TeamCardMember."""
@@ -205,3 +238,19 @@ class TestTeamCardSerialization:
         restored = TeamCard.model_validate(dumped)
         assert restored.name == "singleton"
         assert set(restored.agent_cards.keys()) == {"only"}
+
+    def test_message_types_round_trip(self) -> None:
+        """message_types with actual type references survive round-trip."""
+        team = TeamCard(
+            name="typed-team",
+            description="Team with message types",
+            entry_point=TeamCardMember(
+                card=make_agent_card(name="entry", role="Entry"),
+            ),
+            members=[],
+            message_types=[UserMessage],
+        )
+        dumped = team.model_dump()
+        restored = TeamCard.model_validate(dumped)
+        assert len(restored.message_types) == 1
+        assert restored.message_types[0] is UserMessage
