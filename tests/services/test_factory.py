@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pytest
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
-from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 
 from akgentic.team.factory import TeamFactory
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
-
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -255,3 +254,20 @@ class TestTeamFactoryBuild:
         # lead has subordinates, so it's a supervisor
         assert "lead" in runtime.supervisor_addrs
         assert runtime.supervisor_addrs["lead"] == runtime.addrs["lead"]
+
+    def test_entry_point_headcount_gt1_raises(self, actor_system: ActorSystem) -> None:
+        """Entry point with headcount > 1 raises ValueError."""
+        ep = _make_member("lead", "Lead", headcount=2)
+        tc = _make_team_card(entry_point=ep)
+
+        with pytest.raises(ValueError, match="must have headcount=1"):
+            TeamFactory.build(tc, actor_system)
+
+    def test_rollback_handles_stop_failure(self, actor_system: ActorSystem) -> None:
+        """Rollback continues even if stopping an actor raises."""
+        failing = _make_member("failing", "Failing", agent_class=FailingAgent)
+        tc = _make_team_card(members=[failing])
+
+        with patch.object(ActorAddress, "stop", side_effect=RuntimeError("stop failed")):
+            with pytest.raises(RuntimeError, match="intentional error"):
+                TeamFactory.build(tc, actor_system)

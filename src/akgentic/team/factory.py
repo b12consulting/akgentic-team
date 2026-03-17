@@ -51,6 +51,13 @@ class TeamFactory:
         team_id = uuid.uuid4()
         spawned_addrs: list[ActorAddress] = []
 
+        if team_card.entry_point.headcount != 1:
+            msg = (
+                f"Entry point '{team_card.entry_point.card.config.name}' "
+                f"must have headcount=1, got {team_card.entry_point.headcount}"
+            )
+            raise ValueError(msg)
+
         try:
             # 1. Create Orchestrator
             orchestrator_addr = actor_system.createActor(
