@@ -6,7 +6,12 @@ re-exported here via explicit __all__.
 
 from __future__ import annotations
 
+from akgentic.team.models import TeamCard, TeamCardMember
+
 __version__ = "1.0.0-alpha.1"
 
-# Public types will be added as modules are implemented in Stories 1.2-1.5
-__all__: list[str] = ["__version__"]
+__all__: list[str] = [
+    "__version__",
+    "TeamCard",
+    "TeamCardMember",
+]
