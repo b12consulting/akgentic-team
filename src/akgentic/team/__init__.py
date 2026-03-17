@@ -6,13 +6,25 @@ re-exported here via explicit __all__.
 
 from __future__ import annotations
 
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import (
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamCard,
+    TeamCardMember,
+    TeamRuntime,
+    TeamStatus,
+)
 
 __version__ = "1.0.0-alpha.1"
 
 __all__: list[str] = [
     "__version__",
+    "AgentStateSnapshot",
+    "PersistedEvent",
+    "Process",
     "TeamCard",
     "TeamCardMember",
     "TeamRuntime",
+    "TeamStatus",
 ]

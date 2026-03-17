@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
+from akgentic.core.messages.message import UserMessage
 
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import (
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamCard,
+    TeamCardMember,
+    TeamRuntime,
+    TeamStatus,
+)
 
 
 def make_agent_card(
@@ -143,4 +154,80 @@ def make_team_runtime(
         entry_addr=make_stub_addr("entry"),
         supervisor_addrs=supervisor_addrs or {},
         addrs=addrs or {},
+    )
+
+
+class SampleAgentState(BaseState):
+    """Minimal BaseState subclass for testing polymorphic serialization."""
+
+    task_count: int = 0
+
+
+def make_process(
+    team_id: uuid.UUID | None = None,
+    team_card: TeamCard | None = None,
+    status: TeamStatus = TeamStatus.RUNNING,
+) -> Process:
+    """Create a Process with sensible defaults for testing.
+
+    Args:
+        team_id: Optional team identifier.
+        team_card: Optional pre-built TeamCard.
+        status: Lifecycle status.
+
+    Returns:
+        A Process with the specified or default configuration.
+    """
+    return Process(
+        team_id=team_id or uuid.uuid4(),
+        team_card=team_card or make_team_card(),
+        status=status,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+
+def make_persisted_event(
+    team_id: uuid.UUID | None = None,
+    sequence: int = 0,
+    event: UserMessage | None = None,
+) -> PersistedEvent:
+    """Create a PersistedEvent with sensible defaults for testing.
+
+    Args:
+        team_id: Optional team identifier.
+        sequence: Event sequence number.
+        event: Optional Message subclass instance.
+
+    Returns:
+        A PersistedEvent with the specified or default configuration.
+    """
+    return PersistedEvent(
+        team_id=team_id or uuid.uuid4(),
+        sequence=sequence,
+        event=event or UserMessage(content="test message"),
+        timestamp=datetime.now(UTC),
+    )
+
+
+def make_agent_state_snapshot(
+    team_id: uuid.UUID | None = None,
+    agent_id: str = "test-agent",
+    state: BaseState | None = None,
+) -> AgentStateSnapshot:
+    """Create an AgentStateSnapshot with sensible defaults for testing.
+
+    Args:
+        team_id: Optional team identifier.
+        agent_id: Agent identifier.
+        state: Optional BaseState subclass instance.
+
+    Returns:
+        An AgentStateSnapshot with the specified or default configuration.
+    """
+    return AgentStateSnapshot(
+        team_id=team_id or uuid.uuid4(),
+        agent_id=agent_id,
+        state=state or SampleAgentState(task_count=5),
+        updated_at=datetime.now(UTC),
     )
