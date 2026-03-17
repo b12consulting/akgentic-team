@@ -57,7 +57,7 @@ jobs:
       - name: Update coverage badge
         if: github.ref_name == 'master' && github.event_name == 'push'
         run: |
-          COVERAGE=$(python -c "import json; print(int(json.load(open('coverage.json'))['totals']['percent_covered_display']))")
+          COVERAGE=$(python -c "import json; print(round(float(json.load(open('coverage.json'))['totals']['percent_covered_display'])))")
           if [ "$COVERAGE" -ge 90 ]; then COLOR="brightgreen"
           elif [ "$COVERAGE" -ge 80 ]; then COLOR="green"
           elif [ "$COVERAGE" -ge 70 ]; then COLOR="yellow"
