@@ -1,1 +1,1 @@
-"""Tests for akgentic-template module."""
+"""Tests for the akgentic-team package."""
