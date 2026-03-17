@@ -1,5 +1,8 @@
 # akgentic-team
 
+[![CI](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/jltournay/708bb547b8679308d083be7beaf4448a/raw/coverage.json)](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml)
+
 **Status:** Alpha - 1.0.0-alpha.1
 
 Team lifecycle management for the Akgentic platform. Create, resume, stop, and delete multi-agent teams with event-sourced persistence and crash recovery.

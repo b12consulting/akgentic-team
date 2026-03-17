@@ -68,6 +68,6 @@ jobs:
           elif [ "$COVERAGE" -ge 70 ]; then COLOR="yellow"
           else COLOR="red"; fi
           echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"${COVERAGE}%\",\"color\":\"${COLOR}\"}" > badge.json
-          gh gist edit <GIST_ID> -f coverage.json badge.json
+          gh gist edit 708bb547b8679308d083be7beaf4448a -f coverage.json badge.json
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
