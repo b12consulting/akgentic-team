@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
-
 from akgentic.core.messages.message import UserMessage
+
 from akgentic.team.models import TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
+
+if TYPE_CHECKING:
+    from akgentic.team.ports import EventStore
 
 from tests.models.conftest import (
     SampleAgentState,
@@ -201,6 +205,13 @@ class TestYamlEventStore:
         assert isinstance(loaded[0].state, SampleAgentState)
         assert loaded[0].state.task_count == 5
 
+    # --- Protocol compliance ---
+
+    def test_satisfies_event_store_protocol(self, tmp_path: Path) -> None:
+        """AC9: YamlEventStore satisfies EventStore Protocol via structural subtyping."""
+        store: EventStore = YamlEventStore(tmp_path)
+        assert store is not None
+
     # --- Directory creation ---
 
     def test_directory_creation_is_automatic(
@@ -214,3 +225,37 @@ class TestYamlEventStore:
 
         loaded = yaml_store.load_events(team_id)
         assert len(loaded) == 1
+
+    # --- Corrupted data resilience ---
+
+    def test_load_team_returns_none_for_corrupted_yaml(self, tmp_path: Path) -> None:
+        """Corrupted team.yaml returns None instead of raising."""
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "team.yaml").write_text("{{invalid: yaml: [}")
+        assert store.load_team(team_id) is None
+
+    def test_load_events_returns_empty_for_corrupted_yaml(self, tmp_path: Path) -> None:
+        """Corrupted events.yaml returns empty list instead of raising."""
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "events.yaml").write_text("{{invalid: yaml: [}")
+        assert store.load_events(team_id) == []
+
+    def test_load_agent_states_skips_corrupted_files(self, tmp_path: Path) -> None:
+        """Corrupted state file is skipped; valid ones are still loaded."""
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        # Save a valid state first
+        snap = make_agent_state_snapshot(team_id=team_id, agent_id="good-agent")
+        store.save_agent_state(snap)
+        # Write a corrupted state file
+        states_dir = tmp_path / str(team_id) / "states"
+        (states_dir / "bad-agent.yaml").write_text("{{invalid: yaml: [}")
+        loaded = store.load_agent_states(team_id)
+        assert len(loaded) == 1
+        assert loaded[0].agent_id == "good-agent"

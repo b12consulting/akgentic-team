@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -42,6 +43,25 @@ class YamlEventStore:
     def __init__(self, data_dir: Path) -> None:
         self._data_dir = data_dir
 
+    @staticmethod
+    def _atomic_write(path: Path, data: dict[str, object]) -> None:
+        """Write YAML data atomically using write-to-temp-then-rename.
+
+        Prevents corrupted partial files if the process crashes mid-write.
+
+        Args:
+            path: Destination file path.
+            data: Dictionary to serialize as YAML.
+        """
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with open(fd, "w") as f:
+                yaml.dump(data, f, default_flow_style=False)
+            Path(tmp).replace(path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
     def _team_dir(self, team_id: uuid.UUID) -> Path:
         """Return the directory path for a specific team.
 
@@ -65,9 +85,7 @@ class YamlEventStore:
         team_dir = self._team_dir(process.team_id)
         team_dir.mkdir(parents=True, exist_ok=True)
         team_path = team_dir / "team.yaml"
-        data = process.model_dump()
-        with open(team_path, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
+        self._atomic_write(team_path, process.model_dump())
         logger.debug("Saved team %s to %s", process.team_id, team_path)
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
@@ -82,9 +100,15 @@ class YamlEventStore:
         team_path = self._team_dir(team_id) / "team.yaml"
         if not team_path.exists():
             return None
-        with open(team_path) as f:
-            data = yaml.safe_load(f)
-        return Process.model_validate(data)
+        try:
+            with open(team_path) as f:
+                data = yaml.safe_load(f)
+            process = Process.model_validate(data)
+        except (yaml.YAMLError, ValueError) as exc:
+            logger.error("Corrupted team.yaml for team %s: %s", team_id, exc)
+            return None
+        logger.debug("Loaded team %s from %s", team_id, team_path)
+        return process
 
     def save_event(self, event: PersistedEvent) -> None:
         """Append a persisted event to events.yaml.
@@ -120,9 +144,23 @@ class YamlEventStore:
         events_path = self._team_dir(team_id) / "events.yaml"
         if not events_path.exists():
             return []
-        with open(events_path) as f:
-            docs = list(yaml.safe_load_all(f))
-        events = [PersistedEvent.model_validate(doc) for doc in docs if doc is not None]
+        try:
+            with open(events_path) as f:
+                docs = list(yaml.safe_load_all(f))
+        except yaml.YAMLError as exc:
+            logger.error("Corrupted events.yaml for team %s: %s", team_id, exc)
+            return []
+        events: list[PersistedEvent] = []
+        for doc in docs:
+            if doc is None:
+                continue
+            try:
+                events.append(PersistedEvent.model_validate(doc))
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping corrupted event for team %s: %s", team_id, exc
+                )
+        logger.debug("Loaded %d events for team %s", len(events), team_id)
         return sorted(events, key=lambda e: e.sequence)
 
     def save_agent_state(self, snapshot: AgentStateSnapshot) -> None:
@@ -137,9 +175,7 @@ class YamlEventStore:
         states_dir = self._team_dir(snapshot.team_id) / "states"
         states_dir.mkdir(parents=True, exist_ok=True)
         state_path = states_dir / f"{snapshot.agent_id}.yaml"
-        data = snapshot.model_dump()
-        with open(state_path, "w") as f:
-            yaml.dump(data, f, default_flow_style=False)
+        self._atomic_write(state_path, snapshot.model_dump())
         logger.debug(
             "Saved agent state %s for team %s", snapshot.agent_id, snapshot.team_id
         )
@@ -159,9 +195,18 @@ class YamlEventStore:
             return []
         snapshots: list[AgentStateSnapshot] = []
         for state_path in sorted(states_dir.glob("*.yaml")):
-            with open(state_path) as f:
-                data = yaml.safe_load(f)
-            snapshots.append(AgentStateSnapshot.model_validate(data))
+            try:
+                with open(state_path) as f:
+                    data = yaml.safe_load(f)
+                snapshots.append(AgentStateSnapshot.model_validate(data))
+            except (yaml.YAMLError, ValueError) as exc:
+                logger.warning(
+                    "Skipping corrupted state file %s for team %s: %s",
+                    state_path.name,
+                    team_id,
+                    exc,
+                )
+        logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
 
     def delete_team(self, team_id: uuid.UUID) -> None:
