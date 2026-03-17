@@ -1,0 +1,131 @@
+"""Tests for PersistenceSubscriber — AC 1-7."""
+
+from __future__ import annotations
+
+import uuid
+from unittest.mock import MagicMock
+
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.messages.message import UserMessage
+from akgentic.core.messages.orchestrator import StateChangedMessage
+from akgentic.core.orchestrator import EventSubscriber
+
+from akgentic.team.models import AgentStateSnapshot, PersistedEvent
+from akgentic.team.subscriber import PersistenceSubscriber
+
+from tests.models.conftest import SampleAgentState
+from tests.services.conftest import InMemoryEventStore
+
+
+class TestPersistenceSubscriber:
+    """AC 1-7: PersistenceSubscriber persists events and state snapshots."""
+
+    def _make_subscriber(
+        self,
+    ) -> tuple[PersistenceSubscriber, InMemoryEventStore, uuid.UUID]:
+        """Create a PersistenceSubscriber with an InMemoryEventStore."""
+        team_id = uuid.uuid4()
+        store = InMemoryEventStore()
+        sub = PersistenceSubscriber(team_id=team_id, event_store=store)
+        return sub, store, team_id
+
+    # -- 3.2: Event persistence on normal message --------------------------
+
+    def test_event_persistence_on_user_message(self) -> None:
+        """AC 1: UserMessage produces one PersistedEvent with correct fields."""
+        sub, store, team_id = self._make_subscriber()
+        msg = UserMessage(content="hello")
+
+        sub.on_message(msg)
+
+        assert len(store.events) == 1
+        event = store.events[0]
+        assert isinstance(event, PersistedEvent)
+        assert event.team_id == team_id
+        assert event.sequence == 1
+        assert event.event == msg
+        assert event.timestamp is not None
+
+    # -- 3.3: Sequence numbering -------------------------------------------
+
+    def test_sequence_increments_monotonically(self) -> None:
+        """AC 1: Sequence numbers increment 1, 2, 3 across messages."""
+        sub, store, _team_id = self._make_subscriber()
+
+        sub.on_message(UserMessage(content="first"))
+        sub.on_message(UserMessage(content="second"))
+        sub.on_message(UserMessage(content="third"))
+
+        sequences = [e.sequence for e in store.events]
+        assert sequences == [1, 2, 3]
+
+    # -- 3.4: Agent state snapshot on StateChangedMessage ------------------
+
+    def test_state_snapshot_on_state_changed_message(self) -> None:
+        """AC 2: StateChangedMessage triggers both save_event and save_agent_state."""
+        sub, store, team_id = self._make_subscriber()
+
+        sender = MagicMock(spec=ActorAddress)
+        sender.name = "worker-agent"
+        state = SampleAgentState(task_count=5)
+        msg = StateChangedMessage(sender=sender, state=state)
+
+        sub.on_message(msg)
+
+        # Event saved
+        assert len(store.events) == 1
+        assert store.events[0].event == msg
+
+        # Agent state snapshot saved
+        key = (team_id, "worker-agent")
+        assert key in store.agent_states
+        snapshot = store.agent_states[key]
+        assert isinstance(snapshot, AgentStateSnapshot)
+        assert snapshot.team_id == team_id
+        assert snapshot.agent_id == "worker-agent"
+        assert snapshot.updated_at is not None
+
+    # -- 3.5: Restoring flag -----------------------------------------------
+
+    def test_restoring_flag_skips_persistence(self) -> None:
+        """AC 4: set_restoring(True) skips all persistence."""
+        sub, store, _team_id = self._make_subscriber()
+
+        sub.set_restoring(True)
+        sub.on_message(UserMessage(content="ignored"))
+        sub.on_message(UserMessage(content="also ignored"))
+
+        assert len(store.events) == 0
+        assert len(store.agent_states) == 0
+
+    def test_restoring_flag_resumes_with_correct_sequence(self) -> None:
+        """AC 4: After set_restoring(False), persistence resumes with correct sequence."""
+        sub, store, _team_id = self._make_subscriber()
+
+        # Send one message normally
+        sub.on_message(UserMessage(content="first"))
+        assert store.events[0].sequence == 1
+
+        # Enable restoring, send messages
+        sub.set_restoring(True)
+        sub.on_message(UserMessage(content="skipped"))
+
+        # Disable restoring, send message — sequence continues
+        sub.set_restoring(False)
+        sub.on_message(UserMessage(content="resumed"))
+
+        assert len(store.events) == 2
+        assert store.events[1].sequence == 2
+
+    # -- 3.6: on_stop is callable (no-op) ----------------------------------
+
+    def test_on_stop_is_callable(self) -> None:
+        """AC 3: on_stop exists and does not raise."""
+        sub, _store, _team_id = self._make_subscriber()
+        sub.on_stop()  # Should not raise
+
+    # -- 3.7: Explicit inheritance from EventSubscriber --------------------
+
+    def test_is_instance_of_event_subscriber(self) -> None:
+        """AC 3: PersistenceSubscriber explicitly inherits from EventSubscriber."""
+        assert EventSubscriber in PersistenceSubscriber.__mro__

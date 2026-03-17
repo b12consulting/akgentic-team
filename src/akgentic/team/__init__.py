@@ -21,6 +21,7 @@ from akgentic.team.ports import (
     NullServiceRegistry,
     ServiceRegistry,
 )
+from akgentic.team.subscriber import PersistenceSubscriber
 
 __version__ = "1.0.0-alpha.1"
 
@@ -29,6 +30,7 @@ __all__: list[str] = [
     "AgentStateSnapshot",
     "EventStore",
     "NullServiceRegistry",
+    "PersistenceSubscriber",
     "PersistedEvent",
     "Process",
     "ServiceRegistry",
