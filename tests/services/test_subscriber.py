@@ -12,7 +12,6 @@ from akgentic.core.orchestrator import EventSubscriber
 
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent
 from akgentic.team.subscriber import PersistenceSubscriber
-
 from tests.models.conftest import SampleAgentState
 from tests.services.conftest import InMemoryEventStore
 
@@ -84,6 +83,20 @@ class TestPersistenceSubscriber:
         assert snapshot.team_id == team_id
         assert snapshot.agent_id == "worker-agent"
         assert snapshot.updated_at is not None
+        assert isinstance(snapshot.state, SampleAgentState)
+        assert snapshot.state.task_count == 5
+
+    def test_state_changed_message_with_none_sender_skips_snapshot(self) -> None:
+        """AC 2: StateChangedMessage with sender=None saves event but no snapshot."""
+        sub, store, _team_id = self._make_subscriber()
+
+        state = SampleAgentState(task_count=3)
+        msg = StateChangedMessage(sender=None, state=state)
+
+        sub.on_message(msg)
+
+        assert len(store.events) == 1
+        assert len(store.agent_states) == 0
 
     # -- 3.5: Restoring flag -----------------------------------------------
 
@@ -120,7 +133,7 @@ class TestPersistenceSubscriber:
     # -- 3.6: on_stop is callable (no-op) ----------------------------------
 
     def test_on_stop_is_callable(self) -> None:
-        """AC 3: on_stop exists and does not raise."""
+        """Task 1.5: on_stop exists and does not raise."""
         sub, _store, _team_id = self._make_subscriber()
         sub.on_stop()  # Should not raise
 

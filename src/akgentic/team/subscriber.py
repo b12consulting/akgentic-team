@@ -51,21 +51,21 @@ class PersistenceSubscriber(EventSubscriber):
             return
 
         self._sequence += 1
+        now = datetime.now(UTC)
         event = PersistedEvent(
             team_id=self._team_id,
             sequence=self._sequence,
             event=msg,
-            timestamp=datetime.now(UTC),
+            timestamp=now,
         )
         self._event_store.save_event(event)
 
-        if isinstance(msg, StateChangedMessage):
-            agent_id = msg.sender.name  # type: ignore[union-attr]
+        if isinstance(msg, StateChangedMessage) and msg.sender is not None:
             snapshot = AgentStateSnapshot(
                 team_id=self._team_id,
-                agent_id=agent_id,
+                agent_id=msg.sender.name,
                 state=msg.state.serializable_copy(),
-                updated_at=datetime.now(UTC),
+                updated_at=now,
             )
             self._event_store.save_agent_state(snapshot)
 
