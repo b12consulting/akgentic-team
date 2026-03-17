@@ -15,14 +15,22 @@ from akgentic.team.models import (
     TeamRuntime,
     TeamStatus,
 )
+from akgentic.team.ports import (
+    EventStore,
+    NullServiceRegistry,
+    ServiceRegistry,
+)
 
 __version__ = "1.0.0-alpha.1"
 
 __all__: list[str] = [
     "__version__",
     "AgentStateSnapshot",
+    "EventStore",
+    "NullServiceRegistry",
     "PersistedEvent",
     "Process",
+    "ServiceRegistry",
     "TeamCard",
     "TeamCardMember",
     "TeamRuntime",
