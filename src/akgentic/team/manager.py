@@ -12,6 +12,7 @@ from akgentic.core.orchestrator import EventSubscriber
 from akgentic.team.factory import TeamFactory
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
+from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import PersistenceSubscriber
 
 logger = logging.getLogger(__name__)
@@ -159,15 +160,57 @@ class TeamManager:
         self._service_registry.deregister_team(self._instance_id, team_id)
 
     def resume_team(self, team_id: uuid.UUID) -> TeamRuntime:
-        """Resume a stopped team. Stub for story 3.2.
+        """Resume a stopped team by restoring from persisted EventStore data.
+
+        Loads the Process, validates state machine (only STOPPED teams may
+        resume), delegates to TeamRestorer, then updates Process status to
+        RUNNING and registers with ServiceRegistry.
 
         Args:
             team_id: The team identifier to resume.
 
+        Returns:
+            A TeamRuntime handle to the resumed team.
+
         Raises:
-            NotImplementedError: Always — to be implemented in story 3.2.
+            ValueError: If the team is not found, is currently RUNNING,
+                or is already DELETED.
         """
-        raise NotImplementedError("To be implemented in story 3.2")
+        process = self._event_store.load_team(team_id)
+        if process is None:
+            logger.warning("Resume rejected: team %s not found", team_id)
+            msg = f"Team {team_id} not found"
+            raise ValueError(msg)
+        if process.status == TeamStatus.RUNNING:
+            logger.warning("Resume rejected: team %s is currently running", team_id)
+            msg = f"Cannot resume team {team_id}: team is currently running"
+            raise ValueError(msg)
+        if process.status == TeamStatus.DELETED:
+            logger.warning("Resume rejected: team %s has been deleted", team_id)
+            msg = f"Cannot resume team {team_id}: team has been deleted"
+            raise ValueError(msg)
+
+        restorer = TeamRestorer(
+            self._actor_system, self._event_store, self._subscriber_factory
+        )
+        runtime, _persistence_sub = restorer.restore(process)
+
+        now = datetime.now(UTC)
+        updated_process = Process(
+            team_id=process.team_id,
+            team_card=process.team_card,
+            status=TeamStatus.RUNNING,
+            user_id=process.user_id,
+            user_email=process.user_email,
+            created_at=process.created_at,
+            updated_at=now,
+        )
+        self._event_store.save_team(updated_process)
+
+        self._service_registry.register_team(self._instance_id, team_id)
+
+        logger.info("Team '%s' (%s) resumed successfully", process.team_card.name, team_id)
+        return runtime
 
     def stop_team(self, team_id: uuid.UUID) -> None:
         """Gracefully stop a running team. Stub for story 4.2.

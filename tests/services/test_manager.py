@@ -385,3 +385,198 @@ class TestTeamManagerServiceRegistry:
         mgr.delete_team(team_id)
 
         mock_registry.deregister_team.assert_called_once_with(instance_id, team_id)
+
+
+# ---------------------------------------------------------------------------
+# Tests: resume_team
+# ---------------------------------------------------------------------------
+
+
+def _create_and_stop_team(
+    manager: TeamManager,
+    event_store: InMemoryEventStore,
+    team_card: TeamCard | None = None,
+) -> uuid.UUID:
+    """Create a team, populate events, stop it, and set Process to STOPPED.
+
+    Manually injects StartMessage events for each agent so that
+    TeamRestorer can rebuild the team from the event log.
+
+    Returns the team_id.
+    """
+    from datetime import UTC, datetime
+
+    from akgentic.core.actor_address_impl import ActorAddressProxy
+    from akgentic.core.messages.orchestrator import StartMessage
+    from akgentic.core.orchestrator import Orchestrator
+    from akgentic.core.utils.deserializer import ActorAddressDict
+    from akgentic.team.models import PersistedEvent
+
+    tc = team_card or _make_team_card()
+    runtime = manager.create_team(tc, user_id="test-user")
+
+    team_id = runtime.id
+    seq = 0
+
+    # Inject Orchestrator StartMessage
+    seq += 1
+    orch_addr_dict: ActorAddressDict = {
+        "__actor_address__": True,
+        "__actor_type__": f"{Orchestrator.__module__}.{Orchestrator.__name__}",
+        "agent_id": str(runtime.orchestrator_addr.agent_id),
+        "name": "orchestrator",
+        "role": "Orchestrator",
+        "team_id": str(team_id),
+        "squad_id": str(uuid.uuid4()),
+        "user_message": False,
+    }
+    orch_start = StartMessage(
+        config=BaseConfig(name="orchestrator", role="Orchestrator"),
+    )
+    orch_start.sender = ActorAddressProxy(orch_addr_dict)
+    orch_start.team_id = team_id
+    event_store.save_event(PersistedEvent(
+        team_id=team_id, sequence=seq, event=orch_start, timestamp=datetime.now(UTC),
+    ))
+
+    # Inject StartMessages for all agents in the TeamCard tree
+    def _inject_member(member: TeamCardMember) -> None:
+        nonlocal seq
+        name = member.card.config.name
+        role = member.card.config.role
+        agent_class = member.card.get_agent_class()
+        addr = runtime.addrs.get(name)
+        agent_id = addr.agent_id if addr else uuid.uuid4()
+        seq += 1
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
+            "agent_id": str(agent_id),
+            "name": name,
+            "role": role,
+            "team_id": str(team_id),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        sm = StartMessage(config=member.card.get_config_copy())
+        sm.sender = ActorAddressProxy(addr_dict)
+        sm.team_id = team_id
+        event_store.save_event(PersistedEvent(
+            team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
+        ))
+        for child in member.members:
+            _inject_member(child)
+
+    _inject_member(tc.entry_point)
+    for member in tc.members:
+        _inject_member(member)
+
+    # Stop all actors
+    runtime.orchestrator_addr.stop()
+    for addr in runtime.addrs.values():
+        if addr.is_alive():
+            addr.stop()
+
+    # Transition Process to STOPPED
+    process = event_store.load_team(team_id)
+    assert process is not None
+    stopped_process = Process(
+        team_id=process.team_id,
+        team_card=process.team_card,
+        status=TeamStatus.STOPPED,
+        user_id=process.user_id,
+        user_email=process.user_email,
+        created_at=process.created_at,
+        updated_at=process.updated_at,
+    )
+    event_store.save_team(stopped_process)
+
+    return team_id
+
+
+class TestTeamManagerResume:
+    """AC 1-4, 14, 16: resume_team tests."""
+
+    def test_resume_happy_path(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1,14: resume_team returns TeamRuntime and updates Process to RUNNING."""
+        team_id = _create_and_stop_team(manager, event_store)
+
+        runtime = manager.resume_team(team_id)
+
+        assert isinstance(runtime, TeamRuntime)
+        assert runtime.orchestrator_addr.is_alive()
+
+        # Process should be RUNNING
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.RUNNING
+
+    def test_resume_running_raises(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC 2: resume_team on RUNNING team raises ValueError."""
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+
+        with pytest.raises(ValueError, match="currently running"):
+            manager.resume_team(runtime.id)
+
+    def test_resume_deleted_raises(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3: resume_team on DELETED team raises ValueError."""
+        from datetime import UTC, datetime
+
+        team_id = uuid.uuid4()
+        process = Process(
+            team_id=team_id,
+            team_card=_make_team_card(),
+            status=TeamStatus.DELETED,
+            user_id="cli",
+            user_email="",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_team(process)
+
+        with pytest.raises(ValueError, match="has been deleted"):
+            manager.resume_team(team_id)
+
+    def test_resume_nonexistent_raises(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC 4: resume_team on non-existent team raises ValueError."""
+        with pytest.raises(ValueError, match="not found"):
+            manager.resume_team(uuid.uuid4())
+
+    def test_resume_registers_with_service_registry(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 14: ServiceRegistry.register_team called on successful resume."""
+        mock_registry = MagicMock(spec=NullServiceRegistry)
+        instance_id = uuid.uuid4()
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            service_registry=mock_registry,
+            instance_id=instance_id,
+        )
+
+        team_id = _create_and_stop_team(mgr, event_store)
+
+        # Reset mock to clear the create_team call
+        mock_registry.register_team.reset_mock()
+
+        runtime = mgr.resume_team(team_id)
+
+        mock_registry.register_team.assert_called_once_with(instance_id, team_id)
