@@ -7,9 +7,12 @@ for managing team lifecycle instances.
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 import yaml
@@ -19,6 +22,10 @@ from rich.console import Console
 from akgentic.team.cli._output import OutputFormat, render
 from akgentic.team.models import TeamCard, TeamStatus
 from akgentic.team.ports import EventStore
+
+if TYPE_CHECKING:
+    from akgentic.team.manager import TeamManager
+    from akgentic.team.models import TeamRuntime
 
 __all__ = ["app"]
 
@@ -238,6 +245,42 @@ def inspect_cmd(
     )
 
 
+def _run_interactive(
+    team_manager: TeamManager,
+    runtime: TeamRuntime,
+) -> None:
+    """Block until SIGINT, then gracefully stop the team.
+
+    Registers a SIGINT handler that sets a threading.Event. The main thread
+    blocks on event.wait(). When SIGINT fires, the event is set, and the
+    main thread calls team_manager.stop_team(runtime.id) for clean teardown.
+
+    Args:
+        team_manager: TeamManager instance with stop_team method.
+        runtime: TeamRuntime instance with id attribute.
+    """
+
+    shutdown_event = threading.Event()
+    console = Console()
+
+    def _sigint_handler(signum: int, frame: object) -> None:
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+    console.print("Press Ctrl+C to stop the team.")
+
+    shutdown_event.wait()
+
+    console.print("\nShutting down...")
+    try:
+        team_manager.stop_team(runtime.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error during shutdown: %s", exc)
+        console.print(f"Team stopped with errors: {runtime.id}")
+        return
+    console.print(f"Team stopped: {runtime.id}")
+
+
 @app.command(name="create")
 def create_cmd(
     ctx: typer.Context,
@@ -292,18 +335,47 @@ def create_cmd(
     logger.info("Team created: %s", runtime.id)
     Console().print(f"Team created: {runtime.id}")
 
-    # Non-interactive in 6.2: create, display, stop, exit.
-    # Story 6.3 adds blocking/SIGINT behavior.
-    try:
-        team_manager.stop_team(runtime.id)
-    except Exception as stop_exc:  # noqa: BLE001
-        err_console.print(
-            f"[red]Error:[/red] Team created ({runtime.id}) but failed to stop: {stop_exc}"
-        )
-        raise typer.Exit(code=1) from stop_exc
+    _run_interactive(team_manager, runtime)
 
-    logger.info("Team stopped: %s", runtime.id)
-    Console().print(f"Team stopped: {runtime.id}")
+
+@app.command(name="resume")
+def resume_cmd(
+    ctx: typer.Context,
+    team_id: str = typer.Argument(help="Team UUID to resume."),
+) -> None:
+    """Resume a stopped team by ID."""
+    try:
+        parsed_id = uuid.UUID(team_id)
+    except ValueError:
+        err_console.print(
+            f"[red]Error:[/red] Invalid UUID format: '{team_id}'"
+        )
+        raise typer.Exit(code=1)  # noqa: B904
+
+    state = _get_state(ctx)
+    event_store = _build_event_store(state)
+
+    from akgentic.core.actor_system_impl import ActorSystem
+    from akgentic.team.manager import TeamManager
+
+    actor_system = ActorSystem()
+    team_manager = TeamManager(actor_system=actor_system, event_store=event_store)
+
+    try:
+        runtime = team_manager.resume_team(parsed_id)
+    except ValueError as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001
+        err_console.print(
+            f"[red]Error:[/red] Failed to resume team: {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    logger.info("Team resumed: %s", runtime.id)
+    Console().print(f"Team resumed: {runtime.id}")
+
+    _run_interactive(team_manager, runtime)
 
 
 @app.command(name="delete")

@@ -1,16 +1,19 @@
 """Tests for the ak-team CLI commands.
 
-Validates list, inspect, global options, create, and delete commands
+Validates list, inspect, global options, create, delete, and resume commands
 using Typer CliRunner with YamlEventStore backed by temporary directories.
 
-Acceptance Criteria: AC1-AC11 from Story 6.1, AC1-AC9 from Story 6.2.
+Acceptance Criteria: AC1-AC11 from Story 6.1, AC1-AC9 from Story 6.2,
+AC1-AC6 from Story 6.3.
 """
 
 from __future__ import annotations
 
 import json
+import signal
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import yaml
 from typer.testing import CliRunner
@@ -18,7 +21,6 @@ from typer.testing import CliRunner
 from akgentic.team.cli.main import app
 from akgentic.team.models import TeamCard, TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
-
 from tests.cli.conftest import populate_teams
 from tests.models.conftest import (
     make_agent_state_snapshot,
@@ -200,8 +202,9 @@ def _write_team_card_yaml(team_card: TeamCard, path: Path) -> Path:
 class TestCreateCommand:
     """Tests for `ak-team create` command (AC1, AC2, AC3, AC4 from Story 6.2)."""
 
+    @patch("akgentic.team.cli.main._run_interactive")
     def test_create_valid_team_card(
-        self, cli_runner: CliRunner, data_dir: Path
+        self, mock_interactive: MagicMock, cli_runner: CliRunner, data_dir: Path
     ) -> None:
         """AC1: create from valid TeamCard YAML shows team_id, exit code 0."""
         team_card = make_team_card(agent_class="akgentic.core.agent.Akgent")
@@ -212,10 +215,15 @@ class TestCreateCommand:
         )
         assert result.exit_code == 0, result.output
         assert "Team created:" in result.output
-        assert "Team stopped:" in result.output
+        mock_interactive.assert_called_once()
 
+    @patch("akgentic.team.cli.main._run_interactive")
     def test_create_with_user_id(
-        self, cli_runner: CliRunner, data_dir: Path, yaml_store: YamlEventStore
+        self,
+        mock_interactive: MagicMock,
+        cli_runner: CliRunner,
+        data_dir: Path,
+        yaml_store: YamlEventStore,
     ) -> None:
         """AC2: create with --user-id passes it to TeamManager."""
         team_card = make_team_card(agent_class="akgentic.core.agent.Akgent")
@@ -340,3 +348,136 @@ class TestDeleteCommand:
         )
         assert result.exit_code == 1
         assert "Invalid UUID" in result.output
+
+
+class TestResumeCommand:
+    """Tests for `ak-team resume` command (AC1, AC3, AC4, AC5 from Story 6.3)."""
+
+    @patch("akgentic.team.cli.main._run_interactive")
+    @patch("akgentic.team.manager.TeamManager.resume_team")
+    def test_resume_stopped_team(
+        self,
+        mock_resume: MagicMock,
+        mock_interactive: MagicMock,
+        cli_runner: CliRunner,
+        data_dir: Path,
+        yaml_store: YamlEventStore,
+    ) -> None:
+        """AC1: resume stopped team shows team_id, exit code 0."""
+        process = make_process(status=TeamStatus.STOPPED)
+        yaml_store.save_team(process)
+
+        mock_runtime = MagicMock()
+        mock_runtime.id = process.team_id
+        mock_resume.return_value = mock_runtime
+
+        result = cli_runner.invoke(
+            app,
+            ["--data-dir", str(data_dir), "resume", str(process.team_id)],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Team resumed:" in result.output
+        mock_resume.assert_called_once_with(process.team_id)
+        mock_interactive.assert_called_once()
+
+    def test_resume_running_team_shows_error(
+        self,
+        cli_runner: CliRunner,
+        data_dir: Path,
+        yaml_store: YamlEventStore,
+    ) -> None:
+        """AC3: resume a running team shows error, exit code 1."""
+        process = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(process)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "resume", str(process.team_id)]
+        )
+        assert result.exit_code == 1
+        assert "running" in result.output.lower()
+
+    def test_resume_deleted_team_shows_error(
+        self,
+        cli_runner: CliRunner,
+        data_dir: Path,
+        yaml_store: YamlEventStore,
+    ) -> None:
+        """AC3: resume a deleted team shows error, exit code 1."""
+        process = make_process(status=TeamStatus.DELETED)
+        yaml_store.save_team(process)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "resume", str(process.team_id)]
+        )
+        assert result.exit_code == 1
+        assert "deleted" in result.output.lower()
+
+    def test_resume_nonexistent_team_shows_error(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC4: resume non-existent team shows error, exit code 1."""
+        fake_id = str(uuid.uuid4())
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "resume", fake_id]
+        )
+        assert result.exit_code == 1
+        assert "not found" in result.output.lower()
+
+    def test_resume_invalid_uuid_shows_error(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC5: resume with invalid UUID shows error, exit code 1."""
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "resume", "not-a-uuid"]
+        )
+        assert result.exit_code == 1
+        assert "Invalid UUID" in result.output
+
+
+class TestGracefulShutdown:
+    """Tests for SIGINT-based graceful shutdown (AC2 from Story 6.3)."""
+
+    def test_run_interactive_calls_stop_team_on_shutdown(self) -> None:
+        """AC2: _run_interactive calls stop_team when shutdown event fires."""
+        from akgentic.team.cli.main import _run_interactive
+
+        mock_manager = MagicMock()
+        mock_runtime = MagicMock()
+        mock_runtime.id = uuid.uuid4()
+
+        with (
+            patch("akgentic.team.cli.main.signal.signal") as mock_signal,
+            patch("akgentic.team.cli.main.threading.Event") as mock_event_cls,
+        ):
+            mock_event = MagicMock()
+            mock_event_cls.return_value = mock_event
+            # Make wait() return immediately (simulates shutdown event being set)
+            mock_event.wait.return_value = None
+
+            _run_interactive(mock_manager, mock_runtime)
+
+            # Verify SIGINT handler was registered with the correct signal
+            mock_signal.assert_called_once()
+            assert mock_signal.call_args[0][0] == signal.SIGINT
+            # Verify stop_team was called with correct id
+            mock_manager.stop_team.assert_called_once_with(mock_runtime.id)
+
+    def test_run_interactive_handles_stop_team_exception(self) -> None:
+        """AC2: _run_interactive handles stop_team errors gracefully."""
+        from akgentic.team.cli.main import _run_interactive
+
+        mock_manager = MagicMock()
+        mock_manager.stop_team.side_effect = RuntimeError("actors already dead")
+        mock_runtime = MagicMock()
+        mock_runtime.id = uuid.uuid4()
+
+        with (
+            patch("akgentic.team.cli.main.signal.signal"),
+            patch("akgentic.team.cli.main.threading.Event") as mock_event_cls,
+        ):
+            mock_event = MagicMock()
+            mock_event_cls.return_value = mock_event
+            mock_event.wait.return_value = None
+
+            # Should not raise even though stop_team fails
+            _run_interactive(mock_manager, mock_runtime)
