@@ -23,6 +23,7 @@ dev = [
     "pytest-cov>=4.1.0",
     "mypy>=1.8.0",
     "ruff>=0.1.0",
+    "mongomock>=4.0.0",
 ]
 
 [build-system]
