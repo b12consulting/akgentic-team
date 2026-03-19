@@ -12,9 +12,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
+import yaml
+from pydantic import ValidationError
 from rich.console import Console
 
 from akgentic.team.cli._output import OutputFormat, render
+from akgentic.team.models import TeamCard, TeamStatus
 from akgentic.team.ports import EventStore
 
 __all__ = ["app"]
@@ -233,3 +236,107 @@ def inspect_cmd(
         event_count=event_count,
         agent_state_count=agent_state_count,
     )
+
+
+@app.command(name="create")
+def create_cmd(
+    ctx: typer.Context,
+    team_card_file: Path = typer.Argument(help="Path to a YAML file containing a TeamCard."),
+    user_id: str = typer.Option(
+        "cli",
+        "--user-id",
+        help="User identifier for the team creator.",
+    ),
+) -> None:
+    """Create a team from a TeamCard YAML file."""
+    if not team_card_file.exists():
+        err_console.print(
+            f"[red]Error:[/red] File not found: '{team_card_file}'"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        raw = team_card_file.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        err_console.print(
+            f"[red]Error:[/red] Invalid YAML in '{team_card_file}': {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    try:
+        team_card = TeamCard.model_validate(data)
+    except ValidationError as exc:
+        err_console.print(
+            f"[red]Error:[/red] Invalid TeamCard in '{team_card_file}': {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    state = _get_state(ctx)
+    event_store = _build_event_store(state)
+
+    from akgentic.core.actor_system_impl import ActorSystem
+    from akgentic.team.manager import TeamManager
+
+    actor_system = ActorSystem()
+    team_manager = TeamManager(actor_system=actor_system, event_store=event_store)
+
+    try:
+        runtime = team_manager.create_team(team_card, user_id=user_id)
+    except Exception as exc:  # noqa: BLE001
+        err_console.print(
+            f"[red]Error:[/red] Failed to create team: {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    console = Console()
+    console.print(f"Team created: {runtime.id}")
+
+    # Non-interactive in 6.2: create, display, stop, exit.
+    # Story 6.3 adds blocking/SIGINT behavior.
+    team_manager.stop_team(runtime.id)
+    console.print(f"Team stopped: {runtime.id}")
+
+
+@app.command(name="delete")
+def delete_cmd(
+    ctx: typer.Context,
+    team_id: str = typer.Argument(help="Team UUID to delete."),
+) -> None:
+    """Delete a stopped team and purge all its data."""
+    try:
+        parsed_id = uuid.UUID(team_id)
+    except ValueError:
+        err_console.print(
+            f"[red]Error:[/red] Invalid UUID format: '{team_id}'"
+        )
+        raise typer.Exit(code=1)  # noqa: B904
+
+    state = _get_state(ctx)
+    # delete is a pure data-purge operation — no ActorSystem needed.
+    # We use EventStore directly instead of TeamManager to avoid
+    # creating an unnecessary ActorSystem (expensive, starts threads).
+    event_store = _build_event_store(state)
+
+    process = event_store.load_team(parsed_id)
+    if process is None:
+        err_console.print(
+            f"[red]Error:[/red] Team '{team_id}' not found."
+        )
+        raise typer.Exit(code=1)
+
+    if process.status == TeamStatus.RUNNING:
+        err_console.print(
+            "[red]Error:[/red] Cannot delete: team is running. Stop it first."
+        )
+        raise typer.Exit(code=1)
+
+    if process.status == TeamStatus.DELETED:
+        err_console.print(
+            "[red]Error:[/red] Team already deleted."
+        )
+        raise typer.Exit(code=1)
+
+    event_store.delete_team(parsed_id)
+    console = Console()
+    console.print(f"Team '{team_id}' deleted.")

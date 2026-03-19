@@ -1,21 +1,22 @@
 """Tests for the ak-team CLI commands.
 
-Validates list, inspect, and global options using Typer CliRunner
-with YamlEventStore backed by temporary directories.
+Validates list, inspect, global options, create, and delete commands
+using Typer CliRunner with YamlEventStore backed by temporary directories.
 
-Acceptance Criteria: AC1-AC11 from Story 6.1.
+Acceptance Criteria: AC1-AC11 from Story 6.1, AC1-AC9 from Story 6.2.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 import yaml
 from typer.testing import CliRunner
 
 from akgentic.team.cli.main import app
-from akgentic.team.models import TeamStatus
+from akgentic.team.models import TeamCard, TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
 
 from tests.cli.conftest import populate_teams
@@ -23,6 +24,7 @@ from tests.models.conftest import (
     make_agent_state_snapshot,
     make_persisted_event,
     make_process,
+    make_team_card,
 )
 
 
@@ -185,3 +187,143 @@ class TestGlobalOptions:
         )
         assert result.exit_code == 1
         assert "Invalid status" in result.output
+
+
+def _write_team_card_yaml(team_card: TeamCard, path: Path) -> Path:
+    """Serialize a TeamCard to YAML and write to file."""
+    data = team_card.model_dump(mode="json")
+    file = path / "team-card.yaml"
+    file.write_text(yaml.dump(data, default_flow_style=False))
+    return file
+
+
+class TestCreateCommand:
+    """Tests for `ak-team create` command (AC1, AC2, AC3, AC4 from Story 6.2)."""
+
+    def test_create_valid_team_card(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC1: create from valid TeamCard YAML shows team_id, exit code 0."""
+        team_card = make_team_card(agent_class="akgentic.core.agent.Akgent")
+        card_file = _write_team_card_yaml(team_card, data_dir)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "create", str(card_file)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Team created:" in result.output
+        assert "Team stopped:" in result.output
+
+    def test_create_with_user_id(
+        self, cli_runner: CliRunner, data_dir: Path, yaml_store: YamlEventStore
+    ) -> None:
+        """AC2: create with --user-id passes it to TeamManager."""
+        team_card = make_team_card(agent_class="akgentic.core.agent.Akgent")
+        card_file = _write_team_card_yaml(team_card, data_dir)
+
+        result = cli_runner.invoke(
+            app,
+            [
+                "--data-dir", str(data_dir),
+                "create", str(card_file),
+                "--user-id", "myuser",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        # Verify user_id was stored in the Process
+        teams = yaml_store.list_teams()
+        assert len(teams) == 1
+        assert teams[0].user_id == "myuser"
+
+    def test_create_nonexistent_file(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC3: create with non-existent file shows error, exit code 1."""
+        result = cli_runner.invoke(
+            app,
+            ["--data-dir", str(data_dir), "create", "/no/such/file.yaml"],
+        )
+        assert result.exit_code == 1
+        assert "File not found" in result.output
+
+    def test_create_invalid_yaml(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC4: create with invalid YAML shows error, exit code 1."""
+        bad_file = data_dir / "bad.yaml"
+        bad_file.write_text("not: valid: teamcard: {{{}}}:")
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "create", str(bad_file)]
+        )
+        assert result.exit_code == 1
+        assert "Invalid YAML" in result.output or "Invalid TeamCard" in result.output
+
+    def test_create_invalid_team_card_structure(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC4: create with valid YAML but invalid TeamCard shows error, exit code 1."""
+        bad_file = data_dir / "bad-card.yaml"
+        bad_file.write_text(yaml.dump({"name": "incomplete"}))
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "create", str(bad_file)]
+        )
+        assert result.exit_code == 1
+        assert "Invalid TeamCard" in result.output
+
+
+class TestDeleteCommand:
+    """Tests for `ak-team delete` command (AC5, AC6, AC7, AC8 from Story 6.2)."""
+
+    def test_delete_stopped_team(
+        self, cli_runner: CliRunner, data_dir: Path, yaml_store: YamlEventStore
+    ) -> None:
+        """AC5: delete stopped team succeeds, exit code 0."""
+        process = make_process(status=TeamStatus.STOPPED)
+        yaml_store.save_team(process)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "delete", str(process.team_id)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "deleted" in result.output
+
+        # Verify team is actually deleted from store
+        assert yaml_store.load_team(process.team_id) is None
+
+    def test_delete_running_team(
+        self, cli_runner: CliRunner, data_dir: Path, yaml_store: YamlEventStore
+    ) -> None:
+        """AC6: delete running team shows error, exit code 1."""
+        process = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(process)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "delete", str(process.team_id)]
+        )
+        assert result.exit_code == 1
+        assert "running" in result.output.lower()
+        assert "stop" in result.output.lower()
+
+    def test_delete_nonexistent_team(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC7: delete non-existent team shows error, exit code 1."""
+        fake_id = str(uuid.uuid4())
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "delete", fake_id]
+        )
+        assert result.exit_code == 1
+        assert "not found" in result.output
+
+    def test_delete_invalid_uuid(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """AC8: delete with invalid UUID shows error, exit code 1."""
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "delete", "not-a-uuid"]
+        )
+        assert result.exit_code == 1
+        assert "Invalid UUID" in result.output
