@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from akgentic.core.actor_system_impl import ActorSystem
-from akgentic.core.orchestrator import EventSubscriber
+from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.team.factory import TeamFactory
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
@@ -53,6 +53,8 @@ class TeamManager:
         self._service_registry = service_registry or NullServiceRegistry()
         self._subscriber_factory = subscriber_factory
         self._instance_id = instance_id or uuid.uuid4()
+        self._runtimes: dict[uuid.UUID, TeamRuntime] = {}
+        self._subscribers: dict[uuid.UUID, list[EventSubscriber]] = {}
 
     def create_team(
         self,
@@ -94,6 +96,10 @@ class TeamManager:
         runtime = TeamFactory.build(
             team_card, self._actor_system, subscribers, team_id=team_id
         )
+
+        # Track runtime and subscribers for stop_team
+        self._runtimes[team_id] = runtime
+        self._subscribers[team_id] = subscribers
 
         # Persist Process metadata
         now = datetime.now(UTC)
@@ -159,6 +165,10 @@ class TeamManager:
         self._event_store.delete_team(team_id)
         self._service_registry.deregister_team(self._instance_id, team_id)
 
+        # Cleanup runtime tracking
+        self._runtimes.pop(team_id, None)
+        self._subscribers.pop(team_id, None)
+
     def resume_team(self, team_id: uuid.UUID) -> TeamRuntime:
         """Resume a stopped team by restoring from persisted EventStore data.
 
@@ -193,7 +203,16 @@ class TeamManager:
         restorer = TeamRestorer(
             self._actor_system, self._event_store, self._subscriber_factory
         )
-        runtime, _persistence_sub = restorer.restore(process)
+        runtime, persistence_sub = restorer.restore(process)
+
+        # Build subscriber list matching what restorer registered
+        subscribers: list[EventSubscriber] = [persistence_sub]
+        if self._subscriber_factory is not None:
+            subscribers.extend(self._subscriber_factory(team_id))
+
+        # Track runtime and subscribers for stop_team
+        self._runtimes[team_id] = runtime
+        self._subscribers[team_id] = subscribers
 
         now = datetime.now(UTC)
         updated_process = Process(
@@ -213,12 +232,98 @@ class TeamManager:
         return runtime
 
     def stop_team(self, team_id: uuid.UUID) -> None:
-        """Gracefully stop a running team. Stub for story 4.2.
+        """Gracefully stop a running team.
+
+        Unsubscribes all subscribers from the Orchestrator, tears down actors
+        (orchestrator first, then agents), persists Process with STOPPED status,
+        and deregisters from ServiceRegistry.
+
+        Idempotent: calling stop on an already-STOPPED team is a no-op.
 
         Args:
             team_id: The team identifier to stop.
 
         Raises:
-            NotImplementedError: Always — to be implemented in story 4.2.
+            ValueError: If the team is not found or is already DELETED.
         """
-        raise NotImplementedError("To be implemented in story 4.2")
+        process = self._event_store.load_team(team_id)
+        if process is None:
+            logger.warning("Stop rejected: team %s not found", team_id)
+            msg = f"Team {team_id} not found"
+            raise ValueError(msg)
+
+        if process.status == TeamStatus.STOPPED:
+            logger.info("Team %s is already stopped — no-op", team_id)
+            return
+
+        if process.status == TeamStatus.DELETED:
+            logger.warning("Stop rejected: team %s no longer exists", team_id)
+            msg = f"Team {team_id} no longer exists"
+            raise ValueError(msg)
+
+        # RUNNING — perform graceful shutdown
+        runtime = self._runtimes.get(team_id)
+
+        if runtime is not None:
+            # Unsubscribe all tracked subscribers
+            try:
+                orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
+                    runtime.orchestrator_addr, Orchestrator
+                )
+                for sub in self._subscribers.get(team_id, []):
+                    try:
+                        orchestrator_proxy.unsubscribe(sub)
+                    except Exception:
+                        logger.warning(
+                            "Failed to unsubscribe %s from team %s", sub, team_id
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to get orchestrator proxy for team %s — "
+                    "skipping unsubscribe",
+                    team_id,
+                )
+
+            # Tear down actors: orchestrator first, then remaining agents
+            try:
+                runtime.orchestrator_addr.stop()
+            except Exception:
+                logger.warning(
+                    "Failed to stop orchestrator for team %s", team_id
+                )
+
+            for name, addr in runtime.addrs.items():
+                try:
+                    addr.stop()
+                except Exception:
+                    logger.warning(
+                        "Failed to stop agent '%s' for team %s", name, team_id
+                    )
+        else:
+            logger.warning(
+                "Team %s is RUNNING but no runtime tracked — "
+                "actors may already be dead. Updating state only.",
+                team_id,
+            )
+
+        # Persist STOPPED status
+        now = datetime.now(UTC)
+        updated_process = Process(
+            team_id=process.team_id,
+            team_card=process.team_card,
+            status=TeamStatus.STOPPED,
+            user_id=process.user_id,
+            user_email=process.user_email,
+            created_at=process.created_at,
+            updated_at=now,
+        )
+        self._event_store.save_team(updated_process)
+
+        # Deregister from service discovery
+        self._service_registry.deregister_team(self._instance_id, team_id)
+
+        # Cleanup runtime tracking
+        self._runtimes.pop(team_id, None)
+        self._subscribers.pop(team_id, None)
+
+        logger.info("Team %s stopped successfully", team_id)
