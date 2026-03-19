@@ -46,3 +46,12 @@ __all__: list[str] = [
     "TeamStatus",
     "YamlEventStore",
 ]
+
+_mongo_available = False
+try:
+    from akgentic.team.repositories import MongoEventStore  # noqa: F401
+
+    __all__.append("MongoEventStore")
+    _mongo_available = True
+except ImportError:
+    pass
