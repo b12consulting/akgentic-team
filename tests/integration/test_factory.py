@@ -1,8 +1,6 @@
 """Integration tests for TeamFactory: verify built teams are functional.
 
 Tests use real Akgent subclasses, real orchestrators, and real message flow.
-Tests that fail due to the _spawn_child bug are marked with
-@pytest.mark.skip(reason="Awaiting factory fix - Story 11.2").
 """
 
 from __future__ import annotations

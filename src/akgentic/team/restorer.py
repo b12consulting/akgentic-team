@@ -301,7 +301,8 @@ class TeamRestorer:
             orchestrator_start, team_id, spawned_addrs
         )
 
-        # 2c. Register subscribers
+        # 2c. Register subscribers (without startup replay — phase 3 handles
+        #      event replay, so TeamFactory._register_subscribers is not used here)
         persistence_sub = PersistenceSubscriber(team_id, self._event_store)
         persistence_sub.set_restoring(True)
 

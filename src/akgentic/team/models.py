@@ -254,7 +254,8 @@ class TeamRuntime(SerializableBaseModel):
         message = self._make_message(content)
         self.actor_system.tell(self.entry_addr, message)
         for addr in self.supervisor_addrs.values():
-            self._entry_proxy.send(addr, message)
+            if addr != self.entry_addr:
+                self._entry_proxy.send(addr, message)
 
     def send_to(self, agent_name: str, content: str) -> None:
         """Send a directed message to a specific agent by name.
