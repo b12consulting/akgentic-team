@@ -261,21 +261,24 @@ def _run_interactive(
     """
 
     shutdown_event = threading.Event()
+    console = Console()
 
     def _sigint_handler(signum: int, frame: object) -> None:
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, _sigint_handler)
-    Console().print("Press Ctrl+C to stop the team.")
+    console.print("Press Ctrl+C to stop the team.")
 
     shutdown_event.wait()
 
-    Console().print("\nShutting down...")
+    console.print("\nShutting down...")
     try:
         team_manager.stop_team(runtime.id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Error during shutdown: %s", exc)
-    Console().print(f"Team stopped: {runtime.id}")
+        console.print(f"Team stopped with errors: {runtime.id}")
+        return
+    console.print(f"Team stopped: {runtime.id}")
 
 
 @app.command(name="create")
@@ -339,11 +342,6 @@ def create_cmd(
 def resume_cmd(
     ctx: typer.Context,
     team_id: str = typer.Argument(help="Team UUID to resume."),
-    user_id: str = typer.Option(
-        "cli",
-        "--user-id",
-        help="User identifier for the resume operation.",
-    ),
 ) -> None:
     """Resume a stopped team by ID."""
     try:

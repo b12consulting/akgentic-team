@@ -10,6 +10,7 @@ AC1-AC6 from Story 6.3.
 from __future__ import annotations
 
 import json
+import signal
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,7 +21,6 @@ from typer.testing import CliRunner
 from akgentic.team.cli.main import app
 from akgentic.team.models import TeamCard, TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
-
 from tests.cli.conftest import populate_teams
 from tests.models.conftest import (
     make_agent_state_snapshot,
@@ -456,8 +456,9 @@ class TestGracefulShutdown:
 
             _run_interactive(mock_manager, mock_runtime)
 
-            # Verify SIGINT handler was registered
+            # Verify SIGINT handler was registered with the correct signal
             mock_signal.assert_called_once()
+            assert mock_signal.call_args[0][0] == signal.SIGINT
             # Verify stop_team was called with correct id
             mock_manager.stop_team.assert_called_once_with(mock_runtime.id)
 
