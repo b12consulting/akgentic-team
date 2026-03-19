@@ -43,5 +43,5 @@ uv run python examples/02_team_factory.py
 
 ## Dependencies
 
-- Examples 01--05 depend on `akgentic-core` and `akgentic-team` only.
+- Examples 01-05 depend on `akgentic-core` and `akgentic-team` only.
 - Example 06 additionally requires `mongomock`, available via the `[mongo]` extra.

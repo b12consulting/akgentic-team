@@ -32,8 +32,11 @@ try:
     print(runtime.entry_addr)          # ActorAddress of entry point
     print(runtime.addrs)               # dict[str, ActorAddress]
 
-    # Send a message (broadcasts to supervisor addresses)
+    # Broadcast to supervisors (agents with subordinates)
     runtime.send("Hello team!")
+
+    # Directed message to a specific agent by name
+    runtime.send_to("worker", "Task for you!")
 
 finally:
     actor_system.shutdown()
