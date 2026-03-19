@@ -1,50 +1,47 @@
-# Examples for akgentic-\<module\>
+# akgentic-team Examples
 
-This directory contains example scripts demonstrating the usage of this module.
+A progressive tutorial that walks through the akgentic-team package, from static team definitions to full lifecycle management with persistence and crash recovery.
 
-## Running Examples
+Each example builds on concepts from previous ones. Start with example 01 and work through in order.
+
+## Prerequisites
+
+From the workspace root, install all packages:
 
 ```bash
-# From workspace root with activated venv
-python packages/akgentic-<module>/examples/example_basic.py
+uv sync --all-packages --all-extras
 ```
 
-## Available Examples
+## Examples
 
-### example_basic.py
+| # | File | Summary | Status |
+|---|------|---------|--------|
+| 01 | `01_team_definition.py` | TeamCard & TeamCardMember hierarchies, agent_cards/supervisors inspection, Pydantic round-trip | Implemented |
+| 02 | `02_team_factory.py` | TeamFactory.build(), TeamRuntime inspection, message sending, error paths, clean shutdown | Implemented |
+| 03 | `03_team_manager.py` | TeamManager create/stop lifecycle, state machine transitions | Coming soon |
+| 04 | `04_event_sourcing.py` | PersistenceSubscriber, YamlEventStore, event replay | Coming soon |
+| 05 | `05_crash_recovery.py` | TeamRestorer, resume from persisted state | Coming soon |
+| 06 | `06_mongodb_backend.py` | MongoEventStore with mongomock for testing | Coming soon |
 
-Basic usage demonstrating core functionality.
+Each `.py` file has a companion `.md` file with concepts, API patterns, and pitfalls.
 
-**Topics covered:**
-- Feature 1
-- Feature 2
-- Basic configuration
+## Running
 
-### example_advanced.py
+From the workspace root:
 
-Advanced usage showing integration with other modules.
+```bash
+uv run python packages/akgentic-team/examples/01_team_definition.py
+uv run python packages/akgentic-team/examples/02_team_factory.py
+```
 
-**Topics covered:**
-- Integration with akgentic-core
-- Integration with akgentic-llm
-- Complex scenarios
+Or from the package root (`packages/akgentic-team/`):
 
-## Example Structure
+```bash
+uv run python examples/01_team_definition.py
+uv run python examples/02_team_factory.py
+```
 
-Each example should:
+## Dependencies
 
-1. Import necessary dependencies
-2. Include clear comments explaining each step
-3. Demonstrate realistic use cases
-4. Handle errors appropriately
-5. Clean up resources (if applicable)
-
-## Adding New Examples
-
-When adding new examples:
-
-1. Create a descriptive filename: `example_<feature>.py`
-2. Add detailed comments
-3. Include a docstring explaining the example
-4. Update this README with a description
-5. Test the example works in isolation
+- Examples 01-05 depend on `akgentic-core` and `akgentic-team` only.
+- Example 06 additionally requires `mongomock`, available via the `[mongo]` extra.
