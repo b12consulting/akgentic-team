@@ -627,22 +627,212 @@ class TestTeamManagerDeleteDataPurge:
         assert len(event_store.load_events(team_id)) > 0
         assert len(event_store.load_agent_states(team_id)) > 0
 
-        # Manually set process to STOPPED (stop_team not yet implemented)
-        process = event_store.load_team(team_id)
-        assert process is not None
-        stopped_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.STOPPED,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=datetime.now(UTC),
-        )
-        event_store.save_team(stopped_process)
+        # Use stop_team to transition to STOPPED
+        manager.stop_team(team_id)
 
         # Delete and verify complete purge of all three data types
         manager.delete_team(team_id)
         assert event_store.load_team(team_id) is None
         assert event_store.load_events(team_id) == []
         assert event_store.load_agent_states(team_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: stop_team
+# ---------------------------------------------------------------------------
+
+
+class TestTeamManagerStop:
+    """AC 1-5: TeamManager.stop_team graceful shutdown tests."""
+
+    def test_stop_running_team_succeeds(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: stop_team on RUNNING team transitions to STOPPED with actor teardown."""
+        from datetime import UTC, datetime, timedelta
+
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        # Verify team is running
+        assert runtime.orchestrator_addr.is_alive()
+
+        before = datetime.now(UTC)
+        manager.stop_team(team_id)
+        after = datetime.now(UTC)
+
+        # Process should be STOPPED
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
+        # Actors should be dead
+        assert not runtime.orchestrator_addr.is_alive()
+
+        # updated_at should be recent
+        assert before - timedelta(seconds=1) <= process.updated_at <= after + timedelta(seconds=1)
+
+    def test_stop_running_team_unsubscribes_all(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: stop_team unsubscribes all subscribers from orchestrator."""
+        recording = RecordingSubscriber()
+
+        def factory(team_id: uuid.UUID) -> list[EventSubscriber]:
+            return [recording]
+
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            subscriber_factory=factory,
+        )
+        tc = _make_team_card()
+        runtime = mgr.create_team(tc)
+        team_id = runtime.id
+
+        # Verify subscribers are tracked before stop
+        assert team_id in mgr._subscribers
+        assert len(mgr._subscribers[team_id]) == 2  # PersistenceSubscriber + recording
+
+        mgr.stop_team(team_id)
+
+        # After stop, actors are dead and tracking is cleaned up
+        assert not runtime.orchestrator_addr.is_alive()
+        assert team_id not in mgr._subscribers
+        assert team_id not in mgr._runtimes
+
+        # Process should be STOPPED
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
+    def test_stop_stopped_team_is_noop(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 2: stop_team on STOPPED team is idempotent — no error raised."""
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        # Stop the team
+        manager.stop_team(team_id)
+        process_after_first_stop = event_store.load_team(team_id)
+        assert process_after_first_stop is not None
+        assert process_after_first_stop.status == TeamStatus.STOPPED
+
+        # Stop again — should be no-op
+        manager.stop_team(team_id)
+
+        # Process should remain STOPPED with same timestamp
+        process_after_second_stop = event_store.load_team(team_id)
+        assert process_after_second_stop is not None
+        assert process_after_second_stop.status == TeamStatus.STOPPED
+        assert process_after_second_stop.updated_at == process_after_first_stop.updated_at
+
+    def test_stop_deleted_team_raises(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3: stop_team on DELETED team raises ValueError."""
+        from datetime import UTC, datetime
+
+        team_id = uuid.uuid4()
+        process = Process(
+            team_id=team_id,
+            team_card=_make_team_card(),
+            status=TeamStatus.DELETED,
+            user_id="cli",
+            user_email="",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_team(process)
+
+        with pytest.raises(ValueError, match="no longer exists"):
+            manager.stop_team(team_id)
+
+    def test_stop_nonexistent_team_raises(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC 4: stop_team on non-existent team raises ValueError."""
+        with pytest.raises(ValueError, match="not found"):
+            manager.stop_team(uuid.uuid4())
+
+    def test_stop_deregisters_from_service_registry(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 5: ServiceRegistry.deregister_team called on stop."""
+        mock_registry = MagicMock(spec=NullServiceRegistry)
+        instance_id = uuid.uuid4()
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            service_registry=mock_registry,
+            instance_id=instance_id,
+        )
+        tc = _make_team_card()
+        runtime = mgr.create_team(tc)
+        team_id = runtime.id
+
+        mgr.stop_team(team_id)
+
+        mock_registry.deregister_team.assert_called_once_with(instance_id, team_id)
+
+    def test_stop_running_without_tracked_runtime(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: stop_team handles RUNNING team with no tracked runtime gracefully.
+
+        Simulates a manager restart where _runtimes is empty but EventStore
+        still has a RUNNING Process. stop_team should update Process to STOPPED
+        and deregister without attempting actor teardown.
+        """
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        # Simulate manager restart: clear runtime tracking
+        manager._runtimes.clear()
+        manager._subscribers.clear()
+
+        # stop_team should still succeed — update state and deregister
+        manager.stop_team(team_id)
+
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
+    def test_stop_updates_timestamp(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: updated_at is set to a new value after stop."""
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        process_before = event_store.load_team(team_id)
+        assert process_before is not None
+        original_updated_at = process_before.updated_at
+
+        manager.stop_team(team_id)
+
+        process_after = event_store.load_team(team_id)
+        assert process_after is not None
+        # updated_at must change — stop_team always generates a new timestamp
+        assert process_after.updated_at >= original_updated_at
+        assert process_after.status == TeamStatus.STOPPED
