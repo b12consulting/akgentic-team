@@ -15,6 +15,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.orchestrator import StartMessage, StopMessage
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.deserializer import import_class
+from akgentic.team.factory import TeamFactory
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -221,14 +222,18 @@ class TeamRestorer:
     def _spawn_agents(
         self,
         agent_starts: list[StartMessage],
-        team_id: uuid.UUID,
+        orchestrator_addr: ActorAddress,
         spawned_addrs: list[ActorAddress],
     ) -> dict[str, ActorAddress]:
         """Spawn non-orchestrator agents from their persisted StartMessages.
 
+        Agents are spawned through the orchestrator address so that
+        ``_orchestrator`` and ``_parent`` propagate correctly from the
+        hierarchy root.
+
         Args:
             agent_starts: StartMessages for agents to rebuild.
-            team_id: The team identifier.
+            orchestrator_addr: Address of the restored orchestrator to spawn through.
             spawned_addrs: Shared list for rollback tracking.
 
         Returns:
@@ -246,12 +251,11 @@ class TeamRestorer:
 
             config = sm.config.model_copy()
 
-            addr = self._actor_system.createActor(
+            addr = TeamFactory._spawn_child(
                 agent_class,
-                restoring=True,
-                agent_id=original_agent_id,
-                team_id=team_id,
+                orchestrator_addr,
                 config=config,
+                agent_id=original_agent_id,
             )
             spawned_addrs.append(addr)
             addrs[agent_name] = addr
@@ -308,8 +312,8 @@ class TeamRestorer:
         for sub in subscribers:
             orchestrator_proxy.subscribe(sub)
 
-        # 2d. Spawn remaining agents
-        addrs = self._spawn_agents(agent_starts, team_id, spawned_addrs)
+        # 2d. Spawn remaining agents through orchestrator
+        addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
         # 2e. Restore agent states
         state_map: dict[str, AgentStateSnapshot] = {
