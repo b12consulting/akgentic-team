@@ -139,8 +139,16 @@ def _build_event_store(state: GlobalState) -> EventStore:
     if state.backend == "mongodb":
         import pymongo
 
-        client: pymongo.MongoClient = pymongo.MongoClient(state.mongo_uri)  # type: ignore[type-arg]
-        db = client[state.mongo_db]  # type: ignore[index]
+        try:
+            client: pymongo.MongoClient = pymongo.MongoClient(  # type: ignore[type-arg]
+                state.mongo_uri, serverSelectionTimeoutMS=5000
+            )
+            db = client[state.mongo_db]  # type: ignore[index]
+        except Exception as exc:  # noqa: BLE001
+            err_console.print(
+                f"[red]Error:[/red] Failed to connect to MongoDB: {exc}"
+            )
+            raise typer.Exit(code=1) from exc
         from akgentic.team.repositories.mongo import MongoEventStore
 
         return MongoEventStore(db)

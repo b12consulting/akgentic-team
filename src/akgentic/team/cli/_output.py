@@ -203,8 +203,8 @@ def render(
     elif isinstance(entries, BaseModel):
         _render_detail_table(
             entries,
-            event_count=event_count or 0,
-            agent_state_count=agent_state_count or 0,
+            event_count=event_count if event_count is not None else 0,
+            agent_state_count=agent_state_count if agent_state_count is not None else 0,
         )
     else:
         _render_list_table(entries)

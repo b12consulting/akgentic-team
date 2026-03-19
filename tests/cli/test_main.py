@@ -175,3 +175,13 @@ class TestGlobalOptions:
         )
         assert result.exit_code == 1
         assert "--mongo-uri" in result.output
+
+    def test_list_invalid_status_filter(
+        self, cli_runner: CliRunner, data_dir: object
+    ) -> None:
+        """AC3: list --status with invalid value shows error, exit code 1."""
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "list", "--status", "bogus"]
+        )
+        assert result.exit_code == 1
+        assert "Invalid status" in result.output
