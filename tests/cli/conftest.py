@@ -9,7 +9,6 @@ from typer.testing import CliRunner
 
 from akgentic.team.models import Process, TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
-
 from tests.models.conftest import make_process
 
 

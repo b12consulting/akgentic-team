@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
-from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -29,7 +28,6 @@ from akgentic.team.models import (
 )
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import PersistenceSubscriber
-from tests.models.conftest import make_stub_addr
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------

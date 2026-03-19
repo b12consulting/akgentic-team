@@ -2,8 +2,6 @@
 
 Tests use real Akgent subclasses, real orchestrators, and real event flow
 with YamlEventStore for actual file-based persistence.
-Tests that fail due to the _spawn_child bug are marked with
-@pytest.mark.skip(reason="Awaiting factory fix - Story 11.2").
 """
 
 from __future__ import annotations
@@ -11,7 +9,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.messages.message import UserMessage
 
@@ -83,7 +80,6 @@ class TestPersistenceIntegration:
             f"Expected at least 3 events, got {len(events)}"
         )
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_restored_team_routes_messages(
         self,
         actor_system: ActorSystem,

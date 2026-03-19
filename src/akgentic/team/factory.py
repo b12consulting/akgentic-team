@@ -76,8 +76,7 @@ class TeamFactory:
             orchestrator_proxy: Orchestrator = actor_system.proxy_ask(
                 orchestrator_addr, Orchestrator
             )
-            for sub in subscribers or []:
-                orchestrator_proxy.subscribe(sub)
+            TeamFactory._register_subscribers(orchestrator_proxy, subscribers)
 
             # 3. Walk TeamCard tree and spawn all agents
             addrs: dict[str, ActorAddress] = {}
@@ -131,7 +130,30 @@ class TeamFactory:
             raise
 
     @staticmethod
-    def _spawn_child(
+    def _register_subscribers(
+        orchestrator_proxy: Orchestrator,
+        subscribers: list[EventSubscriber] | None,
+    ) -> None:
+        """Register subscribers and replay missed orchestrator startup events.
+
+        The orchestrator generates its own StartMessage during ``on_start()``,
+        before any subscribers are registered. This method replays those
+        startup events so subscribers capture the full event history.
+
+        Args:
+            orchestrator_proxy: Proxy to the orchestrator actor.
+            subscribers: Optional list of event subscribers to register.
+        """
+        for sub in subscribers or []:
+            orchestrator_proxy.subscribe(sub)
+
+        if subscribers:
+            for msg in orchestrator_proxy.get_messages():
+                for sub in subscribers:
+                    sub.on_message(msg)
+
+    @staticmethod
+    def _spawn_through_parent(
         agent_class: type[Akgent[Any, Any]],
         parent_addr: ActorAddress,
         config: BaseConfig,
@@ -180,8 +202,8 @@ class TeamFactory:
     ) -> dict[str, ActorAddress]:
         """Spawn a member and its subordinates recursively.
 
-        Agents are spawned through the parent via ``_spawn_child()`` so that
-        ``_orchestrator`` and ``_parent`` propagate automatically.
+        Agents are spawned through the parent via ``_spawn_through_parent()``
+        so that ``_orchestrator`` and ``_parent`` propagate automatically.
 
         Args:
             member: The TeamCardMember to spawn.
@@ -196,7 +218,7 @@ class TeamFactory:
         name = member.card.config.name
 
         if member.headcount == 1:
-            addr = TeamFactory._spawn_child(
+            addr = TeamFactory._spawn_through_parent(
                 agent_class, parent_addr,
                 config=member.card.get_config_copy(),
             )
@@ -207,7 +229,7 @@ class TeamFactory:
                 indexed_name = f"{name}_{i}"
                 config = member.card.get_config_copy()
                 config.name = indexed_name
-                addr = TeamFactory._spawn_child(
+                addr = TeamFactory._spawn_through_parent(
                     agent_class, parent_addr,
                     config=config,
                 )

@@ -1,15 +1,12 @@
 """Integration tests for TeamManager lifecycle: create, stop, resume.
 
 Tests use real Akgent subclasses, real orchestrators, and real event flow.
-Tests that fail due to the _spawn_child bug are marked with
-@pytest.mark.skip(reason="Awaiting factory fix - Story 11.2").
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
@@ -110,7 +107,6 @@ class TestLifecycleIntegration:
         events = event_store.load_events(team_id)
         assert len(events) > 0, "No events persisted"
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_resume_team_is_functional(
         self,
         actor_system: ActorSystem,
@@ -150,7 +146,6 @@ class TestLifecycleIntegration:
         )
         assert reached, "Message 'message-2' did not reach entry agent on resumed team"
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_resume_team_preserves_agent_state(
         self,
         actor_system: ActorSystem,
