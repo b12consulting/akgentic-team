@@ -240,15 +240,19 @@ class TeamRuntime(SerializableBaseModel):
         return self._message_cls(content=content)  # type: ignore[call-arg]
 
     def send(self, content: str) -> None:
-        """Broadcast a message to all supervisors via the entry proxy.
+        """Send a message into the team through the entry-point agent.
 
-        Creates a message from the team's declared message type and sends
-        it via the entry proxy to each supervisor address.
+        The message is delivered to the entry-point agent's inbox so it
+        flows through the agent's normal message handler (e.g.
+        ``receiveMsg_UserMessage``), enabling routing via ``routes_to``.
+        Additionally, the message is relayed to each supervisor via the
+        entry proxy for direct delivery.
 
         Args:
             content: The message content to broadcast.
         """
         message = self._make_message(content)
+        self.actor_system.tell(self.entry_addr, message)
         for addr in self.supervisor_addrs.values():
             self._entry_proxy.send(addr, message)
 

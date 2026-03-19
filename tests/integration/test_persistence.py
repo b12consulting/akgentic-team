@@ -11,7 +11,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.messages.message import UserMessage
 
@@ -83,7 +82,6 @@ class TestPersistenceIntegration:
             f"Expected at least 3 events, got {len(events)}"
         )
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_restored_team_routes_messages(
         self,
         actor_system: ActorSystem,

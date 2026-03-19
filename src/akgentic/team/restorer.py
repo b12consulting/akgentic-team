@@ -251,7 +251,7 @@ class TeamRestorer:
 
             config = sm.config.model_copy()
 
-            addr = TeamFactory._spawn_child(
+            addr = TeamFactory._spawn_through_parent(
                 agent_class,
                 orchestrator_addr,
                 config=config,

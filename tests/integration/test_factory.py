@@ -7,7 +7,6 @@ Tests that fail due to the _spawn_child bug are marked with
 
 from __future__ import annotations
 
-import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.orchestrator import Orchestrator
 
@@ -47,7 +46,6 @@ class TestFactoryIntegration:
             assert addr is not None, f"Agent '{name}' not found via orchestrator"
             assert addr.is_alive(), f"Agent '{name}' is not alive"
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_built_team_message_reaches_target(
         self,
         routing_team_card: TeamCard,
@@ -66,7 +64,6 @@ class TestFactoryIntegration:
         )
         assert reached, "Message 'hello' did not reach worker agent"
 
-    @pytest.mark.skip(reason="Awaiting factory fix - Story 11.2")
     def test_built_team_routes_to_resolves_to_existing_agents(
         self,
         routing_team_card: TeamCard,
