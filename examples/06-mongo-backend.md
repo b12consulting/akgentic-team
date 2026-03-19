@@ -95,10 +95,11 @@ Collections and indexes are created automatically on initialization.
 
 ## Common Pitfalls
 
-1. **Missing pymongo dependency**: `MongoEventStore` requires `pymongo`. Install via:
+1. **Missing pymongo dependency**: `MongoEventStore` requires `pymongo` at runtime. Install via:
    ```bash
    pip install akgentic-team[mongo]
    ```
+   To run this example, you also need `mongomock` (included in the `[dev]` extra).
 
 2. **mongomock is dev-only**: `mongomock` is a test/dev dependency. Production deployments use real `pymongo` with a MongoDB server.
 

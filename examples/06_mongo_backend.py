@@ -212,12 +212,14 @@ def main() -> None:
         print(f"\n  Events collection ({events_count} documents):")
         for doc in db["events"].find({}):
             doc.pop("_id", None)
-            print(f"    seq={doc.get('sequence')}, team_id={doc.get('team_id')[:8]}...")
+            print(f"    seq={doc.get('sequence')}, team_id={str(doc.get('team_id', ''))[:8]}...")
 
         print(f"\n  Agent states collection ({agent_states_count} documents):")
         for doc in db["agent_states"].find({}):
             doc.pop("_id", None)
-            print(f"    agent_id={doc.get('agent_id')}, team_id={doc.get('team_id')[:8]}...")
+            agent_id = doc.get("agent_id", "")
+            team_id_short = str(doc.get("team_id", ""))[:8]
+            print(f"    agent_id={agent_id}, team_id={team_id_short}...")
 
         # ============================================================
         # STOP
@@ -321,6 +323,7 @@ def main() -> None:
         # --- 1.13: Guaranteed cleanup ---
         print("\n=== Shutting down ActorSystem ===")
         actor_system.shutdown()
+        client.close()
         print("  ActorSystem shut down cleanly.")
 
 

@@ -52,4 +52,4 @@ uv run python examples/06_mongo_backend.py
 ## Dependencies
 
 - Examples 01-05 depend on `akgentic-core` and `akgentic-team` only.
-- Example 06 additionally requires `mongomock`, available via the `[mongo]` extra.
+- Example 06 additionally requires `mongomock` (included in the `[dev]` extra) and `pymongo` (included in the `[mongo]` extra).
