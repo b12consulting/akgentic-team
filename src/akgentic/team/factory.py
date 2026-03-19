@@ -29,6 +29,7 @@ class TeamFactory:
         team_card: TeamCard,
         actor_system: ActorSystem,
         subscribers: list[EventSubscriber] | None = None,
+        team_id: uuid.UUID | None = None,
     ) -> TeamRuntime:
         """Build a running team from a declarative TeamCard.
 
@@ -40,6 +41,9 @@ class TeamFactory:
             team_card: Declarative team definition with entry point and members.
             actor_system: The actor system to host the team's actors.
             subscribers: Optional event subscribers to register with the orchestrator.
+            team_id: Optional pre-generated team identifier. If None, a new UUID
+                is generated. Allows callers (e.g. TeamManager) to know the team_id
+                before build completes.
 
         Returns:
             A TeamRuntime with all actor addresses populated and proxies rebuilt.
@@ -48,7 +52,7 @@ class TeamFactory:
             Exception: If any agent spawn fails, all already-spawned actors are
                 torn down and the original exception is re-raised.
         """
-        team_id = uuid.uuid4()
+        team_id = team_id or uuid.uuid4()
         spawned_addrs: list[ActorAddress] = []
 
         if team_card.entry_point.headcount != 1:
