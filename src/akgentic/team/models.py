@@ -242,20 +242,21 @@ class TeamRuntime(SerializableBaseModel):
     def send(self, content: str) -> None:
         """Send a message into the team through the entry-point agent.
 
-        The message is delivered to the entry-point agent's inbox so it
-        flows through the agent's normal message handler (e.g.
-        ``receiveMsg_UserMessage``), enabling routing via ``routes_to``.
-        Additionally, the message is relayed to each supervisor via the
-        entry proxy for direct delivery.
+        Routes through the entry proxy so that ``sender`` is set to the
+        entry agent (matching V1 behavior). Each recipient gets its own
+        message instance to avoid shared mutable state between actors.
+
+        For flat teams (no supervisors), the entry agent receives the
+        message directly and can route via ``routes_to``.  For hierarchical
+        teams, supervisors also receive a copy.
 
         Args:
-            content: The message content to broadcast.
+            content: The message content to send.
         """
-        message = self._make_message(content)
-        self.actor_system.tell(self.entry_addr, message)
+        self._entry_proxy.send(self.entry_addr, self._make_message(content))
         for addr in self.supervisor_addrs.values():
             if addr != self.entry_addr:
-                self._entry_proxy.send(addr, message)
+                self._entry_proxy.send(addr, self._make_message(content))
 
     def send_to(self, agent_name: str, content: str) -> None:
         """Send a directed message to a specific agent by name.
