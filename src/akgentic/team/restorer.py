@@ -97,7 +97,7 @@ class TeamRestorer:
 
             # Phase 3: Replay events
             self._replay_events(
-                result.orchestrator_proxy, result.persistence_sub, events
+                team_id, result.orchestrator_proxy, result.persistence_sub, events
             )
 
             # Build and return TeamRuntime
@@ -336,6 +336,7 @@ class TeamRestorer:
 
     def _replay_events(
         self,
+        team_id: uuid.UUID,
         orchestrator_proxy: Orchestrator,
         persistence_sub: PersistenceSubscriber,
         events: list[PersistedEvent],
@@ -343,11 +344,12 @@ class TeamRestorer:
         """Phase 3: Replay all persisted events through the orchestrator.
 
         Args:
+            team_id: The team identifier (used for logging context).
             orchestrator_proxy: Proxy to the restored orchestrator actor.
             persistence_sub: The persistence subscriber to toggle restoring flag.
             events: Sorted persisted events to replay.
         """
-        logger.info("Replaying %d events", len(events))
+        logger.info("Restoring team %s: phase 3 -- replaying %d events", team_id, len(events))
 
         for pe in events:
             orchestrator_proxy.restore_message(pe.event)
