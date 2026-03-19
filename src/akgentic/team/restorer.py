@@ -106,7 +106,8 @@ class TeamRestorer:
             agent_starts: list[StartMessage] = []
 
             for sm in live_starts:
-                assert sm.sender is not None  # noqa: S101
+                if sm.sender is None:  # pragma: no cover – filtered earlier
+                    continue
                 sender_type = sm.sender.serialize().get("__actor_type__", "")
                 if sender_type == orchestrator_class_name:
                     orchestrator_start = sm
@@ -117,7 +118,9 @@ class TeamRestorer:
                 msg = f"No Orchestrator StartMessage found for team {team_id}"
                 raise ValueError(msg)
 
-            assert orchestrator_start.sender is not None  # noqa: S101
+            if orchestrator_start.sender is None:  # pragma: no cover
+                msg = f"Orchestrator StartMessage has no sender for team {team_id}"
+                raise ValueError(msg)
             orchestrator_addr = self._actor_system.createActor(
                 Orchestrator,
                 restoring=True,
@@ -146,7 +149,8 @@ class TeamRestorer:
             addrs: dict[str, ActorAddress] = {}
 
             for sm in agent_starts:
-                assert sm.sender is not None  # noqa: S101
+                if sm.sender is None:  # pragma: no cover – filtered earlier
+                    continue
                 sender_type = sm.sender.serialize().get("__actor_type__", "")
                 agent_class: type[Akgent[Any, Any]] = import_class(sender_type)
                 agent_name = sm.sender.name

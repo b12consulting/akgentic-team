@@ -347,6 +347,26 @@ class TestTeamRestorerRestore:
         # Team is functional after restore
         assert runtime.orchestrator_addr.is_alive()
 
+    def test_restore_get_team_works_after_restore(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """get_team() returns agents after restore (restore_message populates history)."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        team = runtime.orchestrator_proxy.get_team()
+        team_names = {addr.name for addr in team}
+        # Both lead and worker should appear in orchestrator's team
+        assert "lead" in team_names
+        assert "worker" in team_names
+
     def test_restore_supervisor_addrs_populated(
         self,
         actor_system: ActorSystem,
@@ -364,6 +384,55 @@ class TestTeamRestorerRestore:
 
         # lead is a supervisor (has subordinates)
         assert "lead" in runtime.supervisor_addrs
+
+    def test_restore_with_agent_state_snapshots(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 11: Persisted AgentStateSnapshot is restored via init_state()."""
+        from unittest.mock import patch as mock_patch
+
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        # Inject a state snapshot for the "lead" agent
+        snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="lead",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(snapshot)
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        # Track init_state calls via spy
+        init_state_calls: list[str] = []
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(
+            addr: ActorAddress, cls: type[Any],
+        ) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init = proxy.init_state
+
+                def tracked_init(state: Any) -> None:
+                    init_state_calls.append("lead")
+                    return original_init(state)
+
+                proxy.init_state = tracked_init
+            return proxy
+
+        with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime, _ = restorer.restore(process)
+
+        # Verify init_state was called for the agent with snapshot
+        assert "lead" in init_state_calls
+        assert runtime.addrs["lead"].is_alive()
 
     def test_restore_agent_profiles_registered(
         self,
@@ -508,6 +577,10 @@ class TestTeamRestorerRollback:
 
         restorer = TeamRestorer(actor_system, event_store)
 
+        # Track orchestrator actor created before failure
+        import pykka
+        actors_before = len(pykka.ActorRegistry.get_all())
+
         # Patch import_class to fail when resolving the lead agent class
         with patch(
             "akgentic.team.restorer.import_class",
@@ -515,6 +588,12 @@ class TestTeamRestorerRollback:
         ):
             with pytest.raises(ImportError, match="cannot find agent class"):
                 restorer.restore(process)
+
+        # After rollback, no new actors should remain alive
+        actors_after = len(pykka.ActorRegistry.get_all())
+        assert actors_after == actors_before, (
+            f"Rollback failed: {actors_after - actors_before} actor(s) leaked"
+        )
 
     def test_subscriber_factory_called(
         self,
