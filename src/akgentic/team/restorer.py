@@ -15,6 +15,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.orchestrator import StartMessage, StopMessage
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.deserializer import import_class
+from akgentic.team.factory import TeamFactory
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -238,8 +239,6 @@ class TeamRestorer:
         Returns:
             A dict mapping agent names to their actor addresses.
         """
-        from akgentic.team.factory import TeamFactory
-
         addrs: dict[str, ActorAddress] = {}
 
         for sm in agent_starts:

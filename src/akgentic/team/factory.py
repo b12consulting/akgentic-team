@@ -168,7 +168,9 @@ class TeamFactory:
             parent=parent_addr,
             orchestrator=orchestrator_addr,
         )
-        return ActorAddressImpl(actor_ref)
+        child_addr = ActorAddressImpl(actor_ref)
+        parent_actor._children.append(child_addr)
+        return child_addr
 
     @staticmethod
     def _spawn_member(
