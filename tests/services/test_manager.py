@@ -410,6 +410,7 @@ def _create_and_stop_team(
     from akgentic.core.messages.orchestrator import StartMessage
     from akgentic.core.orchestrator import Orchestrator
     from akgentic.core.utils.deserializer import ActorAddressDict
+
     from akgentic.team.models import PersistedEvent
 
     tc = team_card or _make_team_card()
@@ -577,7 +578,7 @@ class TestTeamManagerResume:
         # Reset mock to clear the create_team call
         mock_registry.register_team.reset_mock()
 
-        runtime = mgr.resume_team(team_id)
+        mgr.resume_team(team_id)
 
         mock_registry.register_team.assert_called_once_with(instance_id, team_id)
 
@@ -599,6 +600,7 @@ class TestTeamManagerDeleteDataPurge:
         from datetime import UTC, datetime
 
         from akgentic.core.messages.message import UserMessage
+
         from akgentic.team.models import AgentStateSnapshot, PersistedEvent
 
         manager = TeamManager(actor_system=actor_system, event_store=event_store)
