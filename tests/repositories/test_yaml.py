@@ -205,6 +205,43 @@ class TestYamlEventStore:
         assert isinstance(loaded[0].state, SampleAgentState)
         assert loaded[0].state.task_count == 5
 
+    # --- list_teams ---
+
+    def test_list_teams_returns_empty_when_no_teams(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """AC9: list_teams returns [] when data dir has no team directories."""
+        result = yaml_store.list_teams()
+        assert result == []
+
+    def test_list_teams_returns_all_teams(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """AC9: list_teams returns all saved team processes."""
+        p1 = make_process()
+        p2 = make_process()
+        yaml_store.save_team(p1)
+        yaml_store.save_team(p2)
+
+        result = yaml_store.list_teams()
+        assert len(result) == 2
+        ids = {p.team_id for p in result}
+        assert ids == {p1.team_id, p2.team_id}
+
+    def test_list_teams_ignores_non_team_directories(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """AC9: list_teams skips non-UUID directories like .gitkeep."""
+        p1 = make_process()
+        yaml_store.save_team(p1)
+        # Create non-team entries
+        (tmp_path / ".gitkeep").touch()
+        (tmp_path / "__pycache__").mkdir()
+
+        result = yaml_store.list_teams()
+        assert len(result) == 1
+        assert result[0].team_id == p1.team_id
+
     # --- Protocol compliance ---
 
     def test_satisfies_event_store_protocol(self, tmp_path: Path) -> None:

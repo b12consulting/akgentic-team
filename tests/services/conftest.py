@@ -46,6 +46,10 @@ class InMemoryEventStore:
         """Persist an agent state snapshot."""
         self.agent_states[(snapshot.team_id, snapshot.agent_id)] = snapshot
 
+    def list_teams(self) -> list[Process]:
+        """Load all team process snapshots."""
+        return list(self.teams.values())
+
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
         """Load all agent state snapshots for a team."""
         return [v for k, v in self.agent_states.items() if k[0] == team_id]

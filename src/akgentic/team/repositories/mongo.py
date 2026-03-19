@@ -99,6 +99,26 @@ class MongoEventStore:
         logger.debug("Loaded team %s", team_id)
         return process
 
+    def list_teams(self) -> list[Process]:
+        """Load all team process snapshots from the teams collection.
+
+        Queries all documents in the ``teams`` collection and reconstructs
+        each as a Process via ``model_validate()``. Corrupted documents
+        are skipped with a warning.
+
+        Returns:
+            List of all loadable Process snapshots.
+        """
+        teams: list[Process] = []
+        for doc in self._teams.find({}):
+            doc.pop("_id", None)
+            try:
+                teams.append(Process.model_validate(doc))
+            except (ValueError, TypeError) as exc:
+                logger.warning("Skipping corrupted team document: %s", exc)
+        logger.debug("Listed %d teams", len(teams))
+        return teams
+
     def save_event(self, event: PersistedEvent) -> None:
         """Persist a single domain event (append-only).
 
