@@ -271,3 +271,89 @@ class TestTeamFactoryBuild:
         with patch.object(ActorAddress, "stop", side_effect=RuntimeError("stop failed")):
             with pytest.raises(RuntimeError, match="intentional error"):
                 TeamFactory.build(tc, actor_system)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Hierarchy propagation (Story 10-1, AC 1, 2, 5)
+# ---------------------------------------------------------------------------
+
+
+class TestFactoryHierarchyPropagation:
+    """AC 1,2,5: Spawned agents have _orchestrator and _parent set."""
+
+    def test_orchestrator_set_on_spawned_agents(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 1,5: _orchestrator is not None on all spawned agents."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        for name, addr in runtime.addrs.items():
+            proxy: Akgent[Any, Any] = actor_system.proxy_ask(addr, Akgent)
+            orch = proxy.orchestrator
+            assert orch is not None, f"Agent '{name}' has _orchestrator=None"
+            assert orch.is_alive(), f"Agent '{name}' orchestrator is not alive"
+
+    def test_parent_set_correctly_for_top_level_agents(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 2,5: Top-level agents have orchestrator as parent."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        # Both lead (entry point) and worker (top-level member) should have
+        # the orchestrator as parent
+        for name in ("lead", "worker"):
+            addr = runtime.addrs[name]
+            impl = addr  # ActorAddressImpl
+            actor = impl._actor_ref._actor  # type: ignore[union-attr]
+            assert actor._parent is not None, f"Agent '{name}' has _parent=None"
+            assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
+                f"Agent '{name}' parent is not the orchestrator"
+            )
+
+    def test_parent_set_correctly_for_subordinates(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 2,5: Subordinate agents have their supervisor as parent."""
+        worker = _make_member("worker", "Worker")
+        supervisor = _make_member("supervisor", "Supervisor", members=[worker])
+        tc = _make_team_card(members=[supervisor])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        # Worker should have supervisor as parent, not orchestrator
+        worker_addr = runtime.addrs["worker"]
+        worker_actor = worker_addr._actor_ref._actor  # type: ignore[union-attr]
+        supervisor_addr = runtime.addrs["supervisor"]
+
+        assert worker_actor._parent is not None
+        assert worker_actor._parent.agent_id == supervisor_addr.agent_id, (
+            "Worker's parent should be the supervisor"
+        )
+
+        # Supervisor should have orchestrator as parent
+        supervisor_actor = supervisor_addr._actor_ref._actor  # type: ignore[union-attr]
+        assert supervisor_actor._parent is not None
+        assert supervisor_actor._parent.agent_id == runtime.orchestrator_addr.agent_id
+
+    def test_orchestrator_set_on_headcount_agents(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 5: _orchestrator is set on agents with headcount > 1."""
+        multi = _make_member("worker", "Worker", headcount=2)
+        tc = _make_team_card(members=[multi])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        for name in ("worker_0", "worker_1"):
+            proxy: Akgent[Any, Any] = actor_system.proxy_ask(
+                runtime.addrs[name], Akgent
+            )
+            assert proxy.orchestrator is not None, (
+                f"Agent '{name}' has _orchestrator=None"
+            )

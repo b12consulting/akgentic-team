@@ -618,3 +618,58 @@ class TestTeamRestorerRollback:
         # Stop and verify on_stop called
         runtime.orchestrator_addr.stop()
         assert recording.stopped is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: Hierarchy propagation during restore (Story 10-1, AC 3, 5)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerHierarchyPropagation:
+    """AC 3,5: Restored agents have _orchestrator set."""
+
+    def test_orchestrator_set_on_restored_agents(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3,5: _orchestrator is not None on agents rebuilt during restore."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        for name, addr in runtime.addrs.items():
+            proxy: Akgent[Any, Any] = actor_system.proxy_ask(addr, Akgent)
+            orch = proxy.orchestrator
+            assert orch is not None, f"Restored agent '{name}' has _orchestrator=None"
+            assert orch.is_alive(), (
+                f"Restored agent '{name}' orchestrator is not alive"
+            )
+
+    def test_parent_set_on_restored_agents(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 5: _parent is set on agents rebuilt during restore."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        # All restored agents should have orchestrator as parent
+        for name, addr in runtime.addrs.items():
+            actor = addr._actor_ref._actor  # type: ignore[union-attr]
+            assert actor._parent is not None, (
+                f"Restored agent '{name}' has _parent=None"
+            )
+            assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
+                f"Restored agent '{name}' parent is not the orchestrator"
+            )
