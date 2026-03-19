@@ -79,7 +79,7 @@ class MongoEventStore:
         """Load a team process snapshot by ID.
 
         Queries the ``teams`` collection by ``team_id``. Returns None if no
-        document is found.
+        document is found or if the stored document is corrupted.
 
         Args:
             team_id: Unique identifier of the team.
@@ -91,7 +91,11 @@ class MongoEventStore:
         if doc is None:
             return None
         doc.pop("_id", None)
-        process = Process.model_validate(doc)
+        try:
+            process = Process.model_validate(doc)
+        except (ValueError, TypeError) as exc:
+            logger.error("Corrupted team document for team %s: %s", team_id, exc)
+            return None
         logger.debug("Loaded team %s", team_id)
         return process
 
@@ -124,7 +128,12 @@ class MongoEventStore:
         events: list[PersistedEvent] = []
         for doc in cursor:
             doc.pop("_id", None)
-            events.append(PersistedEvent.model_validate(doc))
+            try:
+                events.append(PersistedEvent.model_validate(doc))
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Skipping corrupted event for team %s: %s", team_id, exc
+                )
         logger.debug("Loaded %d events for team %s", len(events), team_id)
         return events
 
@@ -162,7 +171,12 @@ class MongoEventStore:
         snapshots: list[AgentStateSnapshot] = []
         for doc in cursor:
             doc.pop("_id", None)
-            snapshots.append(AgentStateSnapshot.model_validate(doc))
+            try:
+                snapshots.append(AgentStateSnapshot.model_validate(doc))
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Skipping corrupted agent state for team %s: %s", team_id, exc
+                )
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
 

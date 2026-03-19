@@ -12,7 +12,6 @@ import uuid
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-import pytest
 from akgentic.core.messages.message import UserMessage
 
 from akgentic.team.models import TeamStatus
@@ -196,6 +195,70 @@ class TestMongoEventStore:
         assert isinstance(loaded[0].state, SampleAgentState)
         assert loaded[0].state.task_count == 5
 
+    # --- Corrupted data resilience ---
+
+    def test_load_team_returns_none_for_corrupted_document(
+        self, mongo_store: MongoEventStore, mongo_db: object
+    ) -> None:
+        """Corrupted team document returns None instead of raising."""
+        from mongomock import Database as MockDB
+
+        db: MockDB = mongo_db  # type: ignore[assignment]
+        db["teams"].insert_one({"team_id": "bad-uuid", "status": "INVALID", "_bogus": True})
+        result = mongo_store.load_team(uuid.UUID("00000000-0000-0000-0000-000000000000"))
+        # No document matches, so None
+        assert result is None
+
+        # Insert a document with a valid team_id but corrupted fields
+        team_id = uuid.uuid4()
+        db["teams"].insert_one({"team_id": str(team_id), "not_a_valid_field": 123})
+        result = mongo_store.load_team(team_id)
+        assert result is None
+
+    def test_load_events_skips_corrupted_documents(
+        self, mongo_store: MongoEventStore, mongo_db: object
+    ) -> None:
+        """Corrupted event documents are skipped; valid ones still loaded."""
+        from mongomock import Database as MockDB
+
+        db: MockDB = mongo_db  # type: ignore[assignment]
+        team_id = uuid.uuid4()
+
+        # Insert a valid event
+        valid_event = make_persisted_event(team_id=team_id, sequence=1)
+        mongo_store.save_event(valid_event)
+
+        # Insert a corrupted event document directly
+        db["events"].insert_one(
+            {"team_id": str(team_id), "sequence": 2, "corrupted": True}
+        )
+
+        loaded = mongo_store.load_events(team_id)
+        assert len(loaded) == 1
+        assert loaded[0].sequence == 1
+
+    def test_load_agent_states_skips_corrupted_documents(
+        self, mongo_store: MongoEventStore, mongo_db: object
+    ) -> None:
+        """Corrupted agent state documents are skipped; valid ones still loaded."""
+        from mongomock import Database as MockDB
+
+        db: MockDB = mongo_db  # type: ignore[assignment]
+        team_id = uuid.uuid4()
+
+        # Save a valid snapshot
+        snap = make_agent_state_snapshot(team_id=team_id, agent_id="good-agent")
+        mongo_store.save_agent_state(snap)
+
+        # Insert a corrupted agent state document directly
+        db["agent_states"].insert_one(
+            {"team_id": str(team_id), "agent_id": "bad-agent", "corrupted": True}
+        )
+
+        loaded = mongo_store.load_agent_states(team_id)
+        assert len(loaded) == 1
+        assert loaded[0].agent_id == "good-agent"
+
     # --- Protocol compliance (AC9) ---
 
     def test_satisfies_event_store_protocol(
@@ -220,20 +283,37 @@ class TestMongoEventStore:
 
         import akgentic.team.repositories as repos_module
 
-        # Remove cached mongo module so reload actually re-imports
+        # Save and remove cached mongo and pymongo modules
         mongo_module_key = "akgentic.team.repositories.mongo"
-        saved_mongo = sys.modules.pop(mongo_module_key, None)
+        saved: dict[str, object] = {}
+        for key in list(sys.modules):
+            if key.startswith(mongo_module_key):
+                saved[key] = sys.modules.pop(key)
+        pymongo_saved: dict[str, object] = {}
+        for key in list(sys.modules):
+            if key.startswith("pymongo"):
+                pymongo_saved[key] = sys.modules.pop(key)
 
         try:
             # Simulate pymongo being unavailable
             with patch.dict(
-                "sys.modules",
+                sys.modules,
                 {"pymongo": None, "pymongo.database": None, "pymongo.collection": None},
             ):
+                # Verify repositories __init__ removes MongoEventStore from __all__
                 importlib.reload(repos_module)
                 assert "MongoEventStore" not in repos_module.__all__
+
+                # Verify direct import of mongo module raises helpful ImportError
+                try:
+                    importlib.import_module(mongo_module_key)
+                    msg = "Expected ImportError was not raised"
+                    raise AssertionError(msg)
+                except ImportError as exc:
+                    assert "pymongo is required" in str(exc)
+                    assert "akgentic-team[mongo]" in str(exc)
         finally:
-            # Restore cached module and reload to normal state
-            if saved_mongo is not None:
-                sys.modules[mongo_module_key] = saved_mongo
+            # Restore all saved modules
+            sys.modules.update(saved)  # type: ignore[arg-type]
+            sys.modules.update(pymongo_saved)  # type: ignore[arg-type]
             importlib.reload(repos_module)
