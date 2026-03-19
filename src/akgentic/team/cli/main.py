@@ -289,13 +289,21 @@ def create_cmd(
         )
         raise typer.Exit(code=1) from exc
 
-    console = Console()
-    console.print(f"Team created: {runtime.id}")
+    logger.info("Team created: %s", runtime.id)
+    Console().print(f"Team created: {runtime.id}")
 
     # Non-interactive in 6.2: create, display, stop, exit.
     # Story 6.3 adds blocking/SIGINT behavior.
-    team_manager.stop_team(runtime.id)
-    console.print(f"Team stopped: {runtime.id}")
+    try:
+        team_manager.stop_team(runtime.id)
+    except Exception as stop_exc:  # noqa: BLE001
+        err_console.print(
+            f"[red]Error:[/red] Team created ({runtime.id}) but failed to stop: {stop_exc}"
+        )
+        raise typer.Exit(code=1) from stop_exc
+
+    logger.info("Team stopped: %s", runtime.id)
+    Console().print(f"Team stopped: {runtime.id}")
 
 
 @app.command(name="delete")
@@ -338,5 +346,5 @@ def delete_cmd(
         raise typer.Exit(code=1)
 
     event_store.delete_team(parsed_id)
-    console = Console()
-    console.print(f"Team '{team_id}' deleted.")
+    logger.info("Team deleted: %s", team_id)
+    Console().print(f"Team '{team_id}' deleted.")

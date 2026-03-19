@@ -258,7 +258,7 @@ class TestCreateCommand:
             app, ["--data-dir", str(data_dir), "create", str(bad_file)]
         )
         assert result.exit_code == 1
-        assert "Invalid YAML" in result.output or "Invalid TeamCard" in result.output
+        assert "Invalid YAML" in result.output
 
     def test_create_invalid_team_card_structure(
         self, cli_runner: CliRunner, data_dir: Path
@@ -272,6 +272,19 @@ class TestCreateCommand:
         )
         assert result.exit_code == 1
         assert "Invalid TeamCard" in result.output
+
+    def test_create_team_build_failure(
+        self, cli_runner: CliRunner, data_dir: Path
+    ) -> None:
+        """Error path: TeamFactory.build failure shows friendly error, exit code 1."""
+        team_card = make_team_card(agent_class="nonexistent.module.FakeAgent")
+        card_file = _write_team_card_yaml(team_card, data_dir)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "create", str(card_file)]
+        )
+        assert result.exit_code == 1
+        assert "Failed to create team" in result.output
 
 
 class TestDeleteCommand:
