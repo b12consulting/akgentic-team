@@ -32,7 +32,7 @@ class TeamManager:
         self,
         actor_system: ActorSystem,
         event_store: EventStore,
-        service_registry: ServiceRegistry = NullServiceRegistry(),
+        service_registry: ServiceRegistry | None = None,
         subscriber_factory: Callable[[uuid.UUID], list[EventSubscriber]] | None = None,
         instance_id: uuid.UUID | None = None,
     ) -> None:
@@ -49,7 +49,7 @@ class TeamManager:
         """
         self._actor_system = actor_system
         self._event_store = event_store
-        self._service_registry = service_registry
+        self._service_registry = service_registry or NullServiceRegistry()
         self._subscriber_factory = subscriber_factory
         self._instance_id = instance_id or uuid.uuid4()
 
@@ -138,40 +138,44 @@ class TeamManager:
         """
         process = self._event_store.load_team(team_id)
         if process is None:
+            logger.warning("Delete rejected: team %s not found", team_id)
             msg = f"Team {team_id} not found"
             raise ValueError(msg)
         if process.status == TeamStatus.RUNNING:
+            logger.warning("Delete rejected: team %s is currently running", team_id)
             msg = (
                 f"Cannot delete team {team_id}: "
                 f"team is currently running. Stop it first."
             )
             raise ValueError(msg)
         if process.status == TeamStatus.DELETED:
+            logger.warning("Delete rejected: team %s is already deleted", team_id)
             msg = f"Team {team_id} is already deleted"
             raise ValueError(msg)
 
-        # STOPPED — purge all data
+        # STOPPED — purge all data and deregister from service discovery
         logger.info("Deleting team %s", team_id)
         self._event_store.delete_team(team_id)
+        self._service_registry.deregister_team(self._instance_id, team_id)
 
     def resume_team(self, team_id: uuid.UUID) -> TeamRuntime:
-        """Resume a stopped team. Implemented in story 3.2.
+        """Resume a stopped team. Stub for story 3.2.
 
         Args:
             team_id: The team identifier to resume.
 
         Raises:
-            NotImplementedError: Always — this is a stub for story 3.2.
+            NotImplementedError: Always — to be implemented in story 3.2.
         """
-        raise NotImplementedError("Implemented in story 3.2")
+        raise NotImplementedError("To be implemented in story 3.2")
 
     def stop_team(self, team_id: uuid.UUID) -> None:
-        """Gracefully stop a running team. Implemented in story 4.2.
+        """Gracefully stop a running team. Stub for story 4.2.
 
         Args:
             team_id: The team identifier to stop.
 
         Raises:
-            NotImplementedError: Always — this is a stub for story 4.2.
+            NotImplementedError: Always — to be implemented in story 4.2.
         """
-        raise NotImplementedError("Implemented in story 4.2")
+        raise NotImplementedError("To be implemented in story 4.2")

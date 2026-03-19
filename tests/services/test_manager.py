@@ -145,8 +145,12 @@ class TestTeamManagerCreate:
         event_store: InMemoryEventStore,
     ) -> None:
         """AC 2,4,5,7: create_team returns TeamRuntime and persists RUNNING Process."""
+        from datetime import UTC, datetime, timedelta
+
+        before = datetime.now(UTC)
         tc = _make_team_card()
         runtime = manager.create_team(tc, user_id="test-user", user_email="u@test.com")
+        after = datetime.now(UTC)
 
         assert isinstance(runtime, TeamRuntime)
         assert runtime.orchestrator_addr.is_alive()
@@ -158,6 +162,10 @@ class TestTeamManagerCreate:
         assert process.user_id == "test-user"
         assert process.user_email == "u@test.com"
         assert process.team_card.name == "test-team"
+
+        # Timestamps are set to reasonable values
+        assert before - timedelta(seconds=1) <= process.created_at <= after + timedelta(seconds=1)
+        assert process.created_at == process.updated_at
 
     def test_create_team_with_subscriber_factory(
         self,
@@ -345,3 +353,35 @@ class TestTeamManagerServiceRegistry:
         runtime = mgr.create_team(tc)
 
         mock_registry.register_team.assert_called_once_with(instance_id, runtime.id)
+
+    def test_deregister_team_called_on_delete(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """deregister_team is called with instance_id and team_id on delete."""
+        from datetime import UTC, datetime
+
+        mock_registry = MagicMock(spec=NullServiceRegistry)
+        instance_id = uuid.uuid4()
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            service_registry=mock_registry,
+            instance_id=instance_id,
+        )
+        team_id = uuid.uuid4()
+        process = Process(
+            team_id=team_id,
+            team_card=_make_team_card(),
+            status=TeamStatus.STOPPED,
+            user_id="cli",
+            user_email="",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_team(process)
+
+        mgr.delete_team(team_id)
+
+        mock_registry.deregister_team.assert_called_once_with(instance_id, team_id)
