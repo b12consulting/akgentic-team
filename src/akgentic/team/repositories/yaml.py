@@ -110,6 +110,32 @@ class YamlEventStore:
         logger.debug("Loaded team %s from %s", team_id, team_path)
         return process
 
+    def list_teams(self) -> list[Process]:
+        """Load all team process snapshots from the data directory.
+
+        Iterates subdirectories of ``data_dir``, attempts to parse each
+        directory name as a UUID, and loads the team snapshot for valid
+        team directories. Non-UUID directories are skipped with a warning.
+
+        Returns:
+            List of all loadable Process snapshots.
+        """
+        if not self._data_dir.exists():
+            return []
+        teams: list[Process] = []
+        for child in sorted(self._data_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                team_id = uuid.UUID(child.name)
+            except ValueError:
+                logger.warning("Skipping non-team directory: %s", child.name)
+                continue
+            process = self.load_team(team_id)
+            if process is not None:
+                teams.append(process)
+        return teams
+
     def save_event(self, event: PersistedEvent) -> None:
         """Append a persisted event to events.yaml.
 

@@ -63,6 +63,13 @@ class EventStore(Protocol):
         """
         ...
 
+    def list_teams(self) -> list[Process]:
+        """Load all team process snapshots.
+
+        Called by the CLI to enumerate all known teams.
+        """
+        ...
+
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
         """Load all agent state snapshots for a team.
 

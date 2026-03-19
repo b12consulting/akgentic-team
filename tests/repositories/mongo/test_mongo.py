@@ -195,6 +195,29 @@ class TestMongoEventStore:
         assert isinstance(loaded[0].state, SampleAgentState)
         assert loaded[0].state.task_count == 5
 
+    # --- list_teams (AC9) ---
+
+    def test_list_teams_returns_empty_when_no_teams(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """AC9: list_teams returns [] when no teams exist."""
+        result = mongo_store.list_teams()
+        assert result == []
+
+    def test_list_teams_returns_all_teams(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """AC9: list_teams returns all saved team processes."""
+        p1 = make_process()
+        p2 = make_process()
+        mongo_store.save_team(p1)
+        mongo_store.save_team(p2)
+
+        result = mongo_store.list_teams()
+        assert len(result) == 2
+        ids = {p.team_id for p in result}
+        assert ids == {p1.team_id, p2.team_id}
+
     # --- Corrupted data resilience ---
 
     def test_load_team_returns_none_for_corrupted_document(
