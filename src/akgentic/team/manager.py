@@ -236,6 +236,60 @@ class TeamManager:
         logger.info("Team '%s' (%s) resumed successfully", process.team_card.name, team_id)
         return runtime
 
+    def _teardown_team(self, team_id: uuid.UUID, runtime: TeamRuntime) -> None:
+        """Unsubscribe all subscribers and tear down actors for a running team.
+
+        Best-effort teardown: individual failures are logged but do not prevent
+        the remaining teardown steps from executing.
+
+        Args:
+            team_id: The team identifier being stopped.
+            runtime: The active TeamRuntime containing actor addresses.
+        """
+        # Unsubscribe all tracked subscribers
+        try:
+            orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
+                runtime.orchestrator_addr, Orchestrator
+            )
+            for sub in self._subscribers.get(team_id, []):
+                try:
+                    orchestrator_proxy.unsubscribe(sub)
+                except Exception:
+                    logger.warning(
+                        "Failed to unsubscribe %s from team %s",
+                        sub,
+                        team_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                "Failed to get orchestrator proxy for team %s — "
+                "skipping unsubscribe",
+                team_id,
+                exc_info=True,
+            )
+
+        # Tear down actors: orchestrator first, then remaining agents
+        try:
+            runtime.orchestrator_addr.stop()
+        except Exception:
+            logger.warning(
+                "Failed to stop orchestrator for team %s",
+                team_id,
+                exc_info=True,
+            )
+
+        for name, addr in runtime.addrs.items():
+            try:
+                addr.stop()
+            except Exception:
+                logger.warning(
+                    "Failed to stop agent '%s' for team %s",
+                    name,
+                    team_id,
+                    exc_info=True,
+                )
+
     def stop_team(self, team_id: uuid.UUID) -> None:
         """Gracefully stop a running team.
 
@@ -270,49 +324,7 @@ class TeamManager:
         runtime = self._runtimes.get(team_id)
 
         if runtime is not None:
-            # Unsubscribe all tracked subscribers
-            try:
-                orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
-                    runtime.orchestrator_addr, Orchestrator
-                )
-                for sub in self._subscribers.get(team_id, []):
-                    try:
-                        orchestrator_proxy.unsubscribe(sub)
-                    except Exception:
-                        logger.warning(
-                            "Failed to unsubscribe %s from team %s",
-                            sub,
-                            team_id,
-                            exc_info=True,
-                        )
-            except Exception:
-                logger.warning(
-                    "Failed to get orchestrator proxy for team %s — "
-                    "skipping unsubscribe",
-                    team_id,
-                    exc_info=True,
-                )
-
-            # Tear down actors: orchestrator first, then remaining agents
-            try:
-                runtime.orchestrator_addr.stop()
-            except Exception:
-                logger.warning(
-                    "Failed to stop orchestrator for team %s",
-                    team_id,
-                    exc_info=True,
-                )
-
-            for name, addr in runtime.addrs.items():
-                try:
-                    addr.stop()
-                except Exception:
-                    logger.warning(
-                        "Failed to stop agent '%s' for team %s",
-                        name,
-                        team_id,
-                        exc_info=True,
-                    )
+            self._teardown_team(team_id, runtime)
         else:
             logger.warning(
                 "Team %s is RUNNING but no runtime tracked — "
