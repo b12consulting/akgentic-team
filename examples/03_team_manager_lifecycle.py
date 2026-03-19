@@ -17,16 +17,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from akgentic.core.actor_address import ActorAddress
-from akgentic.core.actor_address_impl import ActorAddressProxy
+from akgentic.core.actor_address_impl import ActorAddressProxy  # seed_start_events workaround
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import UserMessage
-from akgentic.core.messages.orchestrator import StartMessage
-from akgentic.core.orchestrator import Orchestrator
-from akgentic.core.utils.deserializer import ActorAddressDict
+from akgentic.core.messages.orchestrator import StartMessage  # seed_start_events workaround
+from akgentic.core.orchestrator import Orchestrator  # seed_start_events workaround
+from akgentic.core.utils.deserializer import ActorAddressDict  # seed_start_events workaround
 
 from akgentic.team.manager import TeamManager
 from akgentic.team.models import (
@@ -63,8 +63,8 @@ def seed_start_events(
     the PersistenceSubscriber. This helper seeds the event store with the
     same StartMessage events that TeamRestorer expects during restore.
 
-    This is the same pattern used in the framework's own test suite
-    (see tests/services/test_manager.py::_create_and_stop_team).
+    See the companion doc (03-team-manager-lifecycle.md) for details on
+    why this seeding step is required before resume_team() will work.
     """
     team_id = runtime.id
     seq = 0
@@ -72,6 +72,9 @@ def seed_start_events(
 
     # 1. Orchestrator StartMessage
     seq += 1
+    # NOTE: squad_id is fabricated here because the runtime does not expose
+    # the orchestrator's actual squad_id. This is harmless — squad_id is not
+    # used during restore — but the persisted value won't match the original.
     orch_addr_dict: ActorAddressDict = {
         "__actor_address__": True,
         "__actor_type__": f"{Orchestrator.__module__}.{Orchestrator.__name__}",

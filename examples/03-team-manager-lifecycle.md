@@ -55,6 +55,8 @@ process = team_manager.get_team(team_id)
 team_manager.stop_team(team_id)
 
 # Resume a stopped team -- returns fresh TeamRuntime
+# IMPORTANT: resume requires StartMessage events in the EventStore.
+# See "Common Pitfalls" below for the seeding requirement.
 new_runtime = team_manager.resume_team(team_id)
 
 # Delete a stopped team -- purges all data
