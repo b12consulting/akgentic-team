@@ -205,7 +205,12 @@ class TeamManager:
         )
         runtime, persistence_sub = restorer.restore(process)
 
-        # Build subscriber list matching what restorer registered
+        # NOTE: The restorer already called subscriber_factory and registered
+        # those subscriber instances with the orchestrator.  We call the
+        # factory again here to build a tracking list for stop_team.  These
+        # are different objects, so unsubscribe() may be a no-op for factory
+        # subscribers — but this is harmless because stop_team tears down
+        # actors immediately after unsubscribe.
         subscribers: list[EventSubscriber] = [persistence_sub]
         if self._subscriber_factory is not None:
             subscribers.extend(self._subscriber_factory(team_id))
@@ -275,13 +280,17 @@ class TeamManager:
                         orchestrator_proxy.unsubscribe(sub)
                     except Exception:
                         logger.warning(
-                            "Failed to unsubscribe %s from team %s", sub, team_id
+                            "Failed to unsubscribe %s from team %s",
+                            sub,
+                            team_id,
+                            exc_info=True,
                         )
             except Exception:
                 logger.warning(
                     "Failed to get orchestrator proxy for team %s — "
                     "skipping unsubscribe",
                     team_id,
+                    exc_info=True,
                 )
 
             # Tear down actors: orchestrator first, then remaining agents
@@ -289,7 +298,9 @@ class TeamManager:
                 runtime.orchestrator_addr.stop()
             except Exception:
                 logger.warning(
-                    "Failed to stop orchestrator for team %s", team_id
+                    "Failed to stop orchestrator for team %s",
+                    team_id,
+                    exc_info=True,
                 )
 
             for name, addr in runtime.addrs.items():
@@ -297,7 +308,10 @@ class TeamManager:
                     addr.stop()
                 except Exception:
                     logger.warning(
-                        "Failed to stop agent '%s' for team %s", name, team_id
+                        "Failed to stop agent '%s' for team %s",
+                        name,
+                        team_id,
+                        exc_info=True,
                     )
         else:
             logger.warning(

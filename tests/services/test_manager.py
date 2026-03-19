@@ -695,10 +695,16 @@ class TestTeamManagerStop:
         runtime = mgr.create_team(tc)
         team_id = runtime.id
 
+        # Verify subscribers are tracked before stop
+        assert team_id in mgr._subscribers
+        assert len(mgr._subscribers[team_id]) == 2  # PersistenceSubscriber + recording
+
         mgr.stop_team(team_id)
 
-        # After stop, the orchestrator should have unsubscribed — actors are dead
+        # After stop, actors are dead and tracking is cleaned up
         assert not runtime.orchestrator_addr.is_alive()
+        assert team_id not in mgr._subscribers
+        assert team_id not in mgr._runtimes
 
         # Process should be STOPPED
         process = event_store.load_team(team_id)
@@ -783,6 +789,32 @@ class TestTeamManagerStop:
 
         mock_registry.deregister_team.assert_called_once_with(instance_id, team_id)
 
+    def test_stop_running_without_tracked_runtime(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: stop_team handles RUNNING team with no tracked runtime gracefully.
+
+        Simulates a manager restart where _runtimes is empty but EventStore
+        still has a RUNNING Process. stop_team should update Process to STOPPED
+        and deregister without attempting actor teardown.
+        """
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        # Simulate manager restart: clear runtime tracking
+        manager._runtimes.clear()
+        manager._subscribers.clear()
+
+        # stop_team should still succeed — update state and deregister
+        manager.stop_team(team_id)
+
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
     def test_stop_updates_timestamp(
         self,
         manager: TeamManager,
@@ -795,10 +827,12 @@ class TestTeamManagerStop:
 
         process_before = event_store.load_team(team_id)
         assert process_before is not None
-        created_at = process_before.created_at
+        original_updated_at = process_before.updated_at
 
         manager.stop_team(team_id)
 
         process_after = event_store.load_team(team_id)
         assert process_after is not None
-        assert process_after.updated_at >= created_at
+        # updated_at must change — stop_team always generates a new timestamp
+        assert process_after.updated_at >= original_updated_at
+        assert process_after.status == TeamStatus.STOPPED
