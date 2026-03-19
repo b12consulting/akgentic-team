@@ -410,6 +410,7 @@ def _create_and_stop_team(
     from akgentic.core.messages.orchestrator import StartMessage
     from akgentic.core.orchestrator import Orchestrator
     from akgentic.core.utils.deserializer import ActorAddressDict
+
     from akgentic.team.models import PersistedEvent
 
     tc = team_card or _make_team_card()
@@ -577,6 +578,71 @@ class TestTeamManagerResume:
         # Reset mock to clear the create_team call
         mock_registry.register_team.reset_mock()
 
-        runtime = mgr.resume_team(team_id)
+        mgr.resume_team(team_id)
 
         mock_registry.register_team.assert_called_once_with(instance_id, team_id)
+
+
+# ---------------------------------------------------------------------------
+# Tests: delete data purge verification
+# ---------------------------------------------------------------------------
+
+
+class TestTeamManagerDeleteDataPurge:
+    """AC 1: delete_team purges all persisted data."""
+
+    def test_delete_purges_all_persisted_data(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Verify Process, events, and agent states are all purged on delete."""
+        from datetime import UTC, datetime
+
+        from akgentic.core.messages.message import UserMessage
+
+        from akgentic.team.models import AgentStateSnapshot, PersistedEvent
+
+        manager = TeamManager(actor_system=actor_system, event_store=event_store)
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        # Manually populate events and agent states to verify full purge
+        event_store.save_event(PersistedEvent(
+            team_id=team_id,
+            sequence=1,
+            event=UserMessage(content="test"),
+            timestamp=datetime.now(UTC),
+        ))
+        event_store.save_agent_state(AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="test-agent",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        ))
+
+        # Verify all three data types exist before delete
+        assert event_store.load_team(team_id) is not None
+        assert len(event_store.load_events(team_id)) > 0
+        assert len(event_store.load_agent_states(team_id)) > 0
+
+        # Manually set process to STOPPED (stop_team not yet implemented)
+        process = event_store.load_team(team_id)
+        assert process is not None
+        stopped_process = Process(
+            team_id=process.team_id,
+            team_card=process.team_card,
+            status=TeamStatus.STOPPED,
+            user_id=process.user_id,
+            user_email=process.user_email,
+            created_at=process.created_at,
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_team(stopped_process)
+
+        # Delete and verify complete purge of all three data types
+        manager.delete_team(team_id)
+        assert event_store.load_team(team_id) is None
+        assert event_store.load_events(team_id) == []
+        assert event_store.load_agent_states(team_id) == []
