@@ -210,8 +210,11 @@ def main() -> None:
             print("  PersistedEvent. StateChangedMessage triggers agent state snapshots.")
             print()
 
-            # Demonstrate PersistenceSubscriber directly -- same component that
-            # TeamManager registers with the orchestrator on create_team().
+            # Demonstrate PersistenceSubscriber directly. NOTE: TeamManager already
+            # registered one during create_team(), so events from runtime.send()
+            # are also persisted by that subscriber. This second subscriber is for
+            # explicit demonstration only -- its events will have separate sequence
+            # numbers that overlap with the TeamManager's subscriber.
             persistence_sub = PersistenceSubscriber(team_id, event_store)
 
             # Simulate a UserMessage event flowing through the subscriber
@@ -312,7 +315,7 @@ def main() -> None:
             # ================================================================
             # APPEND-ONLY VS OVERWRITE
             # ================================================================
-            print("\n=== APPEND-ONLY VS OVERWRITE: Send 2 more events ===")
+            print("\n=== APPEND-ONLY VS OVERWRITE: Send more events ===")
 
             event_count_before = len(events)
             print(f"  Events before: {event_count_before}")
@@ -346,6 +349,10 @@ def main() -> None:
             snapshot_count_after = len(snapshots_after)
             print(f"  Snapshots before: {snapshot_count_before}")
             print(f"  Snapshots after:  {snapshot_count_after}")
+            assert snapshot_count_after == snapshot_count_before, (
+                f"Snapshot count should be unchanged: "
+                f"{snapshot_count_after} != {snapshot_count_before}"
+            )
             print(
                 f"  -> State snapshots are OVERWRITE: "
                 f"same count ({snapshot_count_after}), but values updated"

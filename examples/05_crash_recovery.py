@@ -31,6 +31,7 @@ from akgentic.core.utils.deserializer import ActorAddressDict
 
 from akgentic.team.manager import TeamManager
 from akgentic.team.models import (
+    AgentStateSnapshot,
     PersistedEvent,
     TeamCard,
     TeamCardMember,
@@ -182,9 +183,9 @@ def seed_state_snapshot(
     agent_name: str,
     count: int,
     seq: int,
+    role: str = "Leader",
 ) -> int:
     """Persist a StateChangedMessage event and an AgentStateSnapshot."""
-    from akgentic.team.models import AgentStateSnapshot
 
     team_id = runtime.id
     now = datetime.now(UTC)
@@ -200,7 +201,7 @@ def seed_state_snapshot(
             "__actor_type__": f"{CounterAgent.__module__}.{CounterAgent.__name__}",
             "agent_id": agent_id,
             "name": agent_name,
-            "role": "Leader",
+            "role": role,
             "team_id": str(team_id),
             "squad_id": str(uuid.uuid4()),
             "user_message": False,
@@ -355,18 +356,22 @@ def main() -> None:
             print("\n=== VERIFY RESTORED STATE: Check state matches pre-stop ===")
 
             snapshots_after_resume = event_store.load_agent_states(team_id)
-            if snapshots_after_resume:
-                leader_snap = next(
-                    (s for s in snapshots_after_resume if s.agent_id == "leader"),
-                    None,
-                )
-                if leader_snap:
-                    restored_count = leader_snap.state.model_dump().get("count", 0)
-                    print(f"  Leader state after resume: count={restored_count}")
-                    assert restored_count == pre_stop_count, (
-                        f"State mismatch: pre-stop={pre_stop_count}, restored={restored_count}"
-                    )
-                    print("  -> State successfully restored!")
+            assert len(snapshots_after_resume) > 0, (
+                "Expected agent state snapshots after resume"
+            )
+            leader_snap = next(
+                (s for s in snapshots_after_resume if s.agent_id == "leader"),
+                None,
+            )
+            assert leader_snap is not None, (
+                "Expected leader agent state snapshot after resume"
+            )
+            restored_count = leader_snap.state.model_dump().get("count", 0)
+            print(f"  Leader state after resume: count={restored_count}")
+            assert restored_count == pre_stop_count, (
+                f"State mismatch: pre-stop={pre_stop_count}, restored={restored_count}"
+            )
+            print("  -> State successfully restored!")
 
             # ================================================================
             # SEND MORE MESSAGES
