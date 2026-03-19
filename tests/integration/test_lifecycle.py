@@ -7,8 +7,11 @@ Tests that fail due to the _spawn_child bug are marked with
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from akgentic.core.actor_system_impl import ActorSystem
+from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
 
 from akgentic.team.manager import TeamManager
@@ -24,7 +27,7 @@ from tests.services.conftest import InMemoryEventStore
 
 
 def _make_simple_team_card(
-    agent_class: type = RecordingAgent,
+    agent_class: type[Akgent[Any, Any]] = RecordingAgent,
     name: str = "entry",
     role: str = "Entry",
 ) -> TeamCard:

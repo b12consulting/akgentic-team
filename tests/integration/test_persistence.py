@@ -8,6 +8,7 @@ Tests that fail due to the _spawn_child bug are marked with
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,6 @@ class TestPersistenceIntegration:
         )
 
         # Allow events to propagate through orchestrator to subscriber
-        import time
         time.sleep(0.2)
 
         events = event_store.load_events(runtime.id)
@@ -107,7 +107,6 @@ class TestPersistenceIntegration:
             timeout=3.0,
         )
 
-        import time
         time.sleep(0.2)
 
         events_before_stop = len(event_store.load_events(team_id))

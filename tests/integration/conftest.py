@@ -7,6 +7,7 @@ No stubs, no mocks -- these exercise the full actor lifecycle.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any
 
 import pykka
@@ -221,7 +222,12 @@ def actor_system() -> ActorSystem:
 
 
 def get_actor_from_addr(addr: ActorAddress) -> Akgent[Any, Any]:
-    """Extract the underlying Akgent instance from an ActorAddress."""
+    """Extract the underlying Akgent instance from an ActorAddress.
+
+    Warning: reaches into Pykka internals (``_actor_ref._actor``).  This is
+    acceptable in integration tests but couples to Pykka's internal layout.
+    If Pykka upgrades break this, update the access path here.
+    """
     impl = addr
     if isinstance(impl, ActorAddressImpl):
         return impl._actor_ref._actor  # type: ignore[return-value]
@@ -231,14 +237,14 @@ def get_actor_from_addr(addr: ActorAddress) -> Akgent[Any, Any]:
 
 def wait_for_agent_state(
     addr: ActorAddress,
-    predicate: Any,
+    predicate: Callable[[BaseState], bool],
     timeout: float = 2.0,
 ) -> bool:
     """Poll agent state until predicate returns True or timeout.
 
     Args:
         addr: ActorAddress of the agent to poll.
-        predicate: Callable(state) -> bool.
+        predicate: Function that takes agent state and returns True when done.
         timeout: Maximum seconds to wait.
 
     Returns:
