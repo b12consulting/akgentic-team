@@ -185,6 +185,8 @@ class TestTeamFactoryBuild:
         worker = _make_member("worker", "Worker")
         ep = _make_member("lead", "Lead", routes_to=["Worker"])
         tc = _make_team_card(entry_point=ep, members=[worker])
+        # Explicitly register profiles for hiring
+        tc.agent_profiles = list(tc.agent_cards.values())
 
         runtime = TeamFactory.build(tc, actor_system)
 
@@ -223,9 +225,11 @@ class TestTeamFactoryBuild:
     # -- 3.8: Agent profiles registered with orchestrator ----------------
 
     def test_agent_profiles_registered(self, actor_system: ActorSystem) -> None:
-        """AC 6: orchestrator.get_agent_catalog() returns all agent cards."""
+        """AC 6: orchestrator.get_agent_catalog() returns only agent_profiles."""
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
+        # Explicitly register profiles for hiring
+        tc.agent_profiles = list(tc.agent_cards.values())
 
         runtime = TeamFactory.build(tc, actor_system)
 

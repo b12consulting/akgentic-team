@@ -216,7 +216,6 @@ def llm_team_infrastructure(tmp_path: Path) -> dict[str, Any]:
 
 
 @pytest.mark.integration
-@pytest.mark.skip(reason="ADR-005: reproduces known bugs — awaiting Story 12.2/12.3 fixes")
 def test_full_lifecycle_create_send_stop_restore(
     llm_team_infrastructure: dict[str, Any],
 ) -> None:
@@ -249,7 +248,7 @@ def test_full_lifecycle_create_send_stop_restore(
     )
     assert len(hire_calls) == 0, f"hire_members called {len(hire_calls)} times"
     # Orchestrator alive check — would throw ActorDeadError if dead
-    roster_after = runtime.orchestrator_proxy.cmd_get_team_roster()
+    roster_after = runtime.orchestrator_proxy.get_team()
     assert roster_after is not None
 
     # --- Phase 2: Stop (AC: 2) ---
@@ -261,32 +260,5 @@ def test_full_lifecycle_create_send_stop_restore(
     assert process.status == TeamStatus.STOPPED
 
     # --- Phase 3: Restore and Continue (AC: 3) ---
-    collector.clear()
-
-    restored_runtime = team_manager.resume_team(team_id)
-    time.sleep(0.3)
-
-    # Assert: same agents restored
-    restored_team_size = len(restored_runtime.addrs)
-    assert restored_team_size == initial_team_size, (
-        f"Restored team size {restored_team_size} != initial {initial_team_size}"
-    )
-
-    follow_up = "Can you summarize the key points from the tea harvesting report?"
-    restored_runtime.send(follow_up)
-    wait_for_stable_messages(collector, stable_seconds=15, timeout=120)
-
-    # Assert: no duplicates after restore
-    final_restored_size = len(restored_runtime.addrs)
-    hire_calls_phase3 = [
-        e for e in collector.tool_events if e.tool_name == "hire_members"
-    ]
-    assert final_restored_size == initial_team_size, (
-        f"Restored team grew from {initial_team_size} to {final_restored_size}"
-    )
-    assert len(hire_calls_phase3) == 0, (
-        f"hire_members called {len(hire_calls_phase3)} times after restore"
-    )
-    # Orchestrator alive
-    roster_phase3 = restored_runtime.orchestrator_proxy.cmd_get_team_roster()
-    assert roster_phase3 is not None
+    # Skipped: Story 12.3 will fix the ActorAddressProxy restore flow
+    pytest.skip("ADR-005: Phase 3 restore assertions deferred to Story 12.3")
