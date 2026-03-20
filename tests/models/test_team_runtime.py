@@ -196,3 +196,68 @@ class TestTeamRuntimeMessaging:
         assert runtime.orchestrator_proxy is runtime._orchestrator_proxy
         assert runtime.entry_proxy is runtime._entry_proxy
         assert runtime.supervisor_proxies is runtime._supervisor_proxies
+
+
+class TestTeamRuntimeSendToResolution:
+    """AC 2 (Story 12.3): send_to() resolves proxy addresses via addr_map."""
+
+    def test_send_to_resolves_proxy_address(self) -> None:
+        """If orchestrator returns a proxy, send_to() resolves it via addr_map."""
+        from akgentic.core.actor_address_impl import ActorAddressProxy
+        from akgentic.core.utils.deserializer import ActorAddressDict
+
+        agent_id = uuid.uuid4()
+        team_id = uuid.uuid4()
+
+        # Create a proxy address (as would come from deserialized data)
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": "akgentic.core.agent.Akgent",
+            "agent_id": str(agent_id),
+            "name": "worker",
+            "role": "Worker",
+            "team_id": str(team_id),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        proxy_addr = ActorAddressProxy(addr_dict)
+
+        # Create a live address mock
+        live_addr = make_stub_addr("worker")
+        live_addr.agent_id = agent_id
+
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=proxy_addr)
+        runtime._addr_map = {agent_id: live_addr}
+
+        runtime.send_to("worker", "hello")
+
+        # Verify send was called with the live address, not the proxy
+        runtime._entry_proxy.send.assert_called_once()
+        call_args = runtime._entry_proxy.send.call_args
+        assert call_args.args[0] is live_addr
+        assert isinstance(call_args.args[1], UserMessage)
+
+    def test_send_to_raises_for_unmapped_proxy(self) -> None:
+        """If proxy has no mapping in addr_map, raise ValueError."""
+        from akgentic.core.actor_address_impl import ActorAddressProxy
+        from akgentic.core.utils.deserializer import ActorAddressDict
+
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": "akgentic.core.agent.Akgent",
+            "agent_id": str(uuid.uuid4()),
+            "name": "ghost",
+            "role": "Ghost",
+            "team_id": str(uuid.uuid4()),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        proxy_addr = ActorAddressProxy(addr_dict)
+
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=proxy_addr)
+        runtime._addr_map = {}  # No mapping
+
+        with pytest.raises(ValueError, match="stale proxy address"):
+            runtime.send_to("ghost", "hello")

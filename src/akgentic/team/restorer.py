@@ -9,10 +9,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
-from akgentic.core.messages.orchestrator import StartMessage, StopMessage
+from akgentic.core.messages.message import Message
+from akgentic.core.messages.orchestrator import (
+    ErrorMessage,
+    SentMessage,
+    StartMessage,
+    StopMessage,
+)
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.deserializer import import_class
 from akgentic.team.factory import TeamFactory
@@ -96,14 +103,23 @@ class TeamRestorer:
                 process, events, agent_states, spawned_addrs
             )
 
-            # Phase 3: Replay events
+            # Build address map: agent_id → live ActorAddress
+            addr_map: dict[uuid.UUID, ActorAddress] = {
+                result.orchestrator_addr.agent_id: result.orchestrator_addr,
+            }
+            for addr in result.addrs.values():
+                addr_map[addr.agent_id] = addr
+
+            # Phase 3: Replay events with proxy resolution
             self._replay_events(
-                team_id, result.orchestrator_proxy, result.persistence_sub, events
+                team_id, result.orchestrator_proxy, result.persistence_sub,
+                events, addr_map,
             )
 
             # Build and return TeamRuntime
             runtime = self._build_team_runtime(
-                team_id, process.team_card, result.orchestrator_addr, result.addrs
+                team_id, process.team_card, result.orchestrator_addr,
+                result.addrs, addr_map,
             )
 
             logger.info("Team %s restored successfully", team_id)
@@ -349,16 +365,24 @@ class TeamRestorer:
         orchestrator_proxy: Orchestrator,
         persistence_sub: PersistenceSubscriber,
         events: list[PersistedEvent],
+        addr_map: dict[uuid.UUID, ActorAddress],
     ) -> None:
         """Phase 3: Replay all persisted events through the orchestrator.
+
+        Resolves ``ActorAddressProxy`` instances in events to live addresses
+        before replay so that ``get_team()`` returns live ``ActorAddressImpl``
+        refs instead of stale proxies.
 
         Args:
             team_id: The team identifier (used for logging context).
             orchestrator_proxy: Proxy to the restored orchestrator actor.
             persistence_sub: The persistence subscriber to toggle restoring flag.
             events: Sorted persisted events to replay.
+            addr_map: Mapping of agent_id to live ActorAddress for proxy resolution.
         """
         logger.info("Restoring team %s: phase 3 -- replaying %d events", team_id, len(events))
+
+        self._resolve_event_addresses(events, addr_map)
 
         for pe in events:
             orchestrator_proxy.restore_message(pe.event)
@@ -366,12 +390,74 @@ class TeamRestorer:
         orchestrator_proxy.end_restoration()
         persistence_sub.set_restoring(False)
 
+    def _resolve_event_addresses(
+        self,
+        events: list[PersistedEvent],
+        addr_map: dict[uuid.UUID, ActorAddress],
+    ) -> None:
+        """Replace ActorAddressProxy with live addresses in all events.
+
+        Walks each event's address fields and swaps proxies for live
+        ``ActorAddressImpl`` refs using the addr_map built from Phase 2.
+
+        Args:
+            events: Persisted events to resolve in-place.
+            addr_map: Mapping of agent_id to live ActorAddress.
+        """
+        for pe in events:
+            self._resolve_message_addresses(pe.event, addr_map)
+
+    def _resolve_message_addresses(
+        self,
+        msg: Message,
+        addr_map: dict[uuid.UUID, ActorAddress],
+    ) -> None:
+        """Replace proxy addresses in a single message with live addresses.
+
+        Handles the ``sender`` field common to all messages, plus
+        type-specific fields: ``SentMessage.recipient``, ``SentMessage.message``,
+        ``StartMessage.parent``, ``ErrorMessage.current_message``.
+
+        Args:
+            msg: The message to resolve addresses in (mutated in-place).
+            addr_map: Mapping of agent_id to live ActorAddress.
+        """
+        msg.sender = self._resolve_addr(msg.sender, addr_map)
+
+        if isinstance(msg, SentMessage):
+            msg.recipient = self._resolve_addr(msg.recipient, addr_map) or msg.recipient
+            self._resolve_message_addresses(msg.message, addr_map)
+        elif isinstance(msg, StartMessage):
+            msg.parent = self._resolve_addr(msg.parent, addr_map)
+        elif isinstance(msg, ErrorMessage) and msg.current_message is not None:
+            self._resolve_message_addresses(msg.current_message, addr_map)
+
+    @staticmethod
+    def _resolve_addr(
+        addr: ActorAddress | None,
+        addr_map: dict[uuid.UUID, ActorAddress],
+    ) -> ActorAddress | None:
+        """Resolve a single proxy address to its live counterpart.
+
+        Args:
+            addr: The address to resolve (may be None or already live).
+            addr_map: Mapping of agent_id to live ActorAddress.
+
+        Returns:
+            The live address if the input was a proxy with a known mapping,
+            or the original address unchanged.
+        """
+        if addr is not None and isinstance(addr, ActorAddressProxy):
+            return addr_map.get(addr.agent_id, addr)
+        return addr
+
     def _build_team_runtime(
         self,
         team_id: uuid.UUID,
         team_card: TeamCard,
         orchestrator_addr: ActorAddress,
         addrs: dict[str, ActorAddress],
+        addr_map: dict[uuid.UUID, ActorAddress],
     ) -> TeamRuntime:
         """Construct a TeamRuntime from restored components.
 
@@ -380,6 +466,8 @@ class TeamRestorer:
             team_card: The declarative team definition.
             orchestrator_addr: Address of the restored orchestrator.
             addrs: Map of agent names to their actor addresses.
+            addr_map: Pre-built mapping of agent_id to live ActorAddress
+                for send_to() safety-net proxy resolution.
 
         Returns:
             A fully constructed TeamRuntime.
@@ -400,7 +488,7 @@ class TeamRestorer:
             if name in addrs:
                 supervisor_addrs[name] = addrs[name]
 
-        return TeamRuntime(
+        runtime = TeamRuntime(
             id=team_id,
             team=team_card,
             actor_system=self._actor_system,
@@ -409,3 +497,8 @@ class TeamRestorer:
             supervisor_addrs=supervisor_addrs,
             addrs=addrs,
         )
+
+        # Reuse addr_map for send_to() safety-net proxy resolution
+        runtime._addr_map = addr_map
+
+        return runtime

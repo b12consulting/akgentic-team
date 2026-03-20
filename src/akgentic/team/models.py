@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import Field, PrivateAttr
 
 from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -196,6 +197,7 @@ class TeamRuntime(SerializableBaseModel):
     _entry_proxy: Akgent[Any, Any] = PrivateAttr()
     _supervisor_proxies: dict[str, Akgent[Any, Any]] = PrivateAttr(default_factory=dict)
     _message_cls: type[Message] | None = PrivateAttr(default=None)
+    _addr_map: dict[uuid.UUID, ActorAddress] = PrivateAttr(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
         """Rebuild all ephemeral proxies from persistent addresses.
@@ -266,19 +268,30 @@ class TeamRuntime(SerializableBaseModel):
         """Send a directed message to a specific agent by name.
 
         Looks up the agent via the orchestrator proxy and sends a message
-        via the entry proxy.
+        via the entry proxy. Includes a safety net to resolve stale
+        ``ActorAddressProxy`` refs that may leak through after restore.
 
         Args:
             agent_name: Name of the target agent.
             content: The message content.
 
         Raises:
-            ValueError: If the agent is not found in the team.
+            ValueError: If the agent is not found or has a stale proxy address.
         """
         actor_addr = self._orchestrator_proxy.get_team_member(agent_name)
         if actor_addr is None:
             msg = f"Agent '{agent_name}' not found in team '{self.team.name}'"
             raise ValueError(msg)
+        # Safety net: resolve proxy if it leaked through after restore
+        if isinstance(actor_addr, ActorAddressProxy):
+            live = self._addr_map.get(actor_addr.agent_id)
+            if live is None:
+                msg = (
+                    f"Agent '{agent_name}' has stale proxy address "
+                    f"— no live mapping available"
+                )
+                raise ValueError(msg)
+            actor_addr = live
         message = self._make_message(content)
         self._entry_proxy.send(actor_addr, message)
 

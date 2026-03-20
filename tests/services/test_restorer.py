@@ -691,3 +691,87 @@ class TestRestorerHierarchyPropagation:
             assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
                 f"Restored agent '{name}' parent is not the orchestrator"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: TestRestorerAddressResolution (Story 12.3, AC 1)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerAddressResolution:
+    """AC 1: Restored teams resolve serialized actor addresses to live refs."""
+
+    def test_restored_get_team_returns_live_addresses(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """After restore, get_team() returns ActorAddressImpl, not ActorAddressProxy."""
+        from akgentic.core.actor_address_impl import ActorAddressImpl, ActorAddressProxy
+
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        team = runtime.orchestrator_proxy.get_team()
+        for addr in team:
+            assert isinstance(addr, ActorAddressImpl), (
+                f"Expected ActorAddressImpl but got {type(addr).__name__} "
+                f"for agent '{addr.name}'"
+            )
+            assert not isinstance(addr, ActorAddressProxy), (
+                f"ActorAddressProxy leaked into get_team() for '{addr.name}'"
+            )
+
+    def test_restored_get_team_member_returns_live_address(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """After restore, get_team_member() returns the live address matching spawned actor."""
+        from akgentic.core.actor_address_impl import ActorAddressImpl
+
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        lead_addr = runtime.orchestrator_proxy.get_team_member("lead")
+        assert lead_addr is not None
+        assert isinstance(lead_addr, ActorAddressImpl)
+        assert lead_addr.is_alive()
+
+        worker_addr = runtime.orchestrator_proxy.get_team_member("worker")
+        assert worker_addr is not None
+        assert isinstance(worker_addr, ActorAddressImpl)
+        assert worker_addr.is_alive()
+
+    def test_replay_does_not_overwrite_live_with_proxy(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Phase 3 replayed StartMessages do not overwrite Phase 2 live addresses."""
+        from akgentic.core.actor_address_impl import ActorAddressImpl
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        # The entry agent should have a live address matching the spawned actor
+        lead_from_roster = runtime.orchestrator_proxy.get_team_member("lead")
+        lead_from_addrs = runtime.addrs["lead"]
+
+        assert lead_from_roster is not None
+        assert isinstance(lead_from_roster, ActorAddressImpl)
+        # The address from get_team_member should match the address from addrs
+        assert lead_from_roster.agent_id == lead_from_addrs.agent_id
