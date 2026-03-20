@@ -46,6 +46,10 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 
+[tool.pytest.ini_options]
+markers = ["integration: Full lifecycle tests requiring real LLM and API keys"]
+addopts = "-m 'not integration'"
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
