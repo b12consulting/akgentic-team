@@ -260,5 +260,45 @@ def test_full_lifecycle_create_send_stop_restore(
     assert process.status == TeamStatus.STOPPED
 
     # --- Phase 3: Restore and Continue (AC: 3) ---
-    # Skipped: Story 12.3 will fix the ActorAddressProxy restore flow
-    pytest.skip("ADR-005: Phase 3 restore assertions deferred to Story 12.3")
+    collector.clear()
+
+    restored_runtime = team_manager.resume_team(team_id)
+    time.sleep(0.3)
+
+    # Verify restored addresses are live ActorAddressImpl, not stale proxies
+    from akgentic.core.actor_address_impl import ActorAddressImpl, ActorAddressProxy
+
+    restored_roster = restored_runtime.orchestrator_proxy.get_team()
+    for addr in restored_roster:
+        assert isinstance(addr, ActorAddressImpl), (
+            f"Expected ActorAddressImpl but got {type(addr).__name__} for '{addr.name}'"
+        )
+        assert not isinstance(addr, ActorAddressProxy), (
+            f"ActorAddressProxy leaked into restored roster for '{addr.name}'"
+        )
+
+    # Restored team should have same size as initial
+    restored_team_size = len(restored_runtime.addrs)
+    assert restored_team_size == initial_team_size, (
+        f"Restored team size {restored_team_size} != initial {initial_team_size}"
+    )
+
+    # Send a follow-up prompt through the restored team
+    follow_up = (
+        "Based on the earlier tea harvesting research, what are the top 3 "
+        "takeaways? Keep it brief."
+    )
+    restored_runtime.send(follow_up)
+
+    wait_for_stable_messages(collector, stable_seconds=15, timeout=120)
+
+    # Assertions — Phase 3
+    restore_hire_calls = [
+        e for e in collector.tool_events if e.tool_name == "hire_members"
+    ]
+    assert len(restore_hire_calls) == 0, (
+        f"hire_members called {len(restore_hire_calls)} times after restore"
+    )
+    # Orchestrator alive check — would throw ActorDeadError if dead
+    post_convo_roster = restored_runtime.orchestrator_proxy.get_team()
+    assert post_convo_roster is not None
