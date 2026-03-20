@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
+from typing import Any
 
 import pykka
 import pytest
 from akgentic.agent import AgentConfig, AgentMessage, BaseAgent, HumanProxy
-from akgentic.core import AgentCard
+from akgentic.core import AgentCard, EventSubscriber
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.message import Message
@@ -32,7 +34,7 @@ LLM_MODEL = "gpt-5.2"
 # --- EventCollector ---
 
 
-class EventCollector:
+class EventCollector(EventSubscriber):
     """Collects SentMessage and ToolCallEvent for test assertions."""
 
     def __init__(self) -> None:
@@ -118,7 +120,7 @@ def build_llm_team_card() -> TeamCard:
             model_cfg=ModelConfig(provider="openai", model=LLM_MODEL, temperature=0.3),
             tools=tools,
         ),
-        routes_to=["Assistant", "Expert"],
+        routes_to=["@Assistant", "@Expert"],
     )
 
     assistant_card = AgentCard(
@@ -175,7 +177,7 @@ def build_llm_team_card() -> TeamCard:
 
 
 @pytest.fixture()
-def llm_team_infrastructure(tmp_path: Path) -> dict:  # type: ignore[type-arg]
+def llm_team_infrastructure(tmp_path: Path) -> dict[str, Any]:
     """Create infrastructure for LLM integration tests."""
     # Load API key from project root .env
     project_root = Path(__file__).resolve().parents[4]
@@ -192,7 +194,7 @@ def llm_team_infrastructure(tmp_path: Path) -> dict:  # type: ignore[type-arg]
     event_store = YamlEventStore(tmp_path / "team-data")
     collector = EventCollector()
 
-    def subscriber_factory(_team_id: object) -> list[EventCollector]:
+    def subscriber_factory(_team_id: uuid.UUID) -> list[EventCollector]:
         return [collector]
 
     team_manager = TeamManager(
@@ -216,7 +218,7 @@ def llm_team_infrastructure(tmp_path: Path) -> dict:  # type: ignore[type-arg]
 @pytest.mark.integration
 @pytest.mark.skip(reason="ADR-005: reproduces known bugs — awaiting Story 12.2/12.3 fixes")
 def test_full_lifecycle_create_send_stop_restore(
-    llm_team_infrastructure: dict,  # type: ignore[type-arg]
+    llm_team_infrastructure: dict[str, Any],
 ) -> None:
     """Full lifecycle: create → send → stop → restore → send again."""
     infra = llm_team_infrastructure
