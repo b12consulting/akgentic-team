@@ -97,10 +97,14 @@ class TeamFactory:
                 )
                 addrs.update(member_addrs)
 
-            # 4. Register agent profiles with orchestrator
-            orchestrator_proxy.register_agent_profiles(
-                list(team_card.agent_cards.values())
-            )
+            # 4. Register hireable agent profiles with orchestrator
+            # Only profiles listed in agent_profiles are available for runtime
+            # hiring. Instantiated members are already live — registering them
+            # would cause the LLM to hire duplicates via role names.
+            if team_card.agent_profiles:
+                orchestrator_proxy.register_agent_profiles(
+                    team_card.agent_profiles
+                )
 
             # 5. Build supervisor_addrs
             supervisor_addrs: dict[str, ActorAddress] = {}

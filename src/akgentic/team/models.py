@@ -71,6 +71,10 @@ class TeamCard(SerializableBaseModel):
         default_factory=list,
         description="Message classes the team handles; first is the default",
     )
+    agent_profiles: list[AgentCard] = Field(
+        default_factory=list,
+        description="AgentCards available for runtime hiring, not instantiated at startup",
+    )
 
     @property
     def agent_cards(self) -> dict[str, AgentCard]:
