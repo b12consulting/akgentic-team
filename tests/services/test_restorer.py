@@ -437,9 +437,11 @@ class TestTeamRestorerRestore:
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 9: Agent profiles are registered with the orchestrator after restore."""
+        """AC 9: Only agent_profiles are registered with orchestrator after restore."""
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
+        # Explicitly register profiles for hiring
+        tc.agent_profiles = list(tc.agent_cards.values())
 
         team_id, process = _populate_stopped_team(event_store, tc)
 
@@ -450,6 +452,24 @@ class TestTeamRestorerRestore:
         roles = {c.role for c in catalog}
         assert "Lead" in roles
         assert "Worker" in roles
+
+    def test_restore_no_profiles_means_empty_catalog(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Default agent_profiles (empty) results in empty hiring catalog after restore."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        # agent_profiles defaults to empty — no roles available for hiring
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert len(catalog) == 0
 
 
 # ---------------------------------------------------------------------------

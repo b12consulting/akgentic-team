@@ -239,6 +239,17 @@ class TestTeamFactoryBuild:
         assert "Worker" in roles
         assert len(catalog) == 2
 
+    def test_no_profiles_means_empty_catalog(self, actor_system: ActorSystem) -> None:
+        """Default agent_profiles (empty) results in empty hiring catalog."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        # agent_profiles defaults to empty — no roles available for hiring
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert len(catalog) == 0
+
     # -- Additional edge-case tests --------------------------------------
 
     def test_build_with_no_subscribers(self, actor_system: ActorSystem) -> None:

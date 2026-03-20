@@ -327,10 +327,14 @@ class TeamRestorer:
                 )
                 proxy.init_state(state_map[agent_name].state)
 
-        # 2f. Register agent profiles with orchestrator
-        orchestrator_proxy.register_agent_profiles(
-            list(process.team_card.agent_cards.values())
-        )
+        # 2f. Register hireable agent profiles with orchestrator
+        # Only profiles listed in agent_profiles are available for runtime
+        # hiring. Instantiated members are already live — registering them
+        # would cause the LLM to hire duplicates via role names.
+        if process.team_card.agent_profiles:
+            orchestrator_proxy.register_agent_profiles(
+                process.team_card.agent_profiles
+            )
 
         return _RebuildResult(
             orchestrator_addr=orchestrator_addr,
