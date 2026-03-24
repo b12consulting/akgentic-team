@@ -1137,6 +1137,13 @@ class TestFilterEventMessages:
 # ---------------------------------------------------------------------------
 
 
+_has_init_llm_context = hasattr(Akgent, "init_llm_context")
+
+
+@pytest.mark.skipif(
+    not _has_init_llm_context,
+    reason="Requires akgentic-core with init_llm_context (Story 14.2)",
+)
 class TestRebuildAgentsLlmContext:
     """AC 1,3,4: init_llm_context() called during _rebuild_agents()."""
 

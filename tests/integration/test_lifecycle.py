@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
@@ -296,6 +297,10 @@ class TestLifecycleIntegration:
         # duplicates (checked above). During restore, new StartMessages are
         # emitted by createActor() but old ones still exist in the store.
 
+    @pytest.mark.skipif(
+        not hasattr(Akgent, "init_llm_context"),
+        reason="Requires akgentic-core with init_llm_context (Story 14.2)",
+    )
     def test_resume_restores_event_messages_to_agents(
         self,
         actor_system: ActorSystem,
