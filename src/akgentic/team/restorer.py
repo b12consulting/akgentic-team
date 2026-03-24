@@ -277,6 +277,9 @@ class TeamRestorer:
                 agent_id=original_agent_id,
                 config=config,
             )
+            if addr is None:
+                msg = f"Failed to spawn agent '{agent_name}' during restore"
+                raise RuntimeError(msg)
             spawned_addrs.append(addr)
             addrs[agent_name] = addr
 

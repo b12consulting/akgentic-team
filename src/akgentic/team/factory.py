@@ -191,6 +191,9 @@ class TeamFactory:
                 agent_class,
                 config=member.card.get_config_copy(),
             )
+            if addr is None:
+                msg = f"Failed to spawn agent '{name}'"
+                raise RuntimeError(msg)
             spawned_addrs.append(addr)
             result[name] = addr
         else:
@@ -202,6 +205,9 @@ class TeamFactory:
                     agent_class,
                     config=config,
                 )
+                if addr is None:
+                    msg = f"Failed to spawn agent '{indexed_name}'"
+                    raise RuntimeError(msg)
                 spawned_addrs.append(addr)
                 result[indexed_name] = addr
 
