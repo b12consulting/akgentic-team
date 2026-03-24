@@ -106,8 +106,15 @@ def _make_start_message(
     team_id: uuid.UUID,
     agent_class: type[Akgent[Any, Any]] = StubAgent,
     config: BaseConfig | None = None,
+    parent_id: uuid.UUID | None = None,
+    parent_name: str = "orchestrator",
+    parent_role: str = "Orchestrator",
 ) -> StartMessage:
-    """Create a StartMessage with a properly-formed sender address."""
+    """Create a StartMessage with a properly-formed sender address.
+
+    Args:
+        parent_id: If set, creates a parent ActorAddressProxy with this agent_id.
+    """
     cfg = config or BaseConfig(name=name, role=role)
     msg = StartMessage(config=cfg)
     # Build a fake sender address dict so serialize() works
@@ -127,6 +134,20 @@ def _make_start_message(
     sender = ActorAddressProxy(addr_dict)
     msg.sender = sender
     msg.team_id = team_id
+
+    if parent_id is not None:
+        parent_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": "akgentic.core.orchestrator.Orchestrator",
+            "agent_id": str(parent_id),
+            "name": parent_name,
+            "role": parent_role,
+            "team_id": str(team_id),
+            "squad_id": "",
+            "user_message": False,
+        }
+        msg.parent = ActorAddressProxy(parent_dict)
+
     return msg
 
 
@@ -178,18 +199,31 @@ def _populate_stopped_team(
     orch_id = uuid.uuid4()
     seq += 1
     orch_start = _make_start_message(
-        orch_id, "orchestrator", "Orchestrator", team_id,
+        orch_id,
+        "orchestrator",
+        "Orchestrator",
+        team_id,
         agent_class=Orchestrator,
         config=BaseConfig(name="orchestrator", role="Orchestrator"),
     )
-    event_store.save_event(PersistedEvent(
-        team_id=team_id, sequence=seq, event=orch_start, timestamp=datetime.now(UTC),
-    ))
+    event_store.save_event(
+        PersistedEvent(
+            team_id=team_id,
+            sequence=seq,
+            event=orch_start,
+            timestamp=datetime.now(UTC),
+        )
+    )
 
     # Agent StartMessages -- from TeamCard tree
     agent_names: list[str] = []
 
-    def _walk_member(member: TeamCardMember) -> None:
+    def _walk_member(
+        member: TeamCardMember,
+        parent_agent_id: uuid.UUID | None = None,
+        parent_name: str = "orchestrator",
+        parent_role: str = "Orchestrator",
+    ) -> None:
         nonlocal seq
         name = member.card.config.name
         role = member.card.config.role
@@ -197,16 +231,27 @@ def _populate_stopped_team(
         agent_class = member.card.get_agent_class()
         seq += 1
         sm = _make_start_message(
-            agent_id, name, role, team_id,
+            agent_id,
+            name,
+            role,
+            team_id,
             agent_class=agent_class,
             config=member.card.get_config_copy(),
+            parent_id=parent_agent_id or orch_id,
+            parent_name=parent_name,
+            parent_role=parent_role,
         )
-        event_store.save_event(PersistedEvent(
-            team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
-        ))
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=seq,
+                event=sm,
+                timestamp=datetime.now(UTC),
+            )
+        )
         agent_names.append(name)
         for child in member.members:
-            _walk_member(child)
+            _walk_member(child, parent_agent_id=agent_id, parent_name=name, parent_role=role)
 
     _walk_member(tc.entry_point)
     for member in tc.members:
@@ -217,14 +262,24 @@ def _populate_stopped_team(
         for fname, frole, fid in fired_members:
             seq += 1
             fsm = _make_start_message(fid, fname, frole, team_id)
-            event_store.save_event(PersistedEvent(
-                team_id=team_id, sequence=seq, event=fsm, timestamp=datetime.now(UTC),
-            ))
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=fsm,
+                    timestamp=datetime.now(UTC),
+                )
+            )
             seq += 1
             fstop = _make_stop_message(fid, fname, frole, team_id)
-            event_store.save_event(PersistedEvent(
-                team_id=team_id, sequence=seq, event=fstop, timestamp=datetime.now(UTC),
-            ))
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=fstop,
+                    timestamp=datetime.now(UTC),
+                )
+            )
 
     # Process record
     now = datetime.now(UTC)
@@ -412,7 +467,8 @@ class TestTeamRestorerRestore:
         original_proxy_ask = actor_system.proxy_ask
 
         def tracking_proxy_ask(
-            addr: ActorAddress, cls: type[Any],
+            addr: ActorAddress,
+            cls: type[Any],
         ) -> Any:
             proxy = original_proxy_ask(addr, cls)
             if cls is Akgent:
@@ -490,7 +546,8 @@ class TestTeamRestorerAgentFiltering:
         fired_id = uuid.uuid4()
 
         team_id, process = _populate_stopped_team(
-            event_store, tc,
+            event_store,
+            tc,
             fired_members=[("fired-agent", "FiredRole", fired_id)],
         )
 
@@ -513,7 +570,8 @@ class TestTeamRestorerAgentFiltering:
         fired2_id = uuid.uuid4()
 
         team_id, process = _populate_stopped_team(
-            event_store, tc,
+            event_store,
+            tc,
             fired_members=[
                 ("fired1", "Role1", fired1_id),
                 ("fired2", "Role2", fired2_id),
@@ -615,6 +673,7 @@ class TestTeamRestorerRollback:
 
         # Track orchestrator actor created before failure
         import pykka
+
         actors_before = len(pykka.ActorRegistry.get_all())
 
         # Patch import_class to fail when resolving the lead agent class
@@ -679,9 +738,7 @@ class TestRestorerHierarchyPropagation:
             proxy: Akgent[Any, Any] = actor_system.proxy_ask(addr, Akgent)
             orch = proxy.orchestrator
             assert orch is not None, f"Restored agent '{name}' has _orchestrator=None"
-            assert orch.is_alive(), (
-                f"Restored agent '{name}' orchestrator is not alive"
-            )
+            assert orch.is_alive(), f"Restored agent '{name}' orchestrator is not alive"
 
     def test_parent_set_on_restored_agents(
         self,
@@ -700,9 +757,7 @@ class TestRestorerHierarchyPropagation:
         # All restored agents should have orchestrator as parent
         for name, addr in runtime.addrs.items():
             actor = addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
-            assert actor._parent is not None, (
-                f"Restored agent '{name}' has _parent=None"
-            )
+            assert actor._parent is not None, f"Restored agent '{name}' has _parent=None"
             assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
                 f"Restored agent '{name}' parent is not the orchestrator"
             )
@@ -735,8 +790,7 @@ class TestRestorerAddressResolution:
         team = runtime.orchestrator_proxy.get_team()
         for addr in team:
             assert isinstance(addr, ActorAddressImpl), (
-                f"Expected ActorAddressImpl but got {type(addr).__name__} "
-                f"for agent '{addr.name}'"
+                f"Expected ActorAddressImpl but got {type(addr).__name__} for agent '{addr.name}'"
             )
             assert not isinstance(addr, ActorAddressProxy), (
                 f"ActorAddressProxy leaked into get_team() for '{addr.name}'"
@@ -840,3 +894,91 @@ class TestRestorerProxySpawning:
         assert len(agent_ids) == len(set(agent_ids)), (
             f"Duplicate agent_ids in team roster: {agent_ids}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Orphan fallback in _spawn_agents (Story 14-1, AC 3)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerOrphanFallback:
+    """AC 3: Unknown parent falls back to orchestrator."""
+
+    def test_spawn_agents_orphan_falls_back_to_orchestrator(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3: Agent with unknown parent spawns through orchestrator (no crash)."""
+        tc = _make_team_card()
+        team_id = uuid.uuid4()
+        seq = 0
+
+        # Orchestrator StartMessage
+        orch_id = uuid.uuid4()
+        seq += 1
+        orch_start = _make_start_message(
+            orch_id,
+            "orchestrator",
+            "Orchestrator",
+            team_id,
+            agent_class=Orchestrator,
+            config=BaseConfig(name="orchestrator", role="Orchestrator"),
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=seq,
+                event=orch_start,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        # Agent with an unknown parent_id (orphan)
+        unknown_parent_id = uuid.uuid4()
+        agent_id = uuid.uuid4()
+        seq += 1
+        orphan_start = _make_start_message(
+            agent_id,
+            "lead",
+            "Lead",
+            team_id,
+            agent_class=StubAgent,
+            parent_id=unknown_parent_id,
+            parent_name="ghost",
+            parent_role="Ghost",
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=seq,
+                event=orphan_start,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        now = datetime.now(UTC)
+        process = Process(
+            team_id=team_id,
+            team_card=tc,
+            status=TeamStatus.STOPPED,
+            user_id="test-user",
+            user_email="test@test.com",
+            created_at=now,
+            updated_at=now,
+        )
+        event_store.save_team(process)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        # The orphan agent should be alive and a child of the orchestrator
+        assert "lead" in runtime.addrs
+        assert runtime.addrs["lead"].is_alive()
+
+        # Verify it's parented to orchestrator (orphan fallback)
+        from tests.integration.conftest import get_actor_from_addr
+
+        orchestrator_actor = get_actor_from_addr(runtime.orchestrator_addr)
+        orch_child_ids = {c.agent_id for c in orchestrator_actor._children}
+        assert runtime.addrs["lead"].agent_id in orch_child_ids
