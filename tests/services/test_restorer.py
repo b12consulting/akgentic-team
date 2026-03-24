@@ -15,7 +15,12 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
-from akgentic.core.messages.orchestrator import StartMessage, StopMessage
+from akgentic.core.messages.orchestrator import (
+    EventMessage,
+    SentMessage,
+    StartMessage,
+    StopMessage,
+)
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 
 from akgentic.team.models import (
@@ -982,3 +987,277 @@ class TestRestorerOrphanFallback:
         orchestrator_actor = get_actor_from_addr(runtime.orchestrator_addr)
         orch_child_ids = {c.agent_id for c in orchestrator_actor._children}
         assert runtime.addrs["lead"].agent_id in orch_child_ids
+
+
+# ---------------------------------------------------------------------------
+# Helpers: EventMessage construction
+# ---------------------------------------------------------------------------
+
+
+def _make_event_message(
+    agent_id: uuid.UUID,
+    name: str,
+    role: str,
+    team_id: uuid.UUID,
+    event: Any = "some-event",
+) -> EventMessage:
+    """Create an EventMessage with a properly-formed sender address."""
+    from akgentic.core.actor_address_impl import ActorAddressProxy
+    from akgentic.core.utils.deserializer import ActorAddressDict
+
+    msg = EventMessage(event=event)
+    addr_dict: ActorAddressDict = {
+        "__actor_address__": True,
+        "__actor_type__": f"{StubAgent.__module__}.{StubAgent.__name__}",
+        "agent_id": str(agent_id),
+        "name": name,
+        "role": role,
+        "team_id": str(team_id),
+        "squad_id": str(uuid.uuid4()),
+        "user_message": False,
+    }
+    msg.sender = ActorAddressProxy(addr_dict)
+    msg.team_id = team_id
+    return msg
+
+
+def _make_sent_message(
+    agent_id: uuid.UUID,
+    name: str,
+    role: str,
+    team_id: uuid.UUID,
+) -> SentMessage:
+    """Create a SentMessage (non-EventMessage) for filtering tests."""
+    from akgentic.core.actor_address_impl import ActorAddressProxy
+    from akgentic.core.utils.deserializer import ActorAddressDict
+
+    inner = Message()
+    addr_dict: ActorAddressDict = {
+        "__actor_address__": True,
+        "__actor_type__": f"{StubAgent.__module__}.{StubAgent.__name__}",
+        "agent_id": str(agent_id),
+        "name": name,
+        "role": role,
+        "team_id": str(team_id),
+        "squad_id": str(uuid.uuid4()),
+        "user_message": False,
+    }
+    recipient = ActorAddressProxy(addr_dict)
+    msg = SentMessage(message=inner, recipient=recipient)
+    msg.sender = ActorAddressProxy(addr_dict)
+    msg.team_id = team_id
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# Tests: TestFilterEventMessages (Story 14.5, AC 2)
+# ---------------------------------------------------------------------------
+
+
+class TestFilterEventMessages:
+    """AC 2: _filter_event_messages filtering logic."""
+
+    def test_filter_event_messages_returns_matching_events(
+        self,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Returns only EventMessage instances with matching agent_id, in order."""
+        actor_system = ActorSystem()
+        try:
+            restorer = TeamRestorer(actor_system, event_store)
+            team_id = uuid.uuid4()
+            target_id = uuid.uuid4()
+            other_id = uuid.uuid4()
+
+            em1 = _make_event_message(target_id, "agent-a", "RoleA", team_id, event="ev1")
+            em2 = _make_event_message(other_id, "agent-b", "RoleB", team_id, event="ev2")
+            em3 = _make_event_message(target_id, "agent-a", "RoleA", team_id, event="ev3")
+            sm = _make_sent_message(target_id, "agent-a", "RoleA", team_id)
+
+            events = [
+                PersistedEvent(team_id=team_id, sequence=1, event=em1, timestamp=datetime.now(UTC)),
+                PersistedEvent(team_id=team_id, sequence=2, event=em2, timestamp=datetime.now(UTC)),
+                PersistedEvent(team_id=team_id, sequence=3, event=em3, timestamp=datetime.now(UTC)),
+                PersistedEvent(team_id=team_id, sequence=4, event=sm, timestamp=datetime.now(UTC)),
+            ]
+
+            result = restorer._filter_event_messages(events, target_id)
+
+            assert len(result) == 2
+            assert result[0] is em1
+            assert result[1] is em3
+        finally:
+            actor_system.shutdown()
+
+    def test_filter_event_messages_returns_empty_for_no_matches(
+        self,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Returns empty list when no EventMessage matches."""
+        actor_system = ActorSystem()
+        try:
+            restorer = TeamRestorer(actor_system, event_store)
+            team_id = uuid.uuid4()
+            target_id = uuid.uuid4()
+            other_id = uuid.uuid4()
+
+            em = _make_event_message(other_id, "agent-b", "RoleB", team_id)
+            sm = _make_sent_message(other_id, "agent-b", "RoleB", team_id)
+
+            events = [
+                PersistedEvent(team_id=team_id, sequence=1, event=em, timestamp=datetime.now(UTC)),
+                PersistedEvent(team_id=team_id, sequence=2, event=sm, timestamp=datetime.now(UTC)),
+            ]
+
+            result = restorer._filter_event_messages(events, target_id)
+            assert result == []
+        finally:
+            actor_system.shutdown()
+
+    def test_filter_event_messages_skips_none_sender(
+        self,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """EventMessage with sender=None is excluded from results."""
+        actor_system = ActorSystem()
+        try:
+            restorer = TeamRestorer(actor_system, event_store)
+            team_id = uuid.uuid4()
+            target_id = uuid.uuid4()
+
+            em_with_sender = _make_event_message(
+                target_id, "agent-a", "RoleA", team_id, event="ev1"
+            )
+            em_no_sender = EventMessage(event="ev2")
+            em_no_sender.sender = None
+
+            events = [
+                PersistedEvent(
+                    team_id=team_id, sequence=1, event=em_with_sender, timestamp=datetime.now(UTC)
+                ),
+                PersistedEvent(
+                    team_id=team_id, sequence=2, event=em_no_sender, timestamp=datetime.now(UTC)
+                ),
+            ]
+
+            result = restorer._filter_event_messages(events, target_id)
+            assert len(result) == 1
+            assert result[0] is em_with_sender
+        finally:
+            actor_system.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Tests: TestRebuildAgentsLlmContext (Story 14.5, AC 1, 3, 4)
+# ---------------------------------------------------------------------------
+
+
+_has_init_llm_context = hasattr(Akgent, "init_llm_context")
+
+
+@pytest.mark.skipif(
+    not _has_init_llm_context,
+    reason="Requires akgentic-core with init_llm_context (Story 14.2)",
+)
+class TestRebuildAgentsLlmContext:
+    """AC 1,3,4: init_llm_context() called during _rebuild_agents()."""
+
+    def test_init_llm_context_called_for_agents_with_events(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """init_llm_context() is called for agents that have EventMessage events."""
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        # Add EventMessage events for the "lead" agent
+        events = event_store.load_events(team_id)
+        # Find the lead agent's agent_id from the StartMessage
+        lead_agent_id: uuid.UUID | None = None
+        for pe in events:
+            if (
+                isinstance(pe.event, StartMessage)
+                and pe.event.sender is not None
+                and pe.event.sender.name == "lead"
+            ):
+                lead_agent_id = pe.event.sender.agent_id
+                break
+        assert lead_agent_id is not None, "lead agent_id not found in events"
+
+        # Add EventMessage events for "lead"
+        em1 = _make_event_message(lead_agent_id, "lead", "Lead", team_id, event="llm-ev-1")
+        em2 = _make_event_message(lead_agent_id, "lead", "Lead", team_id, event="llm-ev-2")
+        event_store.save_event(
+            PersistedEvent(team_id=team_id, sequence=100, event=em1, timestamp=datetime.now(UTC))
+        )
+        event_store.save_event(
+            PersistedEvent(team_id=team_id, sequence=101, event=em2, timestamp=datetime.now(UTC))
+        )
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        # Track init_llm_context calls
+        init_llm_calls: dict[str, list[Any]] = {}
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(
+            addr: ActorAddress,
+            cls: type[Any],
+        ) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init_llm = proxy.init_llm_context
+
+                def tracked_init_llm(context: list[Any]) -> None:
+                    init_llm_calls[addr.name] = context
+                    return original_init_llm(context)
+
+                proxy.init_llm_context = tracked_init_llm
+            return proxy
+
+        with patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime, _ = restorer.restore(process)
+
+        # init_llm_context was called for "lead" with 2 events
+        assert "lead" in init_llm_calls, "init_llm_context not called for lead"
+        assert len(init_llm_calls["lead"]) == 2
+
+    def test_init_llm_context_not_called_for_agents_without_events(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """init_llm_context() is NOT called for agents with no EventMessage events."""
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        # No EventMessage events added -- only StartMessages exist
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        init_llm_calls: dict[str, list[Any]] = {}
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(
+            addr: ActorAddress,
+            cls: type[Any],
+        ) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init_llm = proxy.init_llm_context
+
+                def tracked_init_llm(context: list[Any]) -> None:
+                    init_llm_calls[addr.name] = context
+                    return original_init_llm(context)
+
+                proxy.init_llm_context = tracked_init_llm
+            return proxy
+
+        with patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime, _ = restorer.restore(process)
+
+        # init_llm_context should NOT have been called (no EventMessage events)
+        assert len(init_llm_calls) == 0, (
+            f"init_llm_context unexpectedly called for: {list(init_llm_calls.keys())}"
+        )

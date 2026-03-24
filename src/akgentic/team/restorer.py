@@ -15,6 +15,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import (
     ErrorMessage,
+    EventMessage,
     SentMessage,
     StartMessage,
     StopMessage,
@@ -327,6 +328,32 @@ class TeamRestorer:
             )
         return orchestrator_addr
 
+    def _filter_event_messages(
+        self,
+        events: list[PersistedEvent],
+        agent_id: uuid.UUID,
+    ) -> list[Message]:
+        """Filter persisted events to extract EventMessage instances for an agent.
+
+        Returns only ``EventMessage`` instances whose ``sender.agent_id`` matches
+        the given ``agent_id``, preserving sequence order.  The return type is
+        ``list[Message]`` (not ``list[EventMessage]``) because the proxy API
+        ``init_llm_context()`` accepts ``list[Any]``.
+
+        The restorer passes ALL matching EventMessage objects to the agent; the
+        downstream chain (BaseAgent -> ReactAgent -> ContextManager) handles
+        filtering for LlmMessageEvent payloads and rebuilding the context.
+
+        See ADR-009, Part 3, Layer 4.
+        """
+        return [
+            pe.event
+            for pe in events
+            if isinstance(pe.event, EventMessage)
+            and pe.event.sender is not None
+            and pe.event.sender.agent_id == agent_id
+        ]
+
     def _rebuild_agents(
         self,
         process: Process,
@@ -383,7 +410,14 @@ class TeamRestorer:
                 proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy.init_state(state_map[agent_name].state)
 
-        # 2f. Register hireable agent profiles with orchestrator
+        # 2f. Restore LLM context from persisted events
+        for agent_name, addr in addrs.items():
+            agent_events = self._filter_event_messages(events, addr.agent_id)
+            if agent_events:
+                proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
+                proxy_llm.init_llm_context(agent_events)  # type: ignore[attr-defined]
+
+        # 2g. Register hireable agent profiles with orchestrator
         # Only profiles listed in agent_profiles are available for runtime
         # hiring. Instantiated members are already live — registering them
         # would cause the LLM to hire duplicates via role names.

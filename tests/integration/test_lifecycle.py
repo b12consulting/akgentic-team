@@ -5,14 +5,22 @@ Tests use real Akgent subclasses, real orchestrators, and real event flow.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch as mock_patch
 
+import pytest
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
+from akgentic.core.messages.orchestrator import EventMessage
+from akgentic.core.utils.deserializer import ActorAddressDict
 
 from akgentic.team.manager import TeamManager
-from akgentic.team.models import TeamCard, TeamCardMember, TeamStatus
+from akgentic.team.models import PersistedEvent, TeamCard, TeamCardMember, TeamStatus
 from tests.integration.conftest import (
     RecordingAgent,
     StatefulAgent,
@@ -295,3 +303,103 @@ class TestLifecycleIntegration:
         # The key invariant is that the orchestrator's live roster has no
         # duplicates (checked above). During restore, new StartMessages are
         # emitted by createActor() but old ones still exist in the store.
+
+    @pytest.mark.skipif(
+        not hasattr(Akgent, "init_llm_context"),
+        reason="Requires akgentic-core with init_llm_context (Story 14.2)",
+    )
+    def test_resume_restores_event_messages_to_agents(
+        self,
+        actor_system: ActorSystem,
+    ) -> None:
+        """AC 3,4: Restorer calls init_llm_context with filtered EventMessage events."""
+        event_store = InMemoryEventStore()
+        manager = TeamManager(actor_system, event_store)
+        team_card = _make_simple_team_card()
+
+        runtime = manager.create_team(team_card)
+        team_id = runtime.id
+
+        # Send a message to generate activity
+        actor_system.tell(
+            runtime.entry_addr,
+            UserMessage(content="pre-stop-msg"),
+        )
+        wait_for_agent_state(
+            runtime.entry_addr,
+            lambda state: "pre-stop-msg" in getattr(state, "messages", []),
+            timeout=3.0,
+        )
+
+        # Inject EventMessage events for the entry agent before stopping
+        entry_agent_id = runtime.entry_addr.agent_id
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": (
+                f"{RecordingAgent.__module__}.{RecordingAgent.__name__}"
+            ),
+            "agent_id": str(entry_agent_id),
+            "name": "entry",
+            "role": "Entry",
+            "team_id": str(team_id),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        em1 = EventMessage(event="llm-event-1")
+        em1.sender = ActorAddressProxy(addr_dict)
+        em1.team_id = team_id
+
+        em2 = EventMessage(event="llm-event-2")
+        em2.sender = ActorAddressProxy(addr_dict)
+        em2.team_id = team_id
+
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id, sequence=9000, event=em1,
+                timestamp=datetime.now(UTC),
+            )
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id, sequence=9001, event=em2,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        manager.stop_team(team_id)
+
+        # Track init_llm_context calls during resume
+        init_llm_calls: dict[str, list[Any]] = {}
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(
+            addr: ActorAddress,
+            cls: type[Any],
+        ) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init_llm = proxy.init_llm_context
+
+                def tracked_init_llm(context: list[Any]) -> None:
+                    init_llm_calls[addr.name] = context
+                    return original_init_llm(context)
+
+                proxy.init_llm_context = tracked_init_llm
+            return proxy
+
+        with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            new_runtime = manager.resume_team(team_id)
+
+        # Verify init_llm_context was called for entry agent with the 2 events
+        assert "entry" in init_llm_calls, (
+            "init_llm_context not called for entry agent during resume"
+        )
+        assert len(init_llm_calls["entry"]) == 2
+        # Verify they are EventMessage instances with correct payloads in order
+        for ev in init_llm_calls["entry"]:
+            assert isinstance(ev, EventMessage)
+        assert init_llm_calls["entry"][0].event == "llm-event-1"
+        assert init_llm_calls["entry"][1].event == "llm-event-2"
+
+        # Team is still functional after resume
+        assert new_runtime.entry_addr.is_alive()
