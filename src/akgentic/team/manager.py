@@ -44,8 +44,11 @@ class TeamManager:
             service_registry: Service discovery registry. Defaults to
                 NullServiceRegistry for single-process mode.
             subscribers: Pre-instantiated list of long-lived EventSubscribers
-                shared across all teams. PersistenceSubscriber is per-team
-                and created internally by TeamManager.
+                shared across all teams. These must be thread-safe since
+                different teams' orchestrators may call on_message()
+                concurrently from different actor threads.
+                PersistenceSubscriber is per-team and created internally
+                by TeamManager.
             instance_id: Worker instance identifier. Auto-generated if None.
         """
         self._actor_system = actor_system
@@ -201,9 +204,10 @@ class TeamManager:
 
         all_subs: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
 
-        runtime = restorer.restore(process, subscribers=all_subs)
-
-        persistence_sub.set_restoring(False)
+        try:
+            runtime = restorer.restore(process, subscribers=all_subs)
+        finally:
+            persistence_sub.set_restoring(False)
 
         # Track runtime and subscribers for stop_team
         self._runtimes[team_id] = runtime

@@ -616,7 +616,7 @@ class TestTeamManagerResume:
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 5,6: stop_team after resume correctly unsubscribes the same subscriber objects."""
+        """AC 5,6: stop_team after resume cleans up tracking and transitions to STOPPED."""
         recording = RecordingSubscriber()
 
         mgr = TeamManager(
