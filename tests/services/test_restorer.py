@@ -370,18 +370,20 @@ class TestTeamRestorerRestore:
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 13: TeamRuntime has supervisor_addrs populated."""
+        """AC 13: TeamRuntime has supervisor_addrs populated for first-layer members."""
         worker = _make_member("worker", "Worker")
-        ep = _make_member("lead", "Lead", members=[worker])
-        tc = _make_team_card(entry_point=ep)
+        supervisor = _make_member("supervisor", "Supervisor", members=[worker])
+        tc = _make_team_card(members=[supervisor])
 
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
         runtime, _ = restorer.restore(process)
 
-        # lead is a supervisor (has subordinates)
-        assert "lead" in runtime.supervisor_addrs
+        # supervisor is a first-layer member, so it's in supervisor_addrs
+        assert "supervisor" in runtime.supervisor_addrs
+        # entry point (lead) is NOT in supervisor_addrs
+        assert "lead" not in runtime.supervisor_addrs
 
     def test_restore_with_agent_state_snapshots(
         self,

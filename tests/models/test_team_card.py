@@ -76,8 +76,8 @@ class TestTeamCard:
         cards = team.agent_cards
         assert set(cards.keys()) == {"root", "child", "gc"}
 
-    def test_supervisors_returns_members_with_subordinates(self) -> None:
-        """supervisors property returns only members with subordinates."""
+    def test_supervisors_returns_first_layer_members(self) -> None:
+        """supervisors property returns first-layer members only."""
         worker = TeamCardMember(card=make_agent_card(name="worker", role="Worker"))
         supervisor = TeamCardMember(
             card=make_agent_card(name="sup", role="Supervisor"),
@@ -92,17 +92,20 @@ class TestTeamCard:
         )
         sups = team.supervisors
         sup_names = {s.config.name for s in sups}
-        assert "entry" not in sup_names  # leaf entry point excluded
-        assert "sup" in sup_names        # member with subordinates
+        assert "entry" not in sup_names  # entry point is sender, not supervisor
+        assert "sup" in sup_names        # first-layer member
         assert len(sups) == 1
 
-    def test_supervisors_empty_when_no_subordinates(self) -> None:
-        """supervisors is empty when no member has subordinates."""
-        team = make_team_card(
-            member_names=["a", "b"],
-            member_roles=["A", "B"],
+    def test_supervisors_empty_when_no_members(self) -> None:
+        """supervisors is empty when members list is empty."""
+        team = TeamCard(
+            name="solo-team",
+            description="Just the entry point",
+            entry_point=TeamCardMember(
+                card=make_agent_card(name="solo", role="Solo"),
+            ),
+            members=[],
         )
-        # No member has subordinates; supervisors is empty
         assert len(team.supervisors) == 0
 
     def test_empty_members_list(self) -> None:
@@ -152,8 +155,8 @@ class TestTeamCard:
         sup_names = [s.config.name for s in sups]
         assert "proxy" not in sup_names
 
-    def test_supervisors_includes_entry_point_with_subordinates(self) -> None:
-        """Entry point with subordinates IS included in supervisors."""
+    def test_supervisors_excludes_entry_point_even_with_subordinates(self) -> None:
+        """Entry point is ALWAYS excluded from supervisors -- it is the sender."""
         child = TeamCardMember(card=make_agent_card(name="child", role="Child"))
         entry = TeamCardMember(
             card=make_agent_card(name="boss", role="Boss"),
@@ -166,28 +169,74 @@ class TestTeamCard:
             members=[],
         )
         sups = team.supervisors
-        assert len(sups) == 1
-        assert sups[0].config.name == "boss"
+        assert len(sups) == 0
+        sup_names = {s.config.name for s in sups}
+        assert "boss" not in sup_names
 
-    def test_supervisors_includes_only_members_with_subordinates(self) -> None:
-        """Only members with subordinates are in supervisors, not the leaf entry point."""
+    def test_supervisors_returns_all_first_layer_members_regardless_of_subordinates(
+        self,
+    ) -> None:
+        """ALL first-layer members are supervisors, regardless of whether they have children."""
         worker = TeamCardMember(card=make_agent_card(name="worker", role="Worker"))
         mid_sup = TeamCardMember(
             card=make_agent_card(name="mid", role="MiddleSup"),
             members=[worker],
         )
+        leaf = TeamCardMember(card=make_agent_card(name="leaf", role="Leaf"))
         entry = TeamCardMember(card=make_agent_card(name="lead", role="Lead"))
         team = TeamCard(
             name="mixed-team",
-            description="Entry point (leaf) + member supervisor",
+            description="Entry point + member supervisor + leaf member",
             entry_point=entry,
-            members=[mid_sup],
+            members=[mid_sup, leaf],
         )
         sups = team.supervisors
         sup_names = {s.config.name for s in sups}
-        assert "lead" not in sup_names  # leaf entry point excluded
-        assert "mid" in sup_names
-        assert len(sups) == 1
+        assert "lead" not in sup_names  # entry point always excluded
+        assert "mid" in sup_names       # first-layer member with children
+        assert "leaf" in sup_names      # first-layer member without children
+        assert len(sups) == 2
+
+    def test_supervisors_excludes_deep_hierarchy(self) -> None:
+        """Only first-layer members are supervisors, not deeper nested ones."""
+        assistant = TeamCardMember(card=make_agent_card(name="asst", role="Assistant"))
+        manager = TeamCardMember(
+            card=make_agent_card(name="manager", role="Manager"),
+            members=[assistant],
+        )
+        director = TeamCardMember(
+            card=make_agent_card(name="director", role="Director"),
+            members=[manager],
+        )
+        entry = TeamCardMember(card=make_agent_card(name="proxy", role="Proxy"))
+        team = TeamCard(
+            name="deep-team",
+            description="Deep hierarchy",
+            entry_point=entry,
+            members=[director],
+        )
+        sups = team.supervisors
+        sup_names = {s.config.name for s in sups}
+        assert sup_names == {"director"}
+        assert "manager" not in sup_names
+        assert "asst" not in sup_names
+
+    def test_supervisors_multi_member(self) -> None:
+        """Multiple first-layer members are all supervisors."""
+        entry = TeamCardMember(card=make_agent_card(name="proxy", role="Proxy"))
+        m1 = TeamCardMember(card=make_agent_card(name="m1", role="M1"))
+        m2 = TeamCardMember(card=make_agent_card(name="m2", role="M2"))
+        m3 = TeamCardMember(card=make_agent_card(name="m3", role="M3"))
+        team = TeamCard(
+            name="multi-team",
+            description="Multi supervisor team",
+            entry_point=entry,
+            members=[m1, m2, m3],
+        )
+        sups = team.supervisors
+        sup_names = {s.config.name for s in sups}
+        assert sup_names == {"m1", "m2", "m3"}
+        assert len(sups) == 3
 
 
 class TestTeamCardSerialization:
@@ -237,9 +286,9 @@ class TestTeamCardSerialization:
         dumped = team.model_dump()
         restored = TeamCard.model_validate(dumped)
         assert set(restored.agent_cards.keys()) == {"root", "l1", "l2", "l3"}
-        # Verify supervisors preserved (only members with subordinates)
+        # Verify supervisors preserved (first-layer members only)
         sup_names = {s.config.name for s in restored.supervisors}
-        assert sup_names == {"l1", "l2"}
+        assert sup_names == {"l1"}
 
     def test_routes_to_preserved_through_serialization(self) -> None:
         """routes_to on AgentCards within the tree survive round-trip."""
