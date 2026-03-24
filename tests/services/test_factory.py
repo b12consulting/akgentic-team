@@ -325,7 +325,7 @@ class TestFactoryHierarchyPropagation:
         for name in ("lead", "worker"):
             addr = runtime.addrs[name]
             impl = addr  # ActorAddressImpl
-            actor = impl._actor_ref._actor  # type: ignore[union-attr]
+            actor = impl._actor_ref._actor_weakref()  # type: ignore[union-attr]
             assert actor._parent is not None, f"Agent '{name}' has _parent=None"
             assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
                 f"Agent '{name}' parent is not the orchestrator"
@@ -343,7 +343,7 @@ class TestFactoryHierarchyPropagation:
 
         # Worker should have supervisor as parent, not orchestrator
         worker_addr = runtime.addrs["worker"]
-        worker_actor = worker_addr._actor_ref._actor  # type: ignore[union-attr]
+        worker_actor = worker_addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
         supervisor_addr = runtime.addrs["supervisor"]
 
         assert worker_actor._parent is not None
@@ -352,7 +352,7 @@ class TestFactoryHierarchyPropagation:
         )
 
         # Supervisor should have orchestrator as parent
-        supervisor_actor = supervisor_addr._actor_ref._actor  # type: ignore[union-attr]
+        supervisor_actor = supervisor_addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
         assert supervisor_actor._parent is not None
         assert supervisor_actor._parent.agent_id == runtime.orchestrator_addr.agent_id
 

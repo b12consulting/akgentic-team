@@ -224,13 +224,13 @@ def actor_system() -> ActorSystem:
 def get_actor_from_addr(addr: ActorAddress) -> Akgent[Any, Any]:
     """Extract the underlying Akgent instance from an ActorAddress.
 
-    Warning: reaches into Pykka internals (``_actor_ref._actor``).  This is
-    acceptable in integration tests but couples to Pykka's internal layout.
-    If Pykka upgrades break this, update the access path here.
+    Warning: reaches into Pykka internals (``_actor_ref._actor_weakref()``).
+    This is acceptable in integration tests but couples to Pykka's internal
+    layout.  If Pykka upgrades break this, update the access path here.
     """
     impl = addr
     if isinstance(impl, ActorAddressImpl):
-        return impl._actor_ref._actor  # type: ignore[return-value]
+        return impl._actor_ref._actor_weakref()  # type: ignore[return-value]
     msg = f"Cannot extract actor from address type: {type(addr)}"
     raise TypeError(msg)
 

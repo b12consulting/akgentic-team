@@ -684,7 +684,7 @@ class TestRestorerHierarchyPropagation:
 
         # All restored agents should have orchestrator as parent
         for name, addr in runtime.addrs.items():
-            actor = addr._actor_ref._actor  # type: ignore[union-attr]
+            actor = addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
             assert actor._parent is not None, (
                 f"Restored agent '{name}' has _parent=None"
             )
