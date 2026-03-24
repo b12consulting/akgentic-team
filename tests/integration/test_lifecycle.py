@@ -5,15 +5,22 @@ Tests use real Akgent subclasses, real orchestrators, and real event flow.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch as mock_patch
 
 import pytest
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
+from akgentic.core.messages.orchestrator import EventMessage
+from akgentic.core.utils.deserializer import ActorAddressDict
 
 from akgentic.team.manager import TeamManager
-from akgentic.team.models import TeamCard, TeamCardMember, TeamStatus
+from akgentic.team.models import PersistedEvent, TeamCard, TeamCardMember, TeamStatus
 from tests.integration.conftest import (
     RecordingAgent,
     StatefulAgent,
@@ -306,12 +313,6 @@ class TestLifecycleIntegration:
         actor_system: ActorSystem,
     ) -> None:
         """AC 3,4: Restorer calls init_llm_context with filtered EventMessage events."""
-        from unittest.mock import patch as mock_patch
-        from typing import Any
-
-        from akgentic.core.actor_address import ActorAddress
-        from akgentic.core.messages.orchestrator import EventMessage
-
         event_store = InMemoryEventStore()
         manager = TeamManager(actor_system, event_store)
         team_card = _make_simple_team_card()
@@ -331,12 +332,6 @@ class TestLifecycleIntegration:
         )
 
         # Inject EventMessage events for the entry agent before stopping
-        from akgentic.core.actor_address_impl import ActorAddressProxy
-        from akgentic.core.utils.deserializer import ActorAddressDict
-        from akgentic.team.models import PersistedEvent
-        from datetime import UTC, datetime
-        import uuid
-
         entry_agent_id = runtime.entry_addr.agent_id
         addr_dict: ActorAddressDict = {
             "__actor_address__": True,
@@ -400,9 +395,11 @@ class TestLifecycleIntegration:
             "init_llm_context not called for entry agent during resume"
         )
         assert len(init_llm_calls["entry"]) == 2
-        # Verify they are EventMessage instances
+        # Verify they are EventMessage instances with correct payloads in order
         for ev in init_llm_calls["entry"]:
             assert isinstance(ev, EventMessage)
+        assert init_llm_calls["entry"][0].event == "llm-event-1"
+        assert init_llm_calls["entry"][1].event == "llm-event-2"
 
         # Team is still functional after resume
         assert new_runtime.entry_addr.is_alive()
