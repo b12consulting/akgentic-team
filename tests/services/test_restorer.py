@@ -775,3 +775,53 @@ class TestRestorerAddressResolution:
         assert isinstance(lead_from_roster, ActorAddressImpl)
         # The address from get_team_member should match the address from addrs
         assert lead_from_roster.agent_id == lead_from_addrs.agent_id
+
+
+# ---------------------------------------------------------------------------
+# Tests: Proxy-based restore spawning (Story 12.4, AC 4, 6)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerProxySpawning:
+    """AC 4,6: Restore uses public createActor() API, no duplicate roster entries."""
+
+    def test_restore_creates_agents_through_public_api(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 4: After restore, all agents are alive and have correct names/roles."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        team = runtime.orchestrator_proxy.get_team()
+        team_names = {addr.name for addr in team}
+        assert "lead" in team_names
+        assert "worker" in team_names
+        for addr in team:
+            assert addr.is_alive()
+
+    def test_restore_no_duplicate_roster_entries(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 6: get_team() has no duplicate agent_ids after restore."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime, _ = restorer.restore(process)
+
+        team = runtime.orchestrator_proxy.get_team()
+        agent_ids = [addr.agent_id for addr in team]
+        assert len(agent_ids) == len(set(agent_ids)), (
+            f"Duplicate agent_ids in team roster: {agent_ids}"
+        )

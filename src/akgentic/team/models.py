@@ -95,19 +95,30 @@ class TeamCard(SerializableBaseModel):
 
     @property
     def supervisors(self) -> list[AgentCard]:
-        """Return AgentCards for members that have subordinate members.
+        """Return AgentCards for supervisory members, always including the entry point.
 
-        A member is a supervisor if its ``members`` list is non-empty,
-        meaning it manages at least one subordinate.
+        The entry point is always considered a supervisor regardless of whether
+        it has subordinates, since it serves as the team's external interface
+        and must be reachable via ``supervisor_proxies``. Members with
+        subordinates are also included. Results are deduplicated by
+        ``config.name`` to handle the case where the entry point also has
+        subordinates.
 
         Returns:
-            List of AgentCards belonging to supervisory members.
+            List of AgentCards belonging to supervisory members, entry point first.
         """
-        result: list[AgentCard] = []
+        result: list[AgentCard] = [self.entry_point.card]
         self._collect_supervisors(self.entry_point, result)
         for member in self.members:
             self._collect_supervisors(member, result)
-        return result
+        # Deduplicate: entry_point may also have subordinates
+        seen: set[str] = set()
+        deduped: list[AgentCard] = []
+        for card in result:
+            if card.config.name not in seen:
+                seen.add(card.config.name)
+                deduped.append(card)
+        return deduped
 
     @staticmethod
     def _collect_cards(
@@ -208,25 +219,19 @@ class TeamRuntime(SerializableBaseModel):
         Args:
             __context: Pydantic validation context (unused).
         """
-        self._orchestrator_proxy = self.actor_system.proxy_ask(
-            self.orchestrator_addr, Orchestrator
-        )
+        self._orchestrator_proxy = self.actor_system.proxy_ask(self.orchestrator_addr, Orchestrator)
         entry_agent_class = self.team.entry_point.card.get_agent_class()
-        self._entry_proxy = self.actor_system.proxy_tell(
-            self.entry_addr, entry_agent_class
-        )
+        self._entry_proxy = self.actor_system.proxy_tell(self.entry_addr, entry_agent_class)
 
         self._supervisor_proxies = {}
         for card in self.team.supervisors:
             addr = self.supervisor_addrs.get(card.config.name)
             if addr is not None:
-                self._supervisor_proxies[card.config.name] = (
-                    self.actor_system.proxy_ask(addr, card.get_agent_class())
+                self._supervisor_proxies[card.config.name] = self.actor_system.proxy_ask(
+                    addr, card.get_agent_class()
                 )
 
-        self._message_cls = (
-            self.team.message_types[0] if self.team.message_types else None
-        )
+        self._message_cls = self.team.message_types[0] if self.team.message_types else None
 
     def _make_message(self, content: str) -> Message:
         """Create a message from the team's declared message type.
@@ -286,10 +291,7 @@ class TeamRuntime(SerializableBaseModel):
         if isinstance(actor_addr, ActorAddressProxy):
             live = self._addr_map.get(actor_addr.agent_id)
             if live is None:
-                msg = (
-                    f"Agent '{agent_name}' has stale proxy address "
-                    f"— no live mapping available"
-                )
+                msg = f"Agent '{agent_name}' has stale proxy address — no live mapping available"
                 raise ValueError(msg)
             actor_addr = live
         message = self._make_message(content)

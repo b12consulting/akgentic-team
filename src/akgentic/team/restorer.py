@@ -22,7 +22,6 @@ from akgentic.core.messages.orchestrator import (
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.deserializer import import_class
-from akgentic.team.factory import TeamFactory
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -99,9 +98,7 @@ class TeamRestorer:
             events, agent_states = self._load_persisted_data(team_id)
 
             # Phase 2: Rebuild agents from event log
-            result = self._rebuild_agents(
-                process, events, agent_states, spawned_addrs
-            )
+            result = self._rebuild_agents(process, events, agent_states, spawned_addrs)
 
             # Build address map: agent_id → live ActorAddress
             addr_map: dict[uuid.UUID, ActorAddress] = {
@@ -112,14 +109,20 @@ class TeamRestorer:
 
             # Phase 3: Replay events with proxy resolution
             self._replay_events(
-                team_id, result.orchestrator_proxy, result.persistence_sub,
-                events, addr_map,
+                team_id,
+                result.orchestrator_proxy,
+                result.persistence_sub,
+                events,
+                addr_map,
             )
 
             # Build and return TeamRuntime
             runtime = self._build_team_runtime(
-                team_id, process.team_card, result.orchestrator_addr,
-                result.addrs, addr_map,
+                team_id,
+                process.team_card,
+                result.orchestrator_addr,
+                result.addrs,
+                addr_map,
             )
 
             logger.info("Team %s restored successfully", team_id)
@@ -177,13 +180,12 @@ class TeamRestorer:
                 stopped_agent_ids.add(pe.event.sender.agent_id)
 
         live_starts = [
-            sm for sm in start_messages
+            sm
+            for sm in start_messages
             if sm.sender is not None and sm.sender.agent_id not in stopped_agent_ids
         ]
 
-        orchestrator_class_name = (
-            f"{Orchestrator.__module__}.{Orchestrator.__name__}"
-        )
+        orchestrator_class_name = f"{Orchestrator.__module__}.{Orchestrator.__name__}"
         orchestrator_start: StartMessage | None = None
         agent_starts: list[StartMessage] = []
 
@@ -243,9 +245,9 @@ class TeamRestorer:
     ) -> dict[str, ActorAddress]:
         """Spawn non-orchestrator agents from their persisted StartMessages.
 
-        Agents are spawned through the orchestrator address so that
-        ``_orchestrator`` and ``_parent`` propagate correctly from the
-        hierarchy root.
+        Uses the public proxy API to spawn agents through the orchestrator,
+        preserving original ``agent_id`` values via the ``createActor()``
+        ``agent_id`` parameter.
 
         Args:
             agent_starts: StartMessages for agents to rebuild.
@@ -256,6 +258,9 @@ class TeamRestorer:
             A dict mapping agent names to their actor addresses.
         """
         addrs: dict[str, ActorAddress] = {}
+        orchestrator_proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(
+            orchestrator_addr, Akgent
+        )
 
         for sm in agent_starts:
             if sm.sender is None:  # pragma: no cover – filtered earlier
@@ -267,11 +272,10 @@ class TeamRestorer:
 
             config = sm.config.model_copy()
 
-            addr = TeamFactory._spawn_through_parent(
+            addr = orchestrator_proxy.createActor(
                 agent_class,
-                orchestrator_addr,
-                config=config,
                 agent_id=original_agent_id,
+                config=config,
             )
             spawned_addrs.append(addr)
             addrs[agent_name] = addr
@@ -333,14 +337,10 @@ class TeamRestorer:
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
         # 2e. Restore agent states
-        state_map: dict[str, AgentStateSnapshot] = {
-            snap.agent_id: snap for snap in agent_states
-        }
+        state_map: dict[str, AgentStateSnapshot] = {snap.agent_id: snap for snap in agent_states}
         for agent_name, addr in addrs.items():
             if agent_name in state_map:
-                proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(
-                    addr, Akgent
-                )
+                proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy.init_state(state_map[agent_name].state)
 
         # 2f. Register hireable agent profiles with orchestrator
@@ -348,9 +348,7 @@ class TeamRestorer:
         # hiring. Instantiated members are already live — registering them
         # would cause the LLM to hire duplicates via role names.
         if process.team_card.agent_profiles:
-            orchestrator_proxy.register_agent_profiles(
-                process.team_card.agent_profiles
-            )
+            orchestrator_proxy.register_agent_profiles(process.team_card.agent_profiles)
 
         return _RebuildResult(
             orchestrator_addr=orchestrator_addr,
@@ -385,6 +383,8 @@ class TeamRestorer:
         self._resolve_event_addresses(events, addr_map)
 
         for pe in events:
+            if isinstance(pe.event, StartMessage):
+                continue  # Already registered during Phase 2 spawn
             orchestrator_proxy.restore_message(pe.event)
 
         orchestrator_proxy.end_restoration()

@@ -372,3 +372,39 @@ class TestFactoryHierarchyPropagation:
             assert proxy.orchestrator is not None, (
                 f"Agent '{name}' has _orchestrator=None"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Proxy-based spawning (Story 12.4, AC 3, 4)
+# ---------------------------------------------------------------------------
+
+
+class TestFactoryProxySpawning:
+    """AC 3,4: Agents spawned through public createActor() API."""
+
+    def test_build_creates_agents_through_public_api(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 3: After build, all agents are alive and reachable via get_team()."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        team = runtime.orchestrator_proxy.get_team()
+        team_names = {addr.name for addr in team}
+        assert "lead" in team_names
+        assert "worker" in team_names
+        for addr in team:
+            assert addr.is_alive()
+
+    def test_build_entry_point_in_supervisor_proxies(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 2: Entry point is in supervisor_proxies even without subordinates."""
+        tc = _make_team_card()  # lead has no subordinates
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert "lead" in runtime.supervisor_addrs
+        assert "lead" in runtime.supervisor_proxies
