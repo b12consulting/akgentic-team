@@ -243,24 +243,30 @@ class TeamRestorer:
         orchestrator_addr: ActorAddress,
         spawned_addrs: list[ActorAddress],
     ) -> dict[str, ActorAddress]:
-        """Spawn non-orchestrator agents from their persisted StartMessages.
+        """Spawn non-orchestrator agents using parent-resolution from StartMessage.
 
-        Uses the public proxy API to spawn agents through the orchestrator,
-        preserving original ``agent_id`` values via the ``createActor()``
-        ``agent_id`` parameter.
+        For each agent, resolves its parent from ``StartMessage.parent.agent_id``
+        using a local ``uuid -> ActorAddress`` lookup seeded with the orchestrator.
+        The agent is spawned through its resolved parent via ``createActor()``,
+        preserving the original hierarchy (supervisors own their children).
+
+        If the parent's ``agent_id`` is not found in the already-spawned addresses
+        (orphan case), the agent falls back to spawning through the orchestrator.
 
         Args:
-            agent_starts: StartMessages for agents to rebuild.
-            orchestrator_addr: Address of the restored orchestrator to spawn through.
+            agent_starts: StartMessages for agents to rebuild, sorted by sequence
+                so that parents appear before their children.
+            orchestrator_addr: Address of the restored orchestrator (used as seed
+                and orphan fallback).
             spawned_addrs: Shared list for rollback tracking.
 
         Returns:
             A dict mapping agent names to their actor addresses.
         """
         addrs: dict[str, ActorAddress] = {}
-        orchestrator_proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(
-            orchestrator_addr, Akgent
-        )
+        uuid_addrs: dict[uuid.UUID, ActorAddress] = {
+            orchestrator_addr.agent_id: orchestrator_addr,
+        }
 
         for sm in agent_starts:
             if sm.sender is None:  # pragma: no cover – filtered earlier
@@ -272,7 +278,10 @@ class TeamRestorer:
 
             config = sm.config.model_copy()
 
-            addr = orchestrator_proxy.createActor(
+            parent_addr = self._resolve_parent(sm, uuid_addrs, orchestrator_addr, agent_name)
+
+            parent_proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(parent_addr, Akgent)
+            addr = parent_proxy.createActor(
                 agent_class,
                 agent_id=original_agent_id,
                 config=config,
@@ -282,8 +291,41 @@ class TeamRestorer:
                 raise RuntimeError(msg)
             spawned_addrs.append(addr)
             addrs[agent_name] = addr
+            uuid_addrs[addr.agent_id] = addr
 
         return addrs
+
+    @staticmethod
+    def _resolve_parent(
+        sm: StartMessage,
+        uuid_addrs: dict[uuid.UUID, ActorAddress],
+        orchestrator_addr: ActorAddress,
+        agent_name: str,
+    ) -> ActorAddress:
+        """Resolve the parent address for a StartMessage.
+
+        Returns the live address of the parent if found in ``uuid_addrs``,
+        otherwise falls back to the orchestrator.
+
+        Args:
+            sm: The StartMessage containing the optional parent reference.
+            uuid_addrs: UUID-keyed lookup of already-spawned addresses.
+            orchestrator_addr: Fallback address when parent is unknown.
+            agent_name: Agent name for logging context.
+
+        Returns:
+            The resolved parent ActorAddress.
+        """
+        if sm.parent is not None:
+            resolved = uuid_addrs.get(sm.parent.agent_id)
+            if resolved is not None:
+                return resolved
+            logger.warning(
+                "Parent %s not found for agent '%s'; falling back to orchestrator",
+                sm.parent.agent_id,
+                agent_name,
+            )
+        return orchestrator_addr
 
     def _rebuild_agents(
         self,

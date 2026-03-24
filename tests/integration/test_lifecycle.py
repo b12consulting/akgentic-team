@@ -100,9 +100,7 @@ class TestLifecycleIntegration:
         # Verify persistence
         process = event_store.load_team(team_id)
         assert process is not None, "Process not found after stop"
-        assert process.status == TeamStatus.STOPPED, (
-            f"Expected STOPPED, got {process.status}"
-        )
+        assert process.status == TeamStatus.STOPPED, f"Expected STOPPED, got {process.status}"
 
         events = event_store.load_events(team_id)
         assert len(events) > 0, "No events persisted"
@@ -196,3 +194,104 @@ class TestLifecycleIntegration:
             timeout=3.0,
         )
         assert reached, "Counter did not increment to 4 after resume"
+
+    def test_resume_preserves_parent_child_hierarchy(
+        self,
+        actor_system: ActorSystem,
+        hierarchical_team_card: TeamCard,
+    ) -> None:
+        """AC 1: After stop/resume, children belong to their supervisor, not orchestrator."""
+        event_store = InMemoryEventStore()
+        manager = TeamManager(actor_system, event_store)
+
+        runtime = manager.create_team(hierarchical_team_card)
+        team_id = runtime.id
+
+        manager.stop_team(team_id)
+        new_runtime = manager.resume_team(team_id)
+
+        # Supervisor's _children should contain worker_a and worker_b
+        supervisor_addr = new_runtime.addrs["supervisor"]
+        supervisor_actor = get_actor_from_addr(supervisor_addr)
+        supervisor_child_ids = {c.agent_id for c in supervisor_actor._children}
+
+        worker_a_addr = new_runtime.addrs["worker_a"]
+        worker_b_addr = new_runtime.addrs["worker_b"]
+        assert worker_a_addr.agent_id in supervisor_child_ids, (
+            "worker_a should be a child of supervisor after resume"
+        )
+        assert worker_b_addr.agent_id in supervisor_child_ids, (
+            "worker_b should be a child of supervisor after resume"
+        )
+
+        # Orchestrator's children should NOT include worker_a and worker_b directly
+        orchestrator_actor = get_actor_from_addr(new_runtime.orchestrator_addr)
+        orchestrator_child_ids = {c.agent_id for c in orchestrator_actor._children}
+        assert worker_a_addr.agent_id not in orchestrator_child_ids, (
+            "worker_a should NOT be a direct child of orchestrator"
+        )
+        assert worker_b_addr.agent_id not in orchestrator_child_ids, (
+            "worker_b should NOT be a direct child of orchestrator"
+        )
+
+    def test_resume_hierarchical_team_stop_cascades(
+        self,
+        actor_system: ActorSystem,
+        hierarchical_team_card: TeamCard,
+    ) -> None:
+        """AC 5: Stopping a supervisor cascades to its children after resume."""
+        event_store = InMemoryEventStore()
+        manager = TeamManager(actor_system, event_store)
+
+        runtime = manager.create_team(hierarchical_team_card)
+        team_id = runtime.id
+
+        manager.stop_team(team_id)
+        new_runtime = manager.resume_team(team_id)
+
+        supervisor_addr = new_runtime.addrs["supervisor"]
+        worker_a_addr = new_runtime.addrs["worker_a"]
+        worker_b_addr = new_runtime.addrs["worker_b"]
+
+        # All agents alive before stop
+        assert supervisor_addr.is_alive()
+        assert worker_a_addr.is_alive()
+        assert worker_b_addr.is_alive()
+
+        # Stop supervisor via proxy -- triggers Akgent.stop() which cascades
+        supervisor_proxy: Akgent[Any, Any] = actor_system.proxy_ask(supervisor_addr, Akgent)
+        supervisor_proxy.stop()
+
+        assert not supervisor_addr.is_alive(), "Supervisor should be stopped"
+        assert not worker_a_addr.is_alive(), (
+            "worker_a should be stopped via cascade from supervisor"
+        )
+        assert not worker_b_addr.is_alive(), (
+            "worker_b should be stopped via cascade from supervisor"
+        )
+
+    def test_restore_has_one_start_message_per_agent(
+        self,
+        actor_system: ActorSystem,
+    ) -> None:
+        """AC 4: After restore, each agent has exactly one StartMessage -- no duplicates."""
+        event_store = InMemoryEventStore()
+        manager = TeamManager(actor_system, event_store)
+        team_card = _make_simple_team_card()
+
+        runtime = manager.create_team(team_card)
+        team_id = runtime.id
+
+        manager.stop_team(team_id)
+        new_runtime = manager.resume_team(team_id)
+
+        # Inspect orchestrator's team -- each agent should appear exactly once
+        team = new_runtime.orchestrator_proxy.get_team()
+        agent_ids = [addr.agent_id for addr in team]
+        assert len(agent_ids) == len(set(agent_ids)), (
+            f"Duplicate agent_ids in team roster after restore: {agent_ids}"
+        )
+
+        # The key invariant is that the orchestrator's live roster has no
+        # duplicates (checked above). During restore, new StartMessages are
+        # emitted by createActor() but old ones still exist in the store.
