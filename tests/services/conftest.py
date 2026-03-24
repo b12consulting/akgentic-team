@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process
+
+logger = logging.getLogger(__name__)
 
 
 class InMemoryEventStore:
@@ -38,7 +41,7 @@ class InMemoryEventStore:
         except Exception:
             # Subscriber tests may use mock senders that fail serialization;
             # those tests never call load_events, so a missing dict is safe.
-            pass
+            logger.debug("Event serialization skipped (mock sender): %s", type(event.event))
 
     def load_events(self, team_id: uuid.UUID) -> list[PersistedEvent]:
         """Load all persisted events for a team (deserialized from dicts).

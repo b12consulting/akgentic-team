@@ -378,7 +378,7 @@ class TeamRestorer:
         for sub in subscribers:
             orchestrator_proxy.subscribe(sub)
 
-        # 2d. Spawn remaining agents through orchestrator
+        # 2d. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
         # 2e. Restore agent states

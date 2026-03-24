@@ -219,7 +219,12 @@ def _populate_stopped_team(
     # Agent StartMessages -- from TeamCard tree
     agent_names: list[str] = []
 
-    def _walk_member(member: TeamCardMember) -> None:
+    def _walk_member(
+        member: TeamCardMember,
+        parent_agent_id: uuid.UUID | None = None,
+        parent_name: str = "orchestrator",
+        parent_role: str = "Orchestrator",
+    ) -> None:
         nonlocal seq
         name = member.card.config.name
         role = member.card.config.role
@@ -233,6 +238,9 @@ def _populate_stopped_team(
             team_id,
             agent_class=agent_class,
             config=member.card.get_config_copy(),
+            parent_id=parent_agent_id or orch_id,
+            parent_name=parent_name,
+            parent_role=parent_role,
         )
         event_store.save_event(
             PersistedEvent(
@@ -244,7 +252,7 @@ def _populate_stopped_team(
         )
         agent_names.append(name)
         for child in member.members:
-            _walk_member(child)
+            _walk_member(child, parent_agent_id=agent_id, parent_name=name, parent_role=role)
 
     _walk_member(tc.entry_point)
     for member in tc.members:
