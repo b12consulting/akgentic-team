@@ -27,7 +27,6 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.restorer import TeamRestorer
-from akgentic.team.subscriber import PersistenceSubscriber
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -279,14 +278,13 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, persistence_sub = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         assert isinstance(runtime, TeamRuntime)
         assert runtime.id == team_id
         assert runtime.orchestrator_addr.is_alive()
         assert runtime.entry_addr.is_alive()
         assert "lead" in runtime.addrs
-        assert isinstance(persistence_sub, PersistenceSubscriber)
 
     def test_restore_with_multiple_agents(
         self,
@@ -300,7 +298,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         assert "lead" in runtime.addrs
         assert "worker" in runtime.addrs
@@ -319,7 +317,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # Orchestrator should be alive and functional
         assert runtime.orchestrator_addr.is_alive()
@@ -340,7 +338,7 @@ class TestTeamRestorerRestore:
         assert events_before > 0
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # Team is functional after restore
         assert runtime.orchestrator_addr.is_alive()
@@ -357,7 +355,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         team = runtime.orchestrator_proxy.get_team()
         team_names = {addr.name for addr in team}
@@ -378,7 +376,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # lead is a supervisor (has subordinates)
         assert "lead" in runtime.supervisor_addrs
@@ -426,7 +424,7 @@ class TestTeamRestorerRestore:
             return proxy
 
         with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
-            runtime, _ = restorer.restore(process)
+            runtime = restorer.restore(process)
 
         # Verify init_state was called for the agent with snapshot
         assert "lead" in init_state_calls
@@ -446,7 +444,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
         roles = {c.role for c in catalog}
@@ -466,7 +464,7 @@ class TestTeamRestorerRestore:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
         assert len(catalog) == 0
@@ -495,7 +493,7 @@ class TestTeamRestorerAgentFiltering:
         )
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # Fired agent should NOT be in the restored team
         assert "fired-agent" not in runtime.addrs
@@ -521,7 +519,7 @@ class TestTeamRestorerAgentFiltering:
         )
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         assert "fired1" not in runtime.addrs
         assert "fired2" not in runtime.addrs
@@ -541,14 +539,25 @@ class TestTeamRestorerRestoringFlag:
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 12: PersistenceSubscriber restoring=True before replay, False after."""
+        """AC 12: PersistenceSubscriber restoring=True before replay, False after.
+
+        The caller (TeamManager) is now responsible for toggling the restoring flag.
+        This test validates the pattern: set_restoring(True) before restore(),
+        set_restoring(False) after restore().
+        """
+        from akgentic.team.subscriber import PersistenceSubscriber
+
         tc = _make_team_card()
         team_id, process = _populate_stopped_team(event_store, tc)
 
-        restorer = TeamRestorer(actor_system, event_store)
-        runtime, persistence_sub = restorer.restore(process)
+        persistence_sub = PersistenceSubscriber(team_id, event_store)
+        persistence_sub.set_restoring(True)
 
-        # After restore, restoring flag should be False
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process, subscribers=[persistence_sub])
+
+        # Caller sets restoring=False after restore (simulating TeamManager)
+        persistence_sub.set_restoring(False)
         assert persistence_sub._restoring is False
 
     def test_no_duplicate_events_during_replay(
@@ -557,14 +566,21 @@ class TestTeamRestorerRestoringFlag:
         event_store: InMemoryEventStore,
     ) -> None:
         """AC 12: Replayed events are not re-persisted (restoring flag prevents it)."""
+        from akgentic.team.subscriber import PersistenceSubscriber
+
         tc = _make_team_card()
         team_id, process = _populate_stopped_team(event_store, tc)
 
         original_events = event_store.load_events(team_id)
         original_sequences = {e.sequence for e in original_events}
 
+        persistence_sub = PersistenceSubscriber(team_id, event_store)
+        persistence_sub.set_restoring(True)
+
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process, subscribers=[persistence_sub])
+
+        persistence_sub.set_restoring(False)
 
         # Check no events with original sequences were duplicated
         all_events = event_store.load_events(team_id)
@@ -613,22 +629,19 @@ class TestTeamRestorerRollback:
             f"Rollback failed: {actors_after - actors_before} actor(s) leaked"
         )
 
-    def test_subscriber_factory_called(
+    def test_subscribers_registered_with_orchestrator(
         self,
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """subscriber_factory results registered with orchestrator."""
+        """Pre-instantiated subscribers are registered with orchestrator."""
         tc = _make_team_card()
         team_id, process = _populate_stopped_team(event_store, tc)
 
         recording = RecordingSubscriber()
 
-        def factory(tid: uuid.UUID) -> list[EventSubscriber]:
-            return [recording]
-
-        restorer = TeamRestorer(actor_system, event_store, subscriber_factory=factory)
-        runtime, _ = restorer.restore(process)
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process, subscribers=[recording])
 
         # Recording subscriber should have received replayed events
         assert len(recording.messages) > 0
@@ -658,7 +671,7 @@ class TestRestorerHierarchyPropagation:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         for name, addr in runtime.addrs.items():
             proxy: Akgent[Any, Any] = actor_system.proxy_ask(addr, Akgent)
@@ -680,7 +693,7 @@ class TestRestorerHierarchyPropagation:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # All restored agents should have orchestrator as parent
         for name, addr in runtime.addrs.items():
@@ -715,7 +728,7 @@ class TestRestorerAddressResolution:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         team = runtime.orchestrator_proxy.get_team()
         for addr in team:
@@ -741,7 +754,7 @@ class TestRestorerAddressResolution:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         lead_addr = runtime.orchestrator_proxy.get_team_member("lead")
         assert lead_addr is not None
@@ -765,7 +778,7 @@ class TestRestorerAddressResolution:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # The entry agent should have a live address matching the spawned actor
         lead_from_roster = runtime.orchestrator_proxy.get_team_member("lead")
@@ -797,7 +810,7 @@ class TestRestorerProxySpawning:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         team = runtime.orchestrator_proxy.get_team()
         team_names = {addr.name for addr in team}
@@ -818,7 +831,7 @@ class TestRestorerProxySpawning:
         team_id, process = _populate_stopped_team(event_store, tc)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         team = runtime.orchestrator_proxy.get_team()
         agent_ids = [addr.agent_id for addr in team]

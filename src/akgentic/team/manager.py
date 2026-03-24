@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
 from datetime import UTC, datetime
 
 from akgentic.core.actor_system_impl import ActorSystem
@@ -34,7 +33,7 @@ class TeamManager:
         actor_system: ActorSystem,
         event_store: EventStore,
         service_registry: ServiceRegistry | None = None,
-        subscriber_factory: Callable[[uuid.UUID], list[EventSubscriber]] | None = None,
+        subscribers: list[EventSubscriber] | None = None,
         instance_id: uuid.UUID | None = None,
     ) -> None:
         """Initialize TeamManager with injected dependencies.
@@ -44,17 +43,18 @@ class TeamManager:
             event_store: Persistence backend for team state and events.
             service_registry: Service discovery registry. Defaults to
                 NullServiceRegistry for single-process mode.
-            subscriber_factory: Optional callable that receives a team_id
-                and returns additional EventSubscribers to register.
+            subscribers: Pre-instantiated list of long-lived EventSubscribers
+                shared across all teams. PersistenceSubscriber is per-team
+                and created internally by TeamManager.
             instance_id: Worker instance identifier. Auto-generated if None.
         """
         self._actor_system = actor_system
         self._event_store = event_store
         self._service_registry = service_registry or NullServiceRegistry()
-        self._subscriber_factory = subscriber_factory
+        self._shared_subscribers = subscribers or []
         self._instance_id = instance_id or uuid.uuid4()
         self._runtimes: dict[uuid.UUID, TeamRuntime] = {}
-        self._subscribers: dict[uuid.UUID, list[EventSubscriber]] = {}
+        self._team_subscribers: dict[uuid.UUID, list[EventSubscriber]] = {}
 
     def create_team(
         self,
@@ -65,7 +65,7 @@ class TeamManager:
         """Create and start a new team from a TeamCard.
 
         Pre-generates a team_id, creates a PersistenceSubscriber (always first),
-        appends any subscriber_factory results, then delegates to TeamFactory.build.
+        appends shared subscribers, then delegates to TeamFactory.build.
         On successful build, persists a Process with RUNNING status and registers
         the team with the ServiceRegistry.
 
@@ -88,18 +88,14 @@ class TeamManager:
 
         # Build subscriber list: PersistenceSubscriber always first
         persistence_sub = PersistenceSubscriber(team_id, self._event_store)
-        subscribers: list[EventSubscriber] = [persistence_sub]
-        if self._subscriber_factory is not None:
-            subscribers.extend(self._subscriber_factory(team_id))
+        subscribers: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
 
         # Build the team — if this raises, no Process is persisted
-        runtime = TeamFactory.build(
-            team_card, self._actor_system, subscribers, team_id=team_id
-        )
+        runtime = TeamFactory.build(team_card, self._actor_system, subscribers, team_id=team_id)
 
         # Track runtime and subscribers for stop_team
         self._runtimes[team_id] = runtime
-        self._subscribers[team_id] = subscribers
+        self._team_subscribers[team_id] = subscribers
 
         # Persist Process metadata
         now = datetime.now(UTC)
@@ -150,10 +146,7 @@ class TeamManager:
             raise ValueError(msg)
         if process.status == TeamStatus.RUNNING:
             logger.warning("Delete rejected: team %s is currently running", team_id)
-            msg = (
-                f"Cannot delete team {team_id}: "
-                f"team is currently running. Stop it first."
-            )
+            msg = f"Cannot delete team {team_id}: team is currently running. Stop it first."
             raise ValueError(msg)
         if process.status == TeamStatus.DELETED:
             logger.warning("Delete rejected: team %s is already deleted", team_id)
@@ -167,7 +160,7 @@ class TeamManager:
 
         # Cleanup runtime tracking
         self._runtimes.pop(team_id, None)
-        self._subscribers.pop(team_id, None)
+        self._team_subscribers.pop(team_id, None)
 
     def resume_team(self, team_id: uuid.UUID) -> TeamRuntime:
         """Resume a stopped team by restoring from persisted EventStore data.
@@ -200,24 +193,21 @@ class TeamManager:
             msg = f"Cannot resume team {team_id}: team has been deleted"
             raise ValueError(msg)
 
-        restorer = TeamRestorer(
-            self._actor_system, self._event_store, self._subscriber_factory
-        )
-        runtime, persistence_sub = restorer.restore(process)
+        restorer = TeamRestorer(self._actor_system, self._event_store)
 
-        # NOTE: The restorer already called subscriber_factory and registered
-        # those subscriber instances with the orchestrator.  We call the
-        # factory again here to build a tracking list for stop_team.  These
-        # are different objects, so unsubscribe() may be a no-op for factory
-        # subscribers — but this is harmless because stop_team tears down
-        # actors immediately after unsubscribe.
-        subscribers: list[EventSubscriber] = [persistence_sub]
-        if self._subscriber_factory is not None:
-            subscribers.extend(self._subscriber_factory(team_id))
+        # Create PersistenceSubscriber once — passed to restorer and tracked for stop
+        persistence_sub = PersistenceSubscriber(team_id, self._event_store)
+        persistence_sub.set_restoring(True)
+
+        all_subs: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
+
+        runtime = restorer.restore(process, subscribers=all_subs)
+
+        persistence_sub.set_restoring(False)
 
         # Track runtime and subscribers for stop_team
         self._runtimes[team_id] = runtime
-        self._subscribers[team_id] = subscribers
+        self._team_subscribers[team_id] = all_subs
 
         now = datetime.now(UTC)
         updated_process = Process(
@@ -251,7 +241,7 @@ class TeamManager:
             orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
                 runtime.orchestrator_addr, Orchestrator
             )
-            for sub in self._subscribers.get(team_id, []):
+            for sub in self._team_subscribers.get(team_id, []):
                 try:
                     orchestrator_proxy.unsubscribe(sub)
                 except Exception:
@@ -263,8 +253,7 @@ class TeamManager:
                     )
         except Exception:
             logger.warning(
-                "Failed to get orchestrator proxy for team %s — "
-                "skipping unsubscribe",
+                "Failed to get orchestrator proxy for team %s — skipping unsubscribe",
                 team_id,
                 exc_info=True,
             )
@@ -350,6 +339,6 @@ class TeamManager:
 
         # Cleanup runtime tracking
         self._runtimes.pop(team_id, None)
-        self._subscribers.pop(team_id, None)
+        self._team_subscribers.pop(team_id, None)
 
         logger.info("Team %s stopped successfully", team_id)
