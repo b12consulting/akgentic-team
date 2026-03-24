@@ -95,30 +95,20 @@ class TeamCard(SerializableBaseModel):
 
     @property
     def supervisors(self) -> list[AgentCard]:
-        """Return AgentCards for supervisory members, always including the entry point.
+        """Return AgentCards for members that have subordinates.
 
-        The entry point is always considered a supervisor regardless of whether
-        it has subordinates, since it serves as the team's external interface
-        and must be reachable via ``supervisor_proxies``. Members with
-        subordinates are also included. Results are deduplicated by
-        ``config.name`` to handle the case where the entry point also has
-        subordinates.
+        The entry point is NOT included unless it has subordinates itself.
+        Use ``entry_point`` / ``TeamRuntime.entry_proxy`` to reach the
+        team's external interface (e.g. HumanProxy).
 
         Returns:
-            List of AgentCards belonging to supervisory members, entry point first.
+            List of AgentCards belonging to members with subordinates.
         """
-        result: list[AgentCard] = [self.entry_point.card]
+        result: list[AgentCard] = []
         self._collect_supervisors(self.entry_point, result)
         for member in self.members:
             self._collect_supervisors(member, result)
-        # Deduplicate: entry_point may also have subordinates
-        seen: set[str] = set()
-        deduped: list[AgentCard] = []
-        for card in result:
-            if card.config.name not in seen:
-                seen.add(card.config.name)
-                deduped.append(card)
-        return deduped
+        return result
 
     @staticmethod
     def _collect_cards(
