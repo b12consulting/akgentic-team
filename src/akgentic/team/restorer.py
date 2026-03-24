@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,7 +30,6 @@ from akgentic.team.models import (
     TeamRuntime,
 )
 from akgentic.team.ports import EventStore
-from akgentic.team.subscriber import PersistenceSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +40,6 @@ class _RebuildResult:
 
     orchestrator_addr: ActorAddress
     orchestrator_proxy: Orchestrator
-    persistence_sub: PersistenceSubscriber
     addrs: dict[str, ActorAddress] = field(default_factory=dict)
 
 
@@ -62,30 +59,32 @@ class TeamRestorer:
         self,
         actor_system: ActorSystem,
         event_store: EventStore,
-        subscriber_factory: Callable[[uuid.UUID], list[EventSubscriber]] | None = None,
     ) -> None:
         """Initialize the restorer with injected dependencies.
 
         Args:
             actor_system: The actor system to host rebuilt actors.
             event_store: Persistence backend containing events and states.
-            subscriber_factory: Optional callable returning additional
-                EventSubscribers to register with the orchestrator.
         """
         self._actor_system = actor_system
         self._event_store = event_store
-        self._subscriber_factory = subscriber_factory
 
-    def restore(self, process: Process) -> tuple[TeamRuntime, PersistenceSubscriber]:
+    def restore(
+        self,
+        process: Process,
+        subscribers: list[EventSubscriber] | None = None,
+    ) -> TeamRuntime:
         """Execute the 3-phase restore protocol.
 
         Args:
             process: The Process record of the STOPPED team to restore.
+            subscribers: Pre-instantiated subscribers to register with the
+                orchestrator. Created by TeamManager (includes PersistenceSubscriber
+                and shared subscribers). No subscriber creation happens inside
+                the restorer.
 
         Returns:
-            A tuple of (TeamRuntime, PersistenceSubscriber) for the rebuilt
-            team. TeamManager needs PersistenceSubscriber for restoring-flag
-            management.
+            A TeamRuntime for the rebuilt team.
 
         Raises:
             Exception: If any phase fails, all spawned actors are torn down
@@ -99,7 +98,9 @@ class TeamRestorer:
             events, agent_states = self._load_persisted_data(team_id)
 
             # Phase 2: Rebuild agents from event log
-            result = self._rebuild_agents(process, events, agent_states, spawned_addrs)
+            result = self._rebuild_agents(
+                process, events, agent_states, spawned_addrs, subscribers or []
+            )
 
             # Build address map: agent_id → live ActorAddress
             addr_map: dict[uuid.UUID, ActorAddress] = {
@@ -112,7 +113,6 @@ class TeamRestorer:
             self._replay_events(
                 team_id,
                 result.orchestrator_proxy,
-                result.persistence_sub,
                 events,
                 addr_map,
             )
@@ -127,7 +127,7 @@ class TeamRestorer:
             )
 
             logger.info("Team %s restored successfully", team_id)
-            return runtime, result.persistence_sub
+            return runtime
 
         except Exception:
             # Rollback: stop all spawned actors in reverse order
@@ -360,13 +360,13 @@ class TeamRestorer:
         events: list[PersistedEvent],
         agent_states: list[AgentStateSnapshot],
         spawned_addrs: list[ActorAddress],
+        subscribers: list[EventSubscriber],
     ) -> _RebuildResult:
         """Phase 2: Rebuild agents from the event log.
 
         Determines live agents via StartMessage/StopMessage filtering,
-        rebuilds the Orchestrator first, registers subscribers, spawns
-        remaining agents, restores agent states, restores LLM context from
-        persisted EventMessage events, and registers agent profiles.
+        rebuilds the Orchestrator first, registers passed subscribers, spawns
+        remaining agents, restores agent states, and registers agent profiles.
 
         Args:
             process: The Process record containing the team card.
@@ -374,10 +374,12 @@ class TeamRestorer:
             agent_states: Agent state snapshots from Phase 1.
             spawned_addrs: Shared list for rollback tracking; spawned actors
                 are appended here so the caller can clean up on failure.
+            subscribers: Pre-instantiated subscribers to register with the
+                orchestrator. Passed from restore() caller.
 
         Returns:
             A _RebuildResult containing orchestrator address, proxy,
-            persistence subscriber, and agent address map.
+            and agent address map.
         """
         team_id = process.team_id
         logger.info("Restoring team %s: phase 2 -- rebuilding agents", team_id)
@@ -394,15 +396,7 @@ class TeamRestorer:
             orchestrator_start, team_id, spawned_addrs
         )
 
-        # 2c. Register subscribers (without startup replay — phase 3 handles
-        #      event replay, so TeamFactory._register_subscribers is not used here)
-        persistence_sub = PersistenceSubscriber(team_id, self._event_store)
-        persistence_sub.set_restoring(True)
-
-        subscribers: list[EventSubscriber] = [persistence_sub]
-        if self._subscriber_factory is not None:
-            subscribers.extend(self._subscriber_factory(team_id))
-
+        # 2c. Register passed subscribers directly (no internal creation)
         for sub in subscribers:
             orchestrator_proxy.subscribe(sub)
 
@@ -433,7 +427,6 @@ class TeamRestorer:
         return _RebuildResult(
             orchestrator_addr=orchestrator_addr,
             orchestrator_proxy=orchestrator_proxy,
-            persistence_sub=persistence_sub,
             addrs=addrs,
         )
 
@@ -441,7 +434,6 @@ class TeamRestorer:
         self,
         team_id: uuid.UUID,
         orchestrator_proxy: Orchestrator,
-        persistence_sub: PersistenceSubscriber,
         events: list[PersistedEvent],
         addr_map: dict[uuid.UUID, ActorAddress],
     ) -> None:
@@ -451,10 +443,12 @@ class TeamRestorer:
         before replay so that ``get_team()`` returns live ``ActorAddressImpl``
         refs instead of stale proxies.
 
+        The caller is responsible for toggling PersistenceSubscriber.set_restoring()
+        before and after calling restore().
+
         Args:
             team_id: The team identifier (used for logging context).
             orchestrator_proxy: Proxy to the restored orchestrator actor.
-            persistence_sub: The persistence subscriber to toggle restoring flag.
             events: Sorted persisted events to replay.
             addr_map: Mapping of agent_id to live ActorAddress for proxy resolution.
         """
@@ -468,7 +462,6 @@ class TeamRestorer:
             orchestrator_proxy.restore_message(pe.event)
 
         orchestrator_proxy.end_restoration()
-        persistence_sub.set_restoring(False)
 
     def _resolve_event_addresses(
         self,

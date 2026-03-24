@@ -167,21 +167,18 @@ class TestTeamManagerCreate:
         assert before - timedelta(seconds=1) <= process.created_at <= after + timedelta(seconds=1)
         assert process.created_at == process.updated_at
 
-    def test_create_team_with_subscriber_factory(
+    def test_create_team_with_shared_subscribers(
         self,
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 2,3: subscriber_factory results appended after PersistenceSubscriber."""
+        """AC 2,3: shared subscribers appended after PersistenceSubscriber."""
         recording = RecordingSubscriber()
-
-        def factory(team_id: uuid.UUID) -> list[EventSubscriber]:
-            return [recording]
 
         mgr = TeamManager(
             actor_system=actor_system,
             event_store=event_store,
-            subscriber_factory=factory,
+            subscribers=[recording],
         )
         tc = _make_team_card()
         runtime = mgr.create_team(tc)
@@ -582,6 +579,70 @@ class TestTeamManagerResume:
 
         mock_registry.register_team.assert_called_once_with(instance_id, team_id)
 
+    def test_resume_no_duplicate_subscriber_creation(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3,6: resume_team creates each subscriber exactly once (no double-creation)."""
+        recording = RecordingSubscriber()
+
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            subscribers=[recording],
+        )
+        team_id = _create_and_stop_team(mgr, event_store)
+
+        mgr.resume_team(team_id)
+
+        # The shared subscriber should appear exactly once in per-team tracking
+        team_subs = mgr._team_subscribers[team_id]
+        shared_count = sum(1 for s in team_subs if s is recording)
+        assert shared_count == 1, (
+            f"Shared subscriber appeared {shared_count} times, expected 1"
+        )
+
+        # PersistenceSubscriber should also appear exactly once
+        from akgentic.team.subscriber import PersistenceSubscriber
+
+        persistence_count = sum(1 for s in team_subs if isinstance(s, PersistenceSubscriber))
+        assert persistence_count == 1, (
+            f"PersistenceSubscriber appeared {persistence_count} times, expected 1"
+        )
+
+    def test_stop_after_resume_unsubscribes_same_objects(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 5,6: stop_team after resume cleans up tracking and transitions to STOPPED."""
+        recording = RecordingSubscriber()
+
+        mgr = TeamManager(
+            actor_system=actor_system,
+            event_store=event_store,
+            subscribers=[recording],
+        )
+        team_id = _create_and_stop_team(mgr, event_store)
+
+        mgr.resume_team(team_id)
+
+        # Capture the tracked subscriber objects before stop
+        team_subs = list(mgr._team_subscribers[team_id])
+        assert len(team_subs) == 2  # PersistenceSubscriber + recording
+
+        mgr.stop_team(team_id)
+
+        # After stop, tracking should be cleaned up
+        assert team_id not in mgr._team_subscribers
+        assert team_id not in mgr._runtimes
+
+        # Process should be STOPPED
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
 
 # ---------------------------------------------------------------------------
 # Tests: delete data purge verification
@@ -683,27 +744,24 @@ class TestTeamManagerStop:
         """AC 1: stop_team unsubscribes all subscribers from orchestrator."""
         recording = RecordingSubscriber()
 
-        def factory(team_id: uuid.UUID) -> list[EventSubscriber]:
-            return [recording]
-
         mgr = TeamManager(
             actor_system=actor_system,
             event_store=event_store,
-            subscriber_factory=factory,
+            subscribers=[recording],
         )
         tc = _make_team_card()
         runtime = mgr.create_team(tc)
         team_id = runtime.id
 
         # Verify subscribers are tracked before stop
-        assert team_id in mgr._subscribers
-        assert len(mgr._subscribers[team_id]) == 2  # PersistenceSubscriber + recording
+        assert team_id in mgr._team_subscribers
+        assert len(mgr._team_subscribers[team_id]) == 2  # PersistenceSubscriber + recording
 
         mgr.stop_team(team_id)
 
         # After stop, actors are dead and tracking is cleaned up
         assert not runtime.orchestrator_addr.is_alive()
-        assert team_id not in mgr._subscribers
+        assert team_id not in mgr._team_subscribers
         assert team_id not in mgr._runtimes
 
         # Process should be STOPPED
@@ -806,7 +864,7 @@ class TestTeamManagerStop:
 
         # Simulate manager restart: clear runtime tracking
         manager._runtimes.clear()
-        manager._subscribers.clear()
+        manager._team_subscribers.clear()
 
         # stop_team should still succeed — update state and deregister
         manager.stop_team(team_id)

@@ -259,16 +259,18 @@ class TestTeamFactoryBuild:
         assert runtime.orchestrator_addr.is_alive()
 
     def test_supervisor_addrs_populated(self, actor_system: ActorSystem) -> None:
-        """Supervisor addresses are populated for members with subordinates."""
+        """Supervisor addresses are populated for first-layer members."""
         worker = _make_member("worker", "Worker")
-        ep = _make_member("lead", "Lead", members=[worker])
-        tc = _make_team_card(entry_point=ep)
+        supervisor = _make_member("supervisor", "Supervisor", members=[worker])
+        tc = _make_team_card(members=[supervisor])
 
         runtime = TeamFactory.build(tc, actor_system)
 
-        # lead has subordinates, so it's a supervisor
-        assert "lead" in runtime.supervisor_addrs
-        assert runtime.supervisor_addrs["lead"] == runtime.addrs["lead"]
+        # supervisor is a first-layer member, so it's in supervisor_addrs
+        assert "supervisor" in runtime.supervisor_addrs
+        assert runtime.supervisor_addrs["supervisor"] == runtime.addrs["supervisor"]
+        # entry point (lead) is NOT in supervisor_addrs
+        assert "lead" not in runtime.supervisor_addrs
 
     def test_entry_point_headcount_gt1_raises(self, actor_system: ActorSystem) -> None:
         """Entry point with headcount > 1 raises ValueError."""
