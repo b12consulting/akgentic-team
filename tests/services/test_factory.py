@@ -284,7 +284,7 @@ class TestTeamFactoryBuild:
         tc = _make_team_card(members=[failing])
 
         with patch.object(ActorAddress, "stop", side_effect=RuntimeError("stop failed")):
-            with pytest.raises(RuntimeError, match="intentional error"):
+            with pytest.raises(RuntimeError, match="Failed to spawn agent"):
                 TeamFactory.build(tc, actor_system)
 
 
