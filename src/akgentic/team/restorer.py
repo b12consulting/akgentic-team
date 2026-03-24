@@ -421,7 +421,7 @@ class TeamRestorer:
             agent_events = self._filter_event_messages(events, addr.agent_id)
             if agent_events:
                 proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
-                proxy_llm.init_llm_context(agent_events)
+                proxy_llm.init_llm_context(agent_events)  # type: ignore[attr-defined]
 
         # 2g. Register hireable agent profiles with orchestrator
         # Only profiles listed in agent_profiles are available for runtime
