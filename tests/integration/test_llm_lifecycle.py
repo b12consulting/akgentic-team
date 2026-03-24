@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -189,13 +188,10 @@ def llm_team_infrastructure(tmp_path: Path) -> dict[str, Any]:
     event_store = YamlEventStore(tmp_path / "team-data")
     collector = EventCollector()
 
-    def subscriber_factory(_team_id: uuid.UUID) -> list[EventCollector]:
-        return [collector]
-
     team_manager = TeamManager(
         actor_system=actor_system,
         event_store=event_store,
-        subscriber_factory=subscriber_factory,
+        subscribers=[collector],
     )
 
     yield {
