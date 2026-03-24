@@ -184,6 +184,11 @@ class TestTeamRuntimeMessaging:
         call_addrs = {call.args[0] for call in runtime._entry_proxy.send.call_args_list}
         assert call_addrs == {sup1, sup2, sup3}
         assert runtime.entry_addr not in call_addrs
+        # Verify all messages carry the correct content
+        for call in runtime._entry_proxy.send.call_args_list:
+            msg = call.args[1]
+            assert isinstance(msg, UserMessage)
+            assert msg.content == "multi"
 
     def test_send_to_looks_up_agent(self) -> None:
         """AC6: send_to() looks up agent via orchestrator proxy."""
