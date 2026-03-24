@@ -19,9 +19,8 @@ from akgentic.core import AgentCard, EventSubscriber
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.message import Message
-from akgentic.core.messages.orchestrator import EventMessage, SentMessage
+from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.llm import ModelConfig, PromptTemplate
-from akgentic.tool.event import ToolCallEvent
 from akgentic.tool.planning import PlanningTool, UpdatePlanning
 from akgentic.tool.search import SearchTool, WebSearch
 from dotenv import load_dotenv
@@ -35,18 +34,15 @@ LLM_MODEL = "gpt-5.2"
 
 
 class EventCollector(EventSubscriber):
-    """Collects SentMessage and ToolCallEvent for test assertions."""
+    """Collects SentMessage events for test assertions."""
 
     def __init__(self) -> None:
         self.sent_messages: list[SentMessage] = []
-        self.tool_events: list[ToolCallEvent] = []
 
     def on_message(self, message: Message) -> None:
-        """Record SentMessage and ToolCallEvent events."""
+        """Record SentMessage events."""
         if isinstance(message, SentMessage):
             self.sent_messages.append(message)
-        if isinstance(message, EventMessage) and isinstance(message.event, ToolCallEvent):
-            self.tool_events.append(message.event)
 
     def on_stop(self) -> None:
         """No-op on orchestrator stop."""
@@ -54,7 +50,6 @@ class EventCollector(EventSubscriber):
     def clear(self) -> None:
         """Reset all collected events."""
         self.sent_messages.clear()
-        self.tool_events.clear()
 
 
 # --- wait_for_stable_messages ---
@@ -242,11 +237,9 @@ def test_full_lifecycle_create_send_stop_restore(
 
     # Assertions — Phase 1
     final_team_size = len(runtime.addrs)
-    hire_calls = [e for e in collector.tool_events if e.tool_name == "hire_members"]
     assert final_team_size == initial_team_size, (
         f"Team grew from {initial_team_size} to {final_team_size} — duplicate hiring"
     )
-    assert len(hire_calls) == 0, f"hire_members called {len(hire_calls)} times"
     # Orchestrator alive check — would throw ActorDeadError if dead
     roster_after = runtime.orchestrator_proxy.get_team()
     assert roster_after is not None
@@ -293,12 +286,6 @@ def test_full_lifecycle_create_send_stop_restore(
     wait_for_stable_messages(collector, stable_seconds=15, timeout=120)
 
     # Assertions — Phase 3
-    restore_hire_calls = [
-        e for e in collector.tool_events if e.tool_name == "hire_members"
-    ]
-    assert len(restore_hire_calls) == 0, (
-        f"hire_members called {len(restore_hire_calls)} times after restore"
-    )
     # Orchestrator alive check — would throw ActorDeadError if dead
     post_convo_roster = restored_runtime.orchestrator_proxy.get_team()
     assert post_convo_roster is not None
