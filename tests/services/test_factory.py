@@ -284,7 +284,7 @@ class TestTeamFactoryBuild:
         tc = _make_team_card(members=[failing])
 
         with patch.object(ActorAddress, "stop", side_effect=RuntimeError("stop failed")):
-            with pytest.raises(RuntimeError, match="intentional error"):
+            with pytest.raises(RuntimeError, match="Failed to spawn agent"):
                 TeamFactory.build(tc, actor_system)
 
 
@@ -325,7 +325,7 @@ class TestFactoryHierarchyPropagation:
         for name in ("lead", "worker"):
             addr = runtime.addrs[name]
             impl = addr  # ActorAddressImpl
-            actor = impl._actor_ref._actor  # type: ignore[union-attr]
+            actor = impl._actor_ref._actor_weakref()  # type: ignore[union-attr]
             assert actor._parent is not None, f"Agent '{name}' has _parent=None"
             assert actor._parent.agent_id == runtime.orchestrator_addr.agent_id, (
                 f"Agent '{name}' parent is not the orchestrator"
@@ -343,7 +343,7 @@ class TestFactoryHierarchyPropagation:
 
         # Worker should have supervisor as parent, not orchestrator
         worker_addr = runtime.addrs["worker"]
-        worker_actor = worker_addr._actor_ref._actor  # type: ignore[union-attr]
+        worker_actor = worker_addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
         supervisor_addr = runtime.addrs["supervisor"]
 
         assert worker_actor._parent is not None
@@ -352,7 +352,7 @@ class TestFactoryHierarchyPropagation:
         )
 
         # Supervisor should have orchestrator as parent
-        supervisor_actor = supervisor_addr._actor_ref._actor  # type: ignore[union-attr]
+        supervisor_actor = supervisor_addr._actor_ref._actor_weakref()  # type: ignore[union-attr]
         assert supervisor_actor._parent is not None
         assert supervisor_actor._parent.agent_id == runtime.orchestrator_addr.agent_id
 
@@ -372,3 +372,41 @@ class TestFactoryHierarchyPropagation:
             assert proxy.orchestrator is not None, (
                 f"Agent '{name}' has _orchestrator=None"
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Proxy-based spawning (Story 12.4, AC 3, 4)
+# ---------------------------------------------------------------------------
+
+
+class TestFactoryProxySpawning:
+    """AC 3,4: Agents spawned through public createActor() API."""
+
+    def test_build_creates_agents_through_public_api(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 3: After build, all agents are alive and reachable via get_team()."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        team = runtime.orchestrator_proxy.get_team()
+        team_names = {addr.name for addr in team}
+        assert "lead" in team_names
+        assert "worker" in team_names
+        for addr in team:
+            assert addr.is_alive()
+
+    def test_build_entry_point_not_in_supervisor_proxies_without_subordinates(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """Entry point without subordinates is NOT in supervisor_proxies."""
+        tc = _make_team_card()  # lead has no subordinates
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert "lead" not in runtime.supervisor_addrs
+        assert "lead" not in runtime.supervisor_proxies
+        # Entry point is still reachable via entry_proxy
+        assert runtime.entry_proxy is not None

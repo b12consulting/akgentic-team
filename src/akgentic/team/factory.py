@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, cast
+from typing import Any
 
 from akgentic.core.actor_address import ActorAddress
-from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
@@ -84,7 +83,10 @@ class TeamFactory:
 
             # Spawn entry point through orchestrator
             entry_addrs = TeamFactory._spawn_member(
-                team_card.entry_point, orchestrator_addr, spawned_addrs
+                team_card.entry_point,
+                orchestrator_addr,
+                actor_system,
+                spawned_addrs,
             )
             addrs.update(entry_addrs)
             # Entry point always has headcount=1, so use the card name
@@ -93,7 +95,10 @@ class TeamFactory:
             # Spawn top-level members through orchestrator
             for member in team_card.members:
                 member_addrs = TeamFactory._spawn_member(
-                    member, orchestrator_addr, spawned_addrs
+                    member,
+                    orchestrator_addr,
+                    actor_system,
+                    spawned_addrs,
                 )
                 addrs.update(member_addrs)
 
@@ -102,9 +107,7 @@ class TeamFactory:
             # hiring. Instantiated members are already live — registering them
             # would cause the LLM to hire duplicates via role names.
             if team_card.agent_profiles:
-                orchestrator_proxy.register_agent_profiles(
-                    team_card.agent_profiles
-                )
+                orchestrator_proxy.register_agent_profiles(team_card.agent_profiles)
 
             # 5. Build supervisor_addrs
             supervisor_addrs: dict[str, ActorAddress] = {}
@@ -157,61 +160,22 @@ class TeamFactory:
                     sub.on_message(msg)
 
     @staticmethod
-    def _spawn_through_parent(
-        agent_class: type[Akgent[Any, Any]],
-        parent_addr: ActorAddress,
-        config: BaseConfig,
-        agent_id: uuid.UUID | None = None,
-    ) -> ActorAddress:
-        """Spawn a child actor through a parent, propagating hierarchy context.
-
-        Reads the parent actor's context (orchestrator, user_id, user_email,
-        team_id) and starts the child with ``parent`` and ``orchestrator`` set,
-        replicating what ``Akgent.createActor()`` does but from outside the
-        actor's message handler so exceptions propagate correctly.
-
-        Args:
-            agent_class: The agent class to instantiate.
-            parent_addr: Address of the parent actor.
-            config: Configuration for the new agent.
-            agent_id: Optional UUID for the new agent (e.g. during restore).
-
-        Returns:
-            ActorAddress of the newly created child agent.
-        """
-        parent_impl = cast(ActorAddressImpl, parent_addr)
-        parent_actor: Akgent[Any, Any] = parent_impl._actor_ref._actor
-
-        orchestrator_addr = parent_actor._orchestrator
-        config.squad_id = config.squad_id or parent_actor.config.squad_id
-
-        actor_ref = agent_class.start(
-            agent_id=agent_id,
-            config=config,
-            user_id=parent_actor._user_id,
-            user_email=parent_actor._user_email,
-            team_id=parent_actor._team_id,
-            parent=parent_addr,
-            orchestrator=orchestrator_addr,
-        )
-        child_addr = ActorAddressImpl(actor_ref)
-        parent_actor._children.append(child_addr)
-        return child_addr
-
-    @staticmethod
     def _spawn_member(
         member: TeamCardMember,
         parent_addr: ActorAddress,
+        actor_system: ActorSystem,
         spawned_addrs: list[ActorAddress],
     ) -> dict[str, ActorAddress]:
-        """Spawn a member and its subordinates recursively.
+        """Spawn a member and its subordinates recursively via public proxy API.
 
-        Agents are spawned through the parent via ``_spawn_through_parent()``
-        so that ``_orchestrator`` and ``_parent`` propagate automatically.
+        Uses ``actor_system.proxy_ask(parent_addr, Akgent).createActor()``
+        to spawn children through the parent, ensuring context propagation
+        (orchestrator, parent, user_id, team_id) is handled by ``createActor()``.
 
         Args:
             member: The TeamCardMember to spawn.
             parent_addr: Address of the parent actor to spawn through.
+            actor_system: The actor system for creating proxies.
             spawned_addrs: Accumulator for rollback tracking.
 
         Returns:
@@ -220,12 +184,16 @@ class TeamFactory:
         result: dict[str, ActorAddress] = {}
         agent_class: type[Akgent[Any, Any]] = member.card.get_agent_class()
         name = member.card.config.name
+        parent_proxy: Akgent[Any, Any] = actor_system.proxy_ask(parent_addr, Akgent)
 
         if member.headcount == 1:
-            addr = TeamFactory._spawn_through_parent(
-                agent_class, parent_addr,
+            addr = parent_proxy.createActor(
+                agent_class,
                 config=member.card.get_config_copy(),
             )
+            if addr is None:
+                msg = f"Failed to spawn agent '{name}'"
+                raise RuntimeError(msg)
             spawned_addrs.append(addr)
             result[name] = addr
         else:
@@ -233,10 +201,13 @@ class TeamFactory:
                 indexed_name = f"{name}_{i}"
                 config = member.card.get_config_copy()
                 config.name = indexed_name
-                addr = TeamFactory._spawn_through_parent(
-                    agent_class, parent_addr,
+                addr = parent_proxy.createActor(
+                    agent_class,
                     config=config,
                 )
+                if addr is None:
+                    msg = f"Failed to spawn agent '{indexed_name}'"
+                    raise RuntimeError(msg)
                 spawned_addrs.append(addr)
                 result[indexed_name] = addr
 
@@ -247,7 +218,10 @@ class TeamFactory:
             last_addr = next(reversed(result.values()))
             for child in member.members:
                 child_addrs = TeamFactory._spawn_member(
-                    child, last_addr, spawned_addrs
+                    child,
+                    last_addr,
+                    actor_system,
+                    spawned_addrs,
                 )
                 result.update(child_addrs)
 

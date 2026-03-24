@@ -199,7 +199,7 @@ class TestTeamManagerCreate:
         failing = _make_member("failing", "Failing", agent_class=FailingAgent)
         tc = _make_team_card(members=[failing])
 
-        with pytest.raises(RuntimeError, match="intentional error"):
+        with pytest.raises(RuntimeError, match="Failed to spawn agent"):
             manager.create_team(tc)
 
         # No Process should be in event store
