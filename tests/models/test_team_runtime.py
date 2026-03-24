@@ -131,8 +131,8 @@ class TestTeamRuntimeSerialization:
 class TestTeamRuntimeMessaging:
     """AC 5, 6: send() and send_to() messaging facade."""
 
-    def test_send_broadcasts_to_entry_and_all_supervisors(self) -> None:
-        """AC5: send() routes through entry proxy to entry agent and each supervisor."""
+    def test_send_broadcasts_to_supervisors_only(self) -> None:
+        """AC5: send() routes through entry proxy to supervisors only, not entry."""
         sup_addr_1 = make_stub_addr("supervisor-1")
         sup_addr_2 = make_stub_addr("supervisor-2")
         runtime = make_team_runtime(
@@ -140,25 +140,50 @@ class TestTeamRuntimeMessaging:
             supervisor_addrs={"sup1": sup_addr_1, "sup2": sup_addr_2},
         )
         runtime.send("hello")
-        # entry agent + 2 supervisors = 3 calls
-        assert runtime._entry_proxy.send.call_count == 3
+        # 2 supervisors only (entry does NOT receive)
+        assert runtime._entry_proxy.send.call_count == 2
         call_addrs = {call.args[0] for call in runtime._entry_proxy.send.call_args_list}
-        assert call_addrs == {runtime.entry_addr, sup_addr_1, sup_addr_2}
+        assert call_addrs == {sup_addr_1, sup_addr_2}
+        assert runtime.entry_addr not in call_addrs
         # Verify all messages are UserMessage with correct content
         for call in runtime._entry_proxy.send.call_args_list:
             msg = call.args[1]
             assert isinstance(msg, UserMessage)
             assert msg.content == "hello"
 
-    def test_send_with_empty_supervisors_sends_to_entry(self) -> None:
-        """AC5: send() with no supervisors still sends to entry agent."""
+    def test_send_with_empty_supervisors_is_noop(self) -> None:
+        """AC5: send() with no supervisors is a no-op (no recipients)."""
         runtime = make_team_runtime(message_types=[UserMessage])
         runtime.send("hello")
-        runtime._entry_proxy.send.assert_called_once()
-        call_args = runtime._entry_proxy.send.call_args
-        assert call_args.args[0] is runtime.entry_addr
-        assert isinstance(call_args.args[1], UserMessage)
-        assert call_args.args[1].content == "hello"
+        assert runtime._entry_proxy.send.call_count == 0
+
+    def test_send_does_not_send_to_entry_addr(self) -> None:
+        """send() never sends to entry_addr, only to supervisor addrs."""
+        sup_addr = make_stub_addr("supervisor")
+        runtime = make_team_runtime(
+            message_types=[UserMessage],
+            supervisor_addrs={"sup": sup_addr},
+        )
+        runtime.send("test")
+        assert runtime._entry_proxy.send.call_count == 1
+        call_addr = runtime._entry_proxy.send.call_args.args[0]
+        assert call_addr is sup_addr
+        assert call_addr is not runtime.entry_addr
+
+    def test_send_routes_to_multiple_supervisors(self) -> None:
+        """send() routes to all supervisors, entry does not receive."""
+        sup1 = make_stub_addr("sup1")
+        sup2 = make_stub_addr("sup2")
+        sup3 = make_stub_addr("sup3")
+        runtime = make_team_runtime(
+            message_types=[UserMessage],
+            supervisor_addrs={"s1": sup1, "s2": sup2, "s3": sup3},
+        )
+        runtime.send("multi")
+        assert runtime._entry_proxy.send.call_count == 3
+        call_addrs = {call.args[0] for call in runtime._entry_proxy.send.call_args_list}
+        assert call_addrs == {sup1, sup2, sup3}
+        assert runtime.entry_addr not in call_addrs
 
     def test_send_to_looks_up_agent(self) -> None:
         """AC6: send_to() looks up agent via orchestrator proxy."""

@@ -95,20 +95,18 @@ class TeamCard(SerializableBaseModel):
 
     @property
     def supervisors(self) -> list[AgentCard]:
-        """Return AgentCards for members that have subordinates.
+        """Return AgentCards for the first layer of ``members`` only.
 
-        The entry point is NOT included unless it has subordinates itself.
-        Use ``entry_point`` / ``TeamRuntime.entry_proxy`` to reach the
-        team's external interface (e.g. HumanProxy).
+        Supervisors are the agents that receive external messages routed
+        through the entry point.  The entry point itself is excluded --
+        it is the *sender*, not a recipient.  Deeper members (children
+        of first-layer members) are also excluded -- they are internal
+        to their supervisor's subtree.
 
         Returns:
-            List of AgentCards belonging to members with subordinates.
+            List of AgentCards for each top-level member.
         """
-        result: list[AgentCard] = []
-        self._collect_supervisors(self.entry_point, result)
-        for member in self.members:
-            self._collect_supervisors(member, result)
-        return result
+        return [m.card for m in self.members]
 
     @staticmethod
     def _collect_cards(
@@ -134,22 +132,6 @@ class TeamCard(SerializableBaseModel):
         result[name] = member.card
         for child in member.members:
             TeamCard._collect_cards(child, result)
-
-    @staticmethod
-    def _collect_supervisors(
-        member: TeamCardMember,
-        result: list[AgentCard],
-    ) -> None:
-        """Recursively collect supervisor AgentCards from a member subtree.
-
-        Args:
-            member: The member node to start from.
-            result: Accumulator list to populate with supervisor cards.
-        """
-        if member.members:
-            result.append(member.card)
-        for child in member.members:
-            TeamCard._collect_supervisors(child, result)
 
 
 # --- TeamRuntime ---
@@ -244,20 +226,15 @@ class TeamRuntime(SerializableBaseModel):
         """Send a message into the team through the entry-point agent.
 
         Routes through the entry proxy so that ``sender`` is set to the
-        entry agent (matching V1 behavior). Each recipient gets its own
-        message instance to avoid shared mutable state between actors.
-
-        For flat teams (no supervisors), the entry agent receives the
-        message directly and can route via ``routes_to``.  For hierarchical
-        teams, supervisors also receive a copy.
+        entry agent.  Each supervisor receives its own message instance
+        to avoid shared mutable state between actors.  The entry point
+        itself never receives a copy -- it is the sender, not a recipient.
 
         Args:
             content: The message content to send.
         """
-        self._entry_proxy.send(self.entry_addr, self._make_message(content))
         for addr in self.supervisor_addrs.values():
-            if addr != self.entry_addr:
-                self._entry_proxy.send(addr, self._make_message(content))
+            self._entry_proxy.send(addr, self._make_message(content))
 
     def send_to(self, agent_name: str, content: str) -> None:
         """Send a directed message to a specific agent by name.
