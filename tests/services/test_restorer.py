@@ -643,7 +643,7 @@ class TestTeamRestorerRestoringFlag:
         persistence_sub.set_restoring(True)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime = restorer.restore(process, subscribers=[persistence_sub])
+        restorer.restore(process, subscribers=[persistence_sub])
 
         persistence_sub.set_restoring(False)
 
@@ -975,7 +975,7 @@ class TestRestorerOrphanFallback:
         event_store.save_team(process)
 
         restorer = TeamRestorer(actor_system, event_store)
-        runtime, _ = restorer.restore(process)
+        runtime = restorer.restore(process)
 
         # The orphan agent should be alive and a child of the orchestrator
         assert "lead" in runtime.addrs
@@ -1217,7 +1217,7 @@ class TestRebuildAgentsLlmContext:
             return proxy
 
         with patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
-            runtime, _ = restorer.restore(process)
+            runtime = restorer.restore(process)
 
         # init_llm_context was called for "lead" with 2 events
         assert "lead" in init_llm_calls, "init_llm_context not called for lead"
@@ -1255,7 +1255,7 @@ class TestRebuildAgentsLlmContext:
             return proxy
 
         with patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
-            runtime, _ = restorer.restore(process)
+            runtime = restorer.restore(process)
 
         # init_llm_context should NOT have been called (no EventMessage events)
         assert len(init_llm_calls) == 0, (
