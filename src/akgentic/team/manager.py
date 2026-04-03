@@ -202,12 +202,21 @@ class TeamManager:
         persistence_sub = PersistenceSubscriber(team_id, self._event_store)
         persistence_sub.set_restoring(True)
 
+        # Toggle restoring guard on shared subscribers that support it
+        # (e.g. EventStreamSubscriber) to prevent replay flooding
+        for sub in self._shared_subscribers:
+            if hasattr(sub, "set_restoring"):
+                sub.set_restoring(True)
+
         all_subs: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
 
         try:
             runtime = restorer.restore(process, subscribers=all_subs)
         finally:
             persistence_sub.set_restoring(False)
+            for sub in self._shared_subscribers:
+                if hasattr(sub, "set_restoring"):
+                    sub.set_restoring(False)
 
         # Track runtime and subscribers for stop_team
         self._runtimes[team_id] = runtime
