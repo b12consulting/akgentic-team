@@ -60,6 +60,9 @@ class RecordingSubscriber(EventSubscriber):
         """Record stop."""
         self.stopped = True
 
+    def set_restoring(self, restoring: bool) -> None:  # noqa: FBT001
+        """No-op for test subscriber."""
+
 
 def _make_card(
     name: str,
