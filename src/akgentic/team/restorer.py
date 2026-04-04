@@ -33,6 +33,10 @@ from akgentic.team.ports import EventStore
 
 logger = logging.getLogger(__name__)
 
+# Role string used by ToolActor agents (PlanningTool, KnowledgeGraphTool, Sandbox).
+# Duplicated here because akgentic-team MUST NOT import from akgentic-tool.
+_TOOL_ACTOR_ROLE = "ToolActor"
+
 
 @dataclass
 class _RebuildResult:
@@ -396,8 +400,7 @@ class TeamRestorer:
         # (ToolActors among themselves, regular agents among themselves)
         # is preserved -- this is critical for parent-before-child ordering.
         # See ADR-010.
-        tool_actor_role = "ToolActor"
-        agent_starts.sort(key=lambda sm: sm.config.role != tool_actor_role)
+        agent_starts.sort(key=lambda sm: sm.config.role != _TOOL_ACTOR_ROLE)
 
         if orchestrator_start is None:
             msg = f"No Orchestrator StartMessage found for team {team_id}"
