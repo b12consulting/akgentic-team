@@ -1264,3 +1264,294 @@ class TestRebuildAgentsLlmContext:
         assert len(init_llm_calls) == 0, (
             f"init_llm_context unexpectedly called for: {list(init_llm_calls.keys())}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: ToolActor spawn order during restore (Story 14.6, ADR-010)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerToolActorSpawnOrder:
+    """Story 14.6: ToolActor StartMessages sorted before regular agents."""
+
+    def test_tool_actor_start_messages_sorted_first(
+        self,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """ToolActor StartMessages must be sorted before regular agents."""
+        actor_system = ActorSystem()
+        try:
+            restorer = TeamRestorer(actor_system, event_store)
+            team_id = uuid.uuid4()
+            orch_id = uuid.uuid4()
+            seq = 0
+
+            # Orchestrator
+            seq += 1
+            orch_start = _make_start_message(
+                orch_id,
+                "orchestrator",
+                "Orchestrator",
+                team_id,
+                agent_class=Orchestrator,
+                config=BaseConfig(name="orchestrator", role="Orchestrator"),
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=orch_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            # Regular agents first (lower sequence numbers)
+            seq += 1
+            manager_start = _make_start_message(
+                uuid.uuid4(), "Manager", "Manager", team_id,
+                config=BaseConfig(name="Manager", role="Manager"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=manager_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            seq += 1
+            assistant_start = _make_start_message(
+                uuid.uuid4(), "Assistant", "Assistant", team_id,
+                config=BaseConfig(name="Assistant", role="Assistant"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=assistant_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            # ToolActors last (higher sequence numbers -- lazy creation)
+            seq += 1
+            planning_start = _make_start_message(
+                uuid.uuid4(), "#PlanningTool", "ToolActor", team_id,
+                config=BaseConfig(name="#PlanningTool", role="ToolActor"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=planning_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            seq += 1
+            kg_start = _make_start_message(
+                uuid.uuid4(), "#KnowledgeGraphTool", "ToolActor", team_id,
+                config=BaseConfig(name="#KnowledgeGraphTool", role="ToolActor"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=kg_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            events = event_store.load_events(team_id)
+            events.sort(key=lambda e: e.sequence)
+
+            orchestrator_start, agent_starts = restorer._determine_live_agents(events)
+
+            # Before the fix, agent_starts would be in sequence order:
+            # [Manager, Assistant, #PlanningTool, #KnowledgeGraphTool]
+            # After the fix (sort in _rebuild_agents), ToolActors come first.
+            # We test the sort key directly here:
+            tool_actor_role = "ToolActor"
+            agent_starts.sort(
+                key=lambda sm: sm.config.role != tool_actor_role
+            )
+
+            roles = [sm.config.role for sm in agent_starts]
+            assert roles[:2] == ["ToolActor", "ToolActor"]
+            assert "ToolActor" not in roles[2:]
+
+        finally:
+            actor_system.shutdown()
+
+    def test_sort_with_no_tool_actors_preserves_order(
+        self,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """When no ToolActors exist, sort preserves stable ordering."""
+        actor_system = ActorSystem()
+        try:
+            restorer = TeamRestorer(actor_system, event_store)
+            team_id = uuid.uuid4()
+            orch_id = uuid.uuid4()
+            seq = 0
+
+            # Orchestrator
+            seq += 1
+            orch_start = _make_start_message(
+                orch_id,
+                "orchestrator",
+                "Orchestrator",
+                team_id,
+                agent_class=Orchestrator,
+                config=BaseConfig(name="orchestrator", role="Orchestrator"),
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=orch_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            # Regular agents only
+            seq += 1
+            manager_start = _make_start_message(
+                uuid.uuid4(), "Manager", "Manager", team_id,
+                config=BaseConfig(name="Manager", role="Manager"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=manager_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            seq += 1
+            assistant_start = _make_start_message(
+                uuid.uuid4(), "Assistant", "Assistant", team_id,
+                config=BaseConfig(name="Assistant", role="Assistant"),
+                parent_id=orch_id,
+            )
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id, sequence=seq, event=assistant_start,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+            events = event_store.load_events(team_id)
+            events.sort(key=lambda e: e.sequence)
+
+            orchestrator_start, agent_starts = restorer._determine_live_agents(events)
+
+            original_names = [sm.sender.name for sm in agent_starts]
+
+            tool_actor_role = "ToolActor"
+            agent_starts.sort(
+                key=lambda sm: sm.config.role != tool_actor_role
+            )
+
+            # All agents present, no crash
+            assert len(agent_starts) == 2
+            assert {sm.sender.name for sm in agent_starts} == set(original_names)
+
+        finally:
+            actor_system.shutdown()
+
+    def test_tool_actors_spawned_before_regular_agents_in_full_restore(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Full restore: ToolActors spawned before regular agents (integration)."""
+        tc = _make_team_card()
+        team_id = uuid.uuid4()
+        orch_id = uuid.uuid4()
+        seq = 0
+
+        # Orchestrator StartMessage
+        seq += 1
+        orch_start = _make_start_message(
+            orch_id,
+            "orchestrator",
+            "Orchestrator",
+            team_id,
+            agent_class=Orchestrator,
+            config=BaseConfig(name="orchestrator", role="Orchestrator"),
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id, sequence=seq, event=orch_start,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        # Regular agent (entry point) -- seq 2
+        lead_id = uuid.uuid4()
+        seq += 1
+        lead_start = _make_start_message(
+            lead_id, "lead", "Lead", team_id,
+            config=BaseConfig(name="lead", role="Lead"),
+            parent_id=orch_id,
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id, sequence=seq, event=lead_start,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        # ToolActor -- seq 3 (higher, simulating lazy creation)
+        tool_id = uuid.uuid4()
+        seq += 1
+        tool_start = _make_start_message(
+            tool_id, "#PlanningTool", "ToolActor", team_id,
+            config=BaseConfig(name="#PlanningTool", role="ToolActor"),
+            parent_id=orch_id,
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id, sequence=seq, event=tool_start,
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        now = datetime.now(UTC)
+        process = Process(
+            team_id=team_id,
+            team_card=tc,
+            status=TeamStatus.STOPPED,
+            user_id="test-user",
+            user_email="test@test.com",
+            created_at=now,
+            updated_at=now,
+        )
+        event_store.save_team(process)
+
+        # Track spawn order
+        spawn_order: list[str] = []
+        original_spawn = TeamRestorer._spawn_agents
+
+        def tracking_spawn(
+            self_restorer: TeamRestorer,
+            agent_starts_arg: list[StartMessage],
+            orchestrator_addr: ActorAddress,
+            spawned_addrs: list[ActorAddress],
+        ) -> dict[str, ActorAddress]:
+            for sm in agent_starts_arg:
+                if sm.sender is not None:
+                    spawn_order.append(sm.sender.name)
+            return original_spawn(
+                self_restorer, agent_starts_arg, orchestrator_addr, spawned_addrs
+            )
+
+        with patch.object(TeamRestorer, "_spawn_agents", tracking_spawn):
+            restorer = TeamRestorer(actor_system, event_store)
+            runtime = restorer.restore(process)
+
+        # ToolActor must be spawned BEFORE the regular agent
+        assert spawn_order.index("#PlanningTool") < spawn_order.index("lead"), (
+            f"Expected #PlanningTool before lead, got order: {spawn_order}"
+        )
+
+        # Both agents alive, no duplicates
+        assert "#PlanningTool" in runtime.addrs
+        assert "lead" in runtime.addrs
+        team = runtime.orchestrator_proxy.get_team()
+        agent_ids = [addr.agent_id for addr in team]
+        assert len(agent_ids) == len(set(agent_ids)), "Duplicate agents in roster"

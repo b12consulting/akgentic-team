@@ -387,6 +387,18 @@ class TeamRestorer:
         # 2a. Determine live agents
         orchestrator_start, agent_starts = self._determine_live_agents(events)
 
+        # 2a-bis. Sort: ToolActor role first, stable order within groups.
+        # ToolActors must exist before regular agents are spawned, because
+        # agent tool initialization (observer()) looks up ToolActors via
+        # orchestrator.get_team_member(). Without this, observer() creates
+        # a new empty ToolActor instead of reusing the persisted one.
+        # Python's sort is stable, so relative order within each group
+        # (ToolActors among themselves, regular agents among themselves)
+        # is preserved -- this is critical for parent-before-child ordering.
+        # See ADR-010.
+        tool_actor_role = "ToolActor"
+        agent_starts.sort(key=lambda sm: sm.config.role != tool_actor_role)
+
         if orchestrator_start is None:
             msg = f"No Orchestrator StartMessage found for team {team_id}"
             raise ValueError(msg)
