@@ -33,6 +33,10 @@ from akgentic.team.ports import EventStore
 
 logger = logging.getLogger(__name__)
 
+# Role string used by ToolActor agents (PlanningTool, KnowledgeGraphTool, Sandbox).
+# Duplicated here because akgentic-team MUST NOT import from akgentic-tool.
+_TOOL_ACTOR_ROLE = "ToolActor"
+
 
 @dataclass
 class _RebuildResult:
@@ -387,6 +391,17 @@ class TeamRestorer:
         # 2a. Determine live agents
         orchestrator_start, agent_starts = self._determine_live_agents(events)
 
+        # 2a-bis. Sort: ToolActor role first, stable order within groups.
+        # ToolActors must exist before regular agents are spawned, because
+        # agent tool initialization (observer()) looks up ToolActors via
+        # orchestrator.get_team_member(). Without this, observer() creates
+        # a new empty ToolActor instead of reusing the persisted one.
+        # Python's sort is stable, so relative order within each group
+        # (ToolActors among themselves, regular agents among themselves)
+        # is preserved -- this is critical for parent-before-child ordering.
+        # See ADR-010.
+        agent_starts.sort(key=lambda sm: sm.config.role != _TOOL_ACTOR_ROLE)
+
         if orchestrator_start is None:
             msg = f"No Orchestrator StartMessage found for team {team_id}"
             raise ValueError(msg)
@@ -415,7 +430,7 @@ class TeamRestorer:
             agent_events = self._filter_event_messages(events, addr.agent_id)
             if agent_events:
                 proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
-                proxy_llm.init_llm_context(agent_events)  # type: ignore[attr-defined]
+                proxy_llm.init_llm_context(agent_events)
 
         # 2g. Register hireable agent profiles with orchestrator
         # Only profiles listed in agent_profiles are available for runtime
