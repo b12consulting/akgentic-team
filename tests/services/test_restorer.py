@@ -715,8 +715,15 @@ class TestTeamRestorerRollback:
         # Recording subscriber should have received replayed events
         assert len(recording.messages) > 0
 
-        # Stop and verify on_stop called
-        runtime.orchestrator_addr.stop()
+        # Stop via proxy and wait for full shutdown before asserting on_stop
+        runtime.orchestrator_proxy.stop()
+        # on_stop() fires asynchronously after the proxy stop() call returns;
+        # wait for the actor thread to finish so on_stop() has been invoked.
+        import time
+
+        deadline = time.monotonic() + 2.0
+        while runtime.orchestrator_addr.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert recording.stopped is True
 
 

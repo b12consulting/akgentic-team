@@ -134,10 +134,10 @@ class TeamRestorer:
             return runtime
 
         except Exception:
-            # Rollback: stop all spawned actors in reverse order
+            # Rollback: stop all spawned actors in reverse order via proxy API
             for addr in reversed(spawned_addrs):
                 try:
-                    addr.stop()
+                    self._actor_system.proxy_ask(addr, Akgent).stop()
                 except Exception:
                     logger.warning("Failed to stop actor during rollback: %s", addr)
             raise
