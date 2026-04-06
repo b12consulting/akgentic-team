@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -719,8 +720,6 @@ class TestTeamRestorerRollback:
         runtime.orchestrator_proxy.stop()
         # on_stop() fires asynchronously after the proxy stop() call returns;
         # wait for the actor thread to finish so on_stop() has been invoked.
-        import time
-
         deadline = time.monotonic() + 2.0
         while runtime.orchestrator_addr.is_alive() and time.monotonic() < deadline:
             time.sleep(0.01)

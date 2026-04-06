@@ -272,9 +272,9 @@ class TeamManager:
     def stop_team(self, team_id: uuid.UUID) -> None:
         """Gracefully stop a running team.
 
-        Unsubscribes all subscribers from the Orchestrator, tears down actors
-        (orchestrator first, then agents), persists Process with STOPPED status,
-        and deregisters from ServiceRegistry.
+        Unsubscribes all subscribers from the Orchestrator, stops the
+        orchestrator via proxy (which recursively tears down all child actors),
+        persists Process with STOPPED status, and deregisters from ServiceRegistry.
 
         Idempotent: calling stop on an already-STOPPED team is a no-op.
 
