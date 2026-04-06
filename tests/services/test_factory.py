@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -173,9 +173,14 @@ class TestTeamFactoryBuild:
 
         runtime = TeamFactory.build(tc, actor_system, subscribers=[sub])
 
-        # Verify subscriber is registered by stopping the orchestrator,
+        # Verify subscriber is registered by stopping the orchestrator via proxy,
         # which calls on_stop on all subscribers.
-        runtime.orchestrator_addr.stop()
+        runtime.orchestrator_proxy.stop()
+        # on_stop() fires asynchronously after the proxy stop() call returns;
+        # wait for the actor thread to finish so on_stop() has been invoked.
+        deadline = time.monotonic() + 2.0
+        while runtime.orchestrator_addr.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert sub.stopped is True
 
     # -- 3.5: routes_to wiring ------------------------------------------
@@ -285,7 +290,7 @@ class TestTeamFactoryBuild:
         failing = _make_member("failing", "Failing", agent_class=FailingAgent)
         tc = _make_team_card(members=[failing])
 
-        with patch.object(ActorAddress, "stop", side_effect=RuntimeError("stop failed")):
+        with patch.object(Akgent, "stop", side_effect=RuntimeError("stop failed")):
             with pytest.raises(RuntimeError, match="Failed to spawn agent"):
                 TeamFactory.build(tc, actor_system)
 

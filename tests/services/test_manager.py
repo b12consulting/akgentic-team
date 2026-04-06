@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 from unittest.mock import MagicMock
@@ -186,8 +187,13 @@ class TestTeamManagerCreate:
         tc = _make_team_card()
         runtime = mgr.create_team(tc)
 
-        # Verify recording subscriber is registered by stopping orchestrator
-        runtime.orchestrator_addr.stop()
+        # Verify recording subscriber is registered by stopping orchestrator via proxy
+        runtime.orchestrator_proxy.stop()
+        # on_stop() fires asynchronously after the proxy stop() call returns;
+        # wait for the actor thread to finish so on_stop() has been invoked.
+        deadline = time.monotonic() + 2.0
+        while runtime.orchestrator_addr.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert recording.stopped is True
 
     def test_create_team_rollback_on_build_failure(
@@ -472,25 +478,8 @@ def _create_and_stop_team(
     for member in tc.members:
         _inject_member(member)
 
-    # Stop all actors
-    runtime.orchestrator_addr.stop()
-    for addr in runtime.addrs.values():
-        if addr.is_alive():
-            addr.stop()
-
-    # Transition Process to STOPPED
-    process = event_store.load_team(team_id)
-    assert process is not None
-    stopped_process = Process(
-        team_id=process.team_id,
-        team_card=process.team_card,
-        status=TeamStatus.STOPPED,
-        user_id=process.user_id,
-        user_email=process.user_email,
-        created_at=process.created_at,
-        updated_at=process.updated_at,
-    )
-    event_store.save_team(stopped_process)
+    # Stop team via manager (uses proxy-based stop, transitions to STOPPED)
+    manager.stop_team(team_id)
 
     return team_id
 

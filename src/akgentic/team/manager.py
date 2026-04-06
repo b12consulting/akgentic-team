@@ -244,7 +244,9 @@ class TeamManager:
             team_id: The team identifier being stopped.
             runtime: The active TeamRuntime containing actor addresses.
         """
-        # Unsubscribe all tracked subscribers
+        # Unsubscribe all tracked subscribers and stop orchestrator via proxy.
+        # Using proxy_ask ensures Orchestrator.stop() is invoked (cancels timer,
+        # recursive child teardown) instead of bypassing via raw Pykka stop.
         try:
             orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
                 runtime.orchestrator_addr, Orchestrator
@@ -259,40 +261,20 @@ class TeamManager:
                         team_id,
                         exc_info=True,
                     )
+            orchestrator_proxy.stop()
         except Exception:
             logger.warning(
-                "Failed to get orchestrator proxy for team %s — skipping unsubscribe",
+                "Failed to teardown orchestrator for team %s",
                 team_id,
                 exc_info=True,
             )
-
-        # Tear down actors: orchestrator first, then remaining agents
-        try:
-            runtime.orchestrator_addr.stop()
-        except Exception:
-            logger.warning(
-                "Failed to stop orchestrator for team %s",
-                team_id,
-                exc_info=True,
-            )
-
-        for name, addr in runtime.addrs.items():
-            try:
-                addr.stop()
-            except Exception:
-                logger.warning(
-                    "Failed to stop agent '%s' for team %s",
-                    name,
-                    team_id,
-                    exc_info=True,
-                )
 
     def stop_team(self, team_id: uuid.UUID) -> None:
         """Gracefully stop a running team.
 
-        Unsubscribes all subscribers from the Orchestrator, tears down actors
-        (orchestrator first, then agents), persists Process with STOPPED status,
-        and deregisters from ServiceRegistry.
+        Unsubscribes all subscribers from the Orchestrator, stops the
+        orchestrator via proxy (which recursively tears down all child actors),
+        persists Process with STOPPED status, and deregisters from ServiceRegistry.
 
         Idempotent: calling stop on an already-STOPPED team is a no-op.
 

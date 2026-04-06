@@ -128,10 +128,10 @@ class TeamFactory:
             )
 
         except Exception:
-            # Rollback: stop all already-spawned actors
+            # Rollback: stop all already-spawned actors via proxy API
             for addr in reversed(spawned_addrs):
                 try:
-                    addr.stop()
+                    actor_system.proxy_ask(addr, Akgent).stop()
                 except Exception:
                     logger.warning("Failed to stop actor during rollback: %s", addr)
             raise
