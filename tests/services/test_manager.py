@@ -438,7 +438,7 @@ def _create_and_stop_team(
         "user_message": False,
     }
     orch_start = StartMessage(
-        config=BaseConfig(name="orchestrator", role="Orchestrator"),
+        config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
     )
     orch_start.sender = ActorAddressProxy(orch_addr_dict)
     orch_start.team_id = team_id

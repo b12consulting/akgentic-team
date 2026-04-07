@@ -233,7 +233,7 @@ class TeamRestorer:
             restoring=True,
             agent_id=orchestrator_start.sender.agent_id,
             team_id=team_id,
-            config=BaseConfig(name="orchestrator", role="Orchestrator"),
+            config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
         )
         spawned_addrs.append(orchestrator_addr)
 
