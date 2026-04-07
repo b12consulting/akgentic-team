@@ -291,3 +291,124 @@ class TestTeamRuntimeSendToResolution:
 
         with pytest.raises(ValueError, match="stale proxy address"):
             runtime.send_to("ghost", "hello")
+
+
+class TestTeamRuntimeSendFromTo:
+    """send_from_to() sends a message with the correct sender identity."""
+
+    def test_send_from_to_valid_sender_and_recipient(self) -> None:
+        """AC1: sender proxy is obtained via proxy_tell and used to send."""
+        sender_addr = make_stub_addr("developer")
+        recipient_addr = make_stub_addr("manager")
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: sender_addr if name == "developer" else recipient_addr,
+        )
+        runtime.actor_system.proxy_tell.reset_mock()
+
+        runtime.send_from_to("developer", "manager", "hello")
+
+        runtime.actor_system.proxy_tell.assert_called_once_with(sender_addr, Akgent)
+        sender_proxy = runtime.actor_system.proxy_tell.return_value
+        sender_proxy.send.assert_called_once()
+        call_args = sender_proxy.send.call_args
+        assert call_args.args[0] is recipient_addr
+        assert isinstance(call_args.args[1], UserMessage)
+        assert call_args.args[1].content == "hello"
+
+    def test_send_from_to_unknown_sender(self) -> None:
+        """AC2: ValueError when sender is not found."""
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
+
+        with pytest.raises(ValueError, match="not found"):
+            runtime.send_from_to("unknown", "manager", "hello")
+
+    def test_send_from_to_unknown_recipient(self) -> None:
+        """AC3: ValueError when recipient is not found."""
+        sender_addr = make_stub_addr("developer")
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: sender_addr if name == "developer" else None,
+        )
+
+        with pytest.raises(ValueError, match="not found"):
+            runtime.send_from_to("developer", "unknown", "hello")
+
+    def test_send_from_to_resolves_stale_sender_proxy(self) -> None:
+        """AC4: stale sender proxy is resolved via _addr_map."""
+        from akgentic.core.actor_address_impl import ActorAddressProxy
+        from akgentic.core.utils.deserializer import ActorAddressDict
+
+        agent_id = uuid.uuid4()
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": "akgentic.core.agent.Akgent",
+            "agent_id": str(agent_id),
+            "name": "developer",
+            "role": "Developer",
+            "team_id": str(uuid.uuid4()),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        proxy_addr = ActorAddressProxy(addr_dict)
+        live_sender = make_stub_addr("developer")
+        live_sender.agent_id = agent_id
+        recipient_addr = make_stub_addr("manager")
+
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: proxy_addr if name == "developer" else recipient_addr,
+        )
+        runtime._addr_map = {agent_id: live_sender}
+        runtime.actor_system.proxy_tell.reset_mock()
+
+        runtime.send_from_to("developer", "manager", "hello")
+
+        runtime.actor_system.proxy_tell.assert_called_once_with(live_sender, Akgent)
+
+    def test_send_from_to_resolves_stale_recipient_proxy(self) -> None:
+        """AC4: stale recipient proxy is resolved via _addr_map."""
+        from akgentic.core.actor_address_impl import ActorAddressProxy
+        from akgentic.core.utils.deserializer import ActorAddressDict
+
+        agent_id = uuid.uuid4()
+        addr_dict: ActorAddressDict = {
+            "__actor_address__": True,
+            "__actor_type__": "akgentic.core.agent.Akgent",
+            "agent_id": str(agent_id),
+            "name": "manager",
+            "role": "Manager",
+            "team_id": str(uuid.uuid4()),
+            "squad_id": str(uuid.uuid4()),
+            "user_message": False,
+        }
+        proxy_addr = ActorAddressProxy(addr_dict)
+        live_recipient = make_stub_addr("manager")
+        live_recipient.agent_id = agent_id
+        sender_addr = make_stub_addr("developer")
+
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: sender_addr if name == "developer" else proxy_addr,
+        )
+        runtime._addr_map = {agent_id: live_recipient}
+
+        runtime.send_from_to("developer", "manager", "hello")
+
+        sender_proxy = runtime.actor_system.proxy_tell.return_value
+        call_args = sender_proxy.send.call_args
+        assert call_args.args[0] is live_recipient
+
+    def test_send_to_still_works_after_refactor(self) -> None:
+        """AC6: existing send_to() is not broken by the refactoring."""
+        target_addr = make_stub_addr("worker")
+        runtime = make_team_runtime(message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=target_addr)
+        runtime.send_to("worker", "hello")
+        runtime._orchestrator_proxy.get_team_member.assert_called_once_with("worker")
+        runtime._entry_proxy.send.assert_called_once()
+        call_args = runtime._entry_proxy.send.call_args
+        assert call_args.args[0] is target_addr
+        assert isinstance(call_args.args[1], UserMessage)
+        assert call_args.args[1].content == "hello"
