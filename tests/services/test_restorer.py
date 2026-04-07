@@ -213,7 +213,7 @@ def _populate_stopped_team(
         "Orchestrator",
         team_id,
         agent_class=Orchestrator,
-        config=BaseConfig(name="orchestrator", role="Orchestrator"),
+        config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
     )
     event_store.save_event(
         PersistedEvent(
@@ -937,7 +937,7 @@ class TestRestorerOrphanFallback:
             "Orchestrator",
             team_id,
             agent_class=Orchestrator,
-            config=BaseConfig(name="orchestrator", role="Orchestrator"),
+            config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
         )
         event_store.save_event(
             PersistedEvent(
@@ -1300,7 +1300,7 @@ class TestRestorerToolActorSpawnOrder:
                 "Orchestrator",
                 team_id,
                 agent_class=Orchestrator,
-                config=BaseConfig(name="orchestrator", role="Orchestrator"),
+                config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
             )
             event_store.save_event(
                 PersistedEvent(
@@ -1404,7 +1404,7 @@ class TestRestorerToolActorSpawnOrder:
                 "Orchestrator",
                 team_id,
                 agent_class=Orchestrator,
-                config=BaseConfig(name="orchestrator", role="Orchestrator"),
+                config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
             )
             event_store.save_event(
                 PersistedEvent(
@@ -1478,7 +1478,7 @@ class TestRestorerToolActorSpawnOrder:
             "Orchestrator",
             team_id,
             agent_class=Orchestrator,
-            config=BaseConfig(name="orchestrator", role="Orchestrator"),
+            config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
         )
         event_store.save_event(
             PersistedEvent(

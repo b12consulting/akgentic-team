@@ -66,7 +66,7 @@ class TeamFactory:
             # 1. Create Orchestrator
             orchestrator_addr = actor_system.createActor(
                 Orchestrator,
-                config=BaseConfig(name="orchestrator", role="Orchestrator"),
+                config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
                 team_id=team_id,
             )
             spawned_addrs.append(orchestrator_addr)
