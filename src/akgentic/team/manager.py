@@ -199,8 +199,7 @@ class TeamManager:
         restorer = TeamRestorer(self._actor_system, self._event_store)
 
         # Compute max existing sequence so new events continue monotonically
-        existing_events = self._event_store.load_events(team_id)
-        max_seq = max((e.sequence for e in existing_events), default=0)
+        max_seq = self._event_store.get_max_sequence(team_id)
 
         # Create PersistenceSubscriber once — passed to restorer and tracked for stop
         persistence_sub = PersistenceSubscriber(

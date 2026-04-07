@@ -189,6 +189,22 @@ class YamlEventStore:
         logger.debug("Loaded %d events for team %s", len(events), team_id)
         return sorted(events, key=lambda e: e.sequence)
 
+    def get_max_sequence(self, team_id: uuid.UUID) -> int:
+        """Return the highest event sequence number for a team, or 0.
+
+        Loads all events and computes the max in Python. This is acceptable
+        for a file-based store; database-backed stores should use an
+        efficient query instead.
+
+        Args:
+            team_id: Unique identifier of the team.
+
+        Returns:
+            The highest sequence number, or 0 if no events exist.
+        """
+        events = self.load_events(team_id)
+        return max((e.sequence for e in events), default=0)
+
     def save_agent_state(self, snapshot: AgentStateSnapshot) -> None:
         """Persist an agent state snapshot to states/{agent_id}.yaml.
 
