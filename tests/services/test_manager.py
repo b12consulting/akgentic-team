@@ -603,6 +603,65 @@ class TestTeamManagerResume:
             f"PersistenceSubscriber appeared {persistence_count} times, expected 1"
         )
 
+    def test_resume_continues_sequence_numbering(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 14.8: After stop/resume, new events continue from max existing sequence."""
+        from akgentic.core.messages.message import UserMessage
+
+        from akgentic.team.subscriber import PersistenceSubscriber
+
+        team_id = _create_and_stop_team(manager, event_store)
+
+        # Record max sequence before resume
+        existing_events = event_store.load_events(team_id)
+        max_seq = max(e.sequence for e in existing_events)
+        assert max_seq > 0, "Precondition: events must exist before resume"
+
+        # Resume team
+        manager.resume_team(team_id)
+
+        # Find the PersistenceSubscriber in tracked subscribers
+        team_subs = manager._team_subscribers[team_id]
+        persistence_sub = next(s for s in team_subs if isinstance(s, PersistenceSubscriber))
+
+        # Send a message via the PersistenceSubscriber directly
+        persistence_sub.on_message(UserMessage(content="post-resume message"))
+
+        # The new event must have sequence = max_seq + 1
+        all_events = event_store.load_events(team_id)
+        # Filter to events from the persistence subscriber (latest one added)
+        post_resume_events = [e for e in all_events if e.sequence > max_seq]
+        assert len(post_resume_events) == 1
+        assert post_resume_events[0].sequence == max_seq + 1
+
+    def test_create_team_uses_default_initial_sequence(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 14.8: create_team uses default initial_sequence=0 (no regression)."""
+        from akgentic.core.messages.message import UserMessage
+
+        from akgentic.team.subscriber import PersistenceSubscriber
+
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+
+        # Find the PersistenceSubscriber
+        team_subs = manager._team_subscribers[runtime.id]
+        persistence_sub = next(s for s in team_subs if isinstance(s, PersistenceSubscriber))
+
+        # Send a message — sequence should start at 1
+        persistence_sub.on_message(UserMessage(content="first message"))
+
+        events = event_store.events
+        # Filter to the event we just sent (others may exist from team creation)
+        our_events = [e for e in events if e.team_id == runtime.id and e.sequence == 1]
+        assert len(our_events) == 1
+
     def test_stop_after_resume_unsubscribes_same_objects(
         self,
         actor_system: ActorSystem,

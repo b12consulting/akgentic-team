@@ -26,16 +26,24 @@ class PersistenceSubscriber(EventSubscriber):
     BaseState) -- no imports from akgentic-llm or akgentic-agent needed.
     """
 
-    def __init__(self, team_id: uuid.UUID, event_store: EventStore) -> None:
+    def __init__(
+        self,
+        team_id: uuid.UUID,
+        event_store: EventStore,
+        initial_sequence: int = 0,
+    ) -> None:
         """Initialize the persistence subscriber.
 
         Args:
             team_id: Unique identifier of the team whose events are persisted.
             event_store: Storage backend for events and agent state snapshots.
+            initial_sequence: Starting sequence number. Use 0 (default) for new
+                teams. For resumed teams, pass the max existing sequence so that
+                new events continue monotonically without duplicating numbers.
         """
         self._team_id = team_id
         self._event_store = event_store
-        self._sequence = 0
+        self._sequence = initial_sequence
         self._restoring = False
 
     def on_message(self, msg: Message) -> None:

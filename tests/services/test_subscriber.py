@@ -142,3 +142,42 @@ class TestPersistenceSubscriber:
     def test_is_instance_of_event_subscriber(self) -> None:
         """AC 3: PersistenceSubscriber explicitly inherits from EventSubscriber."""
         assert EventSubscriber in PersistenceSubscriber.__mro__
+
+    # -- Story 14.8: initial_sequence parameter ------------------------------
+
+    def test_initial_sequence_continues_from_provided_value(self) -> None:
+        """AC 14.8: Sequence starts from initial_sequence, not 0."""
+        team_id = uuid.uuid4()
+        store = InMemoryEventStore()
+        sub = PersistenceSubscriber(team_id=team_id, event_store=store, initial_sequence=22)
+
+        sub.on_message(UserMessage(content="hello after resume"))
+
+        events = store.events
+        assert len(events) == 1
+        assert events[0].sequence == 23
+
+    def test_default_initial_sequence_starts_at_one(self) -> None:
+        """AC 14.8: Without initial_sequence, first event gets sequence 1 (no regression)."""
+        team_id = uuid.uuid4()
+        store = InMemoryEventStore()
+        sub = PersistenceSubscriber(team_id=team_id, event_store=store)
+
+        sub.on_message(UserMessage(content="first"))
+
+        events = store.events
+        assert len(events) == 1
+        assert events[0].sequence == 1
+
+    def test_initial_sequence_with_multiple_messages(self) -> None:
+        """AC 14.8: Multiple messages after initial_sequence continue monotonically."""
+        team_id = uuid.uuid4()
+        store = InMemoryEventStore()
+        sub = PersistenceSubscriber(team_id=team_id, event_store=store, initial_sequence=10)
+
+        sub.on_message(UserMessage(content="msg1"))
+        sub.on_message(UserMessage(content="msg2"))
+        sub.on_message(UserMessage(content="msg3"))
+
+        sequences = [e.sequence for e in store.events]
+        assert sequences == [11, 12, 13]
