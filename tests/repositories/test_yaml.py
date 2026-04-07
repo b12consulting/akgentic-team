@@ -242,6 +242,25 @@ class TestYamlEventStore:
         assert len(result) == 1
         assert result[0].team_id == p1.team_id
 
+    # --- get_max_sequence ---
+
+    def test_get_max_sequence_returns_max_sequence(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """get_max_sequence returns the highest sequence number for a team."""
+        team_id = uuid.uuid4()
+        yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=5))
+        yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=3))
+        yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=10))
+
+        assert yaml_store.get_max_sequence(team_id) == 10
+
+    def test_get_max_sequence_returns_zero_for_no_events(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """get_max_sequence returns 0 when no events exist for a team."""
+        assert yaml_store.get_max_sequence(uuid.uuid4()) == 0
+
     # --- Protocol compliance ---
 
     def test_satisfies_event_store_protocol(self, tmp_path: Path) -> None:

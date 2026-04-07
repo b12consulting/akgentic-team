@@ -70,6 +70,19 @@ class EventStore(Protocol):
         """
         ...
 
+    def get_max_sequence(self, team_id: uuid.UUID) -> int:
+        """Return the highest event sequence number for a team.
+
+        Used by TeamManager.resume_team() to initialize PersistenceSubscriber
+        so that new events continue monotonically after restore. Returns 0 if
+        no events exist for the given team.
+
+        Implementations backed by a database (e.g. MongoDB) SHOULD use an
+        efficient query (e.g. ``find().sort("sequence", -1).limit(1)``)
+        rather than loading all events into memory.
+        """
+        ...
+
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
         """Load all agent state snapshots for a team.
 

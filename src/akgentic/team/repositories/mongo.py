@@ -157,6 +157,28 @@ class MongoEventStore:
         logger.debug("Loaded %d events for team %s", len(events), team_id)
         return events
 
+    def get_max_sequence(self, team_id: uuid.UUID) -> int:
+        """Return the highest event sequence number for a team, or 0.
+
+        Uses an efficient MongoDB query (sort + limit) to avoid loading
+        all events into memory.
+
+        Args:
+            team_id: Unique identifier of the team.
+
+        Returns:
+            The highest sequence number, or 0 if no events exist.
+        """
+        doc = self._events.find_one(
+            {"team_id": str(team_id)},
+            sort=[("sequence", -1)],
+            projection={"sequence": 1, "_id": 0},
+        )
+        if doc is None:
+            return 0
+        result: int = doc["sequence"]
+        return result
+
     def save_agent_state(self, snapshot: AgentStateSnapshot) -> None:
         """Persist an agent state snapshot via upsert.
 

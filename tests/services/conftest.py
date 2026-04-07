@@ -77,6 +77,11 @@ class InMemoryEventStore:
         """Load all team process snapshots."""
         return list(self.teams.values())
 
+    def get_max_sequence(self, team_id: uuid.UUID) -> int:
+        """Return the highest event sequence number for a team, or 0."""
+        events = self.load_events(team_id)
+        return max((e.sequence for e in events), default=0)
+
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
         """Load all agent state snapshots for a team."""
         return [v for k, v in self.agent_states.items() if k[0] == team_id]
