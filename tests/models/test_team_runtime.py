@@ -7,7 +7,8 @@ from unittest.mock import MagicMock
 
 import pytest
 from akgentic.core.agent import Akgent
-from akgentic.core.messages.message import UserMessage
+from akgentic.core.messages.message import Message, UserMessage
+from akgentic.core.user_proxy import UserProxy
 from pydantic import ValidationError
 
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
@@ -412,3 +413,129 @@ class TestTeamRuntimeSendFromTo:
         assert call_args.args[0] is target_addr
         assert isinstance(call_args.args[1], UserMessage)
         assert call_args.args[1].content == "hello"
+
+
+class TestTeamRuntimeProcessHumanInput:
+    """AC 1-4 (Story 17.1): process_human_input() routes to UserProxy agent."""
+
+    def _make_runtime_with_userproxy(
+        self,
+        *,
+        include_addr: bool = True,
+    ) -> tuple[TeamRuntime, MagicMock]:
+        """Build a TeamRuntime whose team includes a UserProxy agent card.
+
+        Args:
+            include_addr: Whether to populate addrs with the UserProxy address.
+
+        Returns:
+            Tuple of (runtime, user_proxy_addr).
+        """
+        user_proxy_card = make_agent_card(
+            name="human", role="UserProxy", agent_class=UserProxy
+        )
+        worker_card = make_agent_card(name="worker", role="Worker", agent_class=Akgent)
+        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+
+        entry_member = TeamCardMember(card=entry_card)
+        tc = TeamCard(
+            name="team-with-human",
+            description="A team with a UserProxy",
+            entry_point=entry_member,
+            members=[
+                TeamCardMember(card=user_proxy_card),
+                TeamCardMember(card=worker_card),
+            ],
+            message_types=[UserMessage],
+        )
+
+        proxy_addr = make_stub_addr("human")
+        addrs: dict[str, MagicMock] = {}
+        if include_addr:
+            addrs["human"] = proxy_addr
+
+        runtime = make_team_runtime(team_card=tc, addrs=addrs)
+        return runtime, proxy_addr
+
+    def test_happy_path(self) -> None:
+        """AC1-2: process_human_input routes to UserProxy via proxy_ask."""
+        runtime, proxy_addr = self._make_runtime_with_userproxy()
+        message = UserMessage(content="What should I do?")
+
+        runtime.process_human_input("Continue with plan A", message)
+
+        runtime.actor_system.proxy_ask.assert_any_call(proxy_addr, UserProxy)
+        proxy = runtime.actor_system.proxy_ask.return_value
+        proxy.process_human_input.assert_called_once_with(
+            "Continue with plan A", message
+        )
+
+    def test_no_userproxy_in_team(self) -> None:
+        """AC3: ValueError when no UserProxy agent exists in team."""
+        runtime = make_team_runtime(message_types=[UserMessage])
+        message = UserMessage(content="hello")
+
+        with pytest.raises(ValueError, match="No UserProxy found in team"):
+            runtime.process_human_input("response", message)
+
+    def test_userproxy_with_missing_address(self) -> None:
+        """AC4: ValueError when UserProxy has no resolved address."""
+        runtime, _ = self._make_runtime_with_userproxy(include_addr=False)
+        message = UserMessage(content="hello")
+
+        with pytest.raises(ValueError, match="has no resolved address"):
+            runtime.process_human_input("response", message)
+
+    def test_empty_agent_cards(self) -> None:
+        """AC3: ValueError when team has no members at all."""
+        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+        tc = TeamCard(
+            name="empty-team",
+            description="A team with no members",
+            entry_point=TeamCardMember(card=entry_card),
+            members=[],
+            message_types=[UserMessage],
+        )
+        runtime = make_team_runtime(team_card=tc)
+        message = UserMessage(content="hello")
+
+        with pytest.raises(ValueError, match="No UserProxy found in team"):
+            runtime.process_human_input("response", message)
+
+    def test_multiple_agents_only_userproxy_matched(self) -> None:
+        """AC2: Only the UserProxy agent is called among multiple agents."""
+        user_proxy_card = make_agent_card(
+            name="human", role="UserProxy", agent_class=UserProxy
+        )
+        worker1_card = make_agent_card(
+            name="worker1", role="Worker1", agent_class=Akgent
+        )
+        worker2_card = make_agent_card(
+            name="worker2", role="Worker2", agent_class=Akgent
+        )
+        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+
+        tc = TeamCard(
+            name="multi-agent-team",
+            description="Team with 3+ agents, only one UserProxy",
+            entry_point=TeamCardMember(card=entry_card),
+            members=[
+                TeamCardMember(card=worker1_card),
+                TeamCardMember(card=user_proxy_card),
+                TeamCardMember(card=worker2_card),
+            ],
+            message_types=[UserMessage],
+        )
+
+        proxy_addr = make_stub_addr("human")
+        runtime = make_team_runtime(
+            team_card=tc,
+            addrs={"human": proxy_addr},
+        )
+        message = UserMessage(content="question")
+
+        runtime.process_human_input("answer", message)
+
+        runtime.actor_system.proxy_ask.assert_any_call(proxy_addr, UserProxy)
+        proxy = runtime.actor_system.proxy_ask.return_value
+        proxy.process_human_input.assert_called_once_with("answer", message)
