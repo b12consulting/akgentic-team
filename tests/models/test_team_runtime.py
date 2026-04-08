@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from akgentic.core.agent import Akgent
-from akgentic.core.messages.message import Message, UserMessage
+from akgentic.core.messages.message import UserMessage
 from akgentic.core.user_proxy import UserProxy
 from pydantic import ValidationError
 
