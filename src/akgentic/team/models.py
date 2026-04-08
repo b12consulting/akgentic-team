@@ -236,6 +236,52 @@ class TeamRuntime(SerializableBaseModel):
         for addr in self.supervisor_addrs.values():
             self._entry_proxy.send(addr, self._make_message(content))
 
+    def _resolve_addr(self, agent_name: str, addr: ActorAddress) -> ActorAddress:
+        """Resolve a potentially stale proxy address to a live address.
+
+        If the address is an ``ActorAddressProxy`` (from deserialized data),
+        looks up the live address in ``_addr_map``.  Returns the address
+        unchanged if it is already live.
+
+        Args:
+            agent_name: Name of the agent (used in error messages).
+            addr: The address to resolve.
+
+        Returns:
+            A live ``ActorAddress``.
+
+        Raises:
+            ValueError: If the address is a stale proxy with no live mapping.
+        """
+        if isinstance(addr, ActorAddressProxy):
+            live = self._addr_map.get(addr.agent_id)
+            if live is None:
+                msg = (
+                    f"Agent '{agent_name}' has stale proxy address"
+                    " — no live mapping available"
+                )
+                raise ValueError(msg)
+            return live
+        return addr
+
+    def _lookup_member(self, agent_name: str) -> ActorAddress:
+        """Look up a team member by name and resolve stale proxies.
+
+        Args:
+            agent_name: Name of the agent to look up.
+
+        Returns:
+            A live ``ActorAddress`` for the agent.
+
+        Raises:
+            ValueError: If the agent is not found or has a stale proxy.
+        """
+        addr = self._orchestrator_proxy.get_team_member(agent_name)
+        if addr is None:
+            msg = f"Agent '{agent_name}' not found in team '{self.team.name}'"
+            raise ValueError(msg)
+        return self._resolve_addr(agent_name, addr)
+
     def send_to(self, agent_name: str, content: str) -> None:
         """Send a directed message to a specific agent by name.
 
@@ -250,19 +296,35 @@ class TeamRuntime(SerializableBaseModel):
         Raises:
             ValueError: If the agent is not found or has a stale proxy address.
         """
-        actor_addr = self._orchestrator_proxy.get_team_member(agent_name)
-        if actor_addr is None:
-            msg = f"Agent '{agent_name}' not found in team '{self.team.name}'"
-            raise ValueError(msg)
-        # Safety net: resolve proxy if it leaked through after restore
-        if isinstance(actor_addr, ActorAddressProxy):
-            live = self._addr_map.get(actor_addr.agent_id)
-            if live is None:
-                msg = f"Agent '{agent_name}' has stale proxy address — no live mapping available"
-                raise ValueError(msg)
-            actor_addr = live
+        actor_addr = self._lookup_member(agent_name)
         message = self._make_message(content)
         self._entry_proxy.send(actor_addr, message)
+
+    def send_from_to(
+        self,
+        sender_name: str,
+        recipient_name: str,
+        content: str,
+    ) -> None:
+        """Send a message from a specified agent to another agent.
+
+        Unlike ``send_to()`` which always sends via the entry proxy (so
+        the sender is the entry agent), this method obtains a proxy for
+        the *sender* agent and calls ``send()`` on it, so the message's
+        ``sender`` field is set to the specified sender's address.
+
+        Args:
+            sender_name: Name of the agent to send from.
+            recipient_name: Name of the agent to send to.
+            content: The message content.
+
+        Raises:
+            ValueError: If sender or recipient is not found or has a stale proxy.
+        """
+        sender_addr = self._lookup_member(sender_name)
+        recipient_addr = self._lookup_member(recipient_name)
+        sender_proxy = self.actor_system.proxy_tell(sender_addr, Akgent)
+        sender_proxy.send(recipient_addr, self._make_message(content))
 
     @property
     def orchestrator_proxy(self) -> Orchestrator:
