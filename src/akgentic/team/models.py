@@ -21,6 +21,7 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
+from akgentic.core.user_proxy import UserProxy
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 
@@ -325,6 +326,33 @@ class TeamRuntime(SerializableBaseModel):
         recipient_addr = self._lookup_member(recipient_name)
         sender_proxy = self.actor_system.proxy_tell(sender_addr, Akgent)
         sender_proxy.send(recipient_addr, self._make_message(content))
+
+    def process_human_input(self, content: str, message: Message) -> None:
+        """Route human input to the team's UserProxy agent.
+
+        Walks the team's agent cards to find the agent whose class is a
+        ``UserProxy`` subclass, resolves its address, obtains a typed proxy,
+        and delegates the call.
+
+        Args:
+            content: The human's text response.
+            message: The original message from the requesting agent.
+
+        Raises:
+            ValueError: If no UserProxy agent is found in the team or the
+                found agent has no resolved address.
+        """
+        for name, card in self.team.agent_cards.items():
+            if issubclass(card.get_agent_class(), UserProxy):
+                addr = self.addrs.get(name)
+                if addr is None:
+                    msg = f"UserProxy '{name}' found but has no resolved address"
+                    raise ValueError(msg)
+                proxy = self.actor_system.proxy_ask(addr, UserProxy)
+                proxy.process_human_input(content, message)
+                return
+        msg = "No UserProxy found in team"
+        raise ValueError(msg)
 
     @property
     def orchestrator_proxy(self) -> Orchestrator:
