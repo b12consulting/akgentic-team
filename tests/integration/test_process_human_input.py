@@ -7,9 +7,7 @@ and routed to the correct UserProxy agent.
 
 from __future__ import annotations
 
-import time
 import uuid
-from typing import Any
 
 import pykka
 import pytest
@@ -26,12 +24,10 @@ from akgentic.core.utils.deserializer import ActorAddressDict
 from akgentic.team.manager import TeamManager
 from akgentic.team.models import TeamCard, TeamCardMember
 from tests.integration.conftest import (
-    RecordingAgent,
     make_integration_agent_card,
     wait_for_agent_state,
 )
 from tests.services.conftest import InMemoryEventStore
-
 
 # ---------------------------------------------------------------------------
 # Agent classes for this test

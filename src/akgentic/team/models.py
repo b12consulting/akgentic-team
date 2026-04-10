@@ -352,7 +352,7 @@ class TeamRuntime(SerializableBaseModel):
             if live is None:
                 err = (
                     f"Cannot rehydrate address for agent '{proxy.name}': "
-                    f"not found in team"
+                    "not found in team"
                 )
                 raise ValueError(err)
             return live

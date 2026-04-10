@@ -238,7 +238,6 @@ class TestTeamRuntimeSendToResolution:
     def test_send_to_resolves_proxy_address(self) -> None:
         """If orchestrator returns a proxy, send_to() resolves it via addr_map."""
         from akgentic.core.actor_address_impl import ActorAddressProxy
-        from akgentic.core.utils.deserializer import ActorAddressDict
 
         agent_id = uuid.uuid4()
         team_id = uuid.uuid4()
@@ -275,7 +274,6 @@ class TestTeamRuntimeSendToResolution:
     def test_send_to_raises_for_unmapped_proxy(self) -> None:
         """If proxy has no mapping in addr_map, raise ValueError."""
         from akgentic.core.actor_address_impl import ActorAddressProxy
-        from akgentic.core.utils.deserializer import ActorAddressDict
 
         addr_dict: ActorAddressDict = {
             "__actor_address__": True,
@@ -342,7 +340,6 @@ class TestTeamRuntimeSendFromTo:
     def test_send_from_to_resolves_stale_sender_proxy(self) -> None:
         """AC4: stale sender proxy is resolved via _addr_map."""
         from akgentic.core.actor_address_impl import ActorAddressProxy
-        from akgentic.core.utils.deserializer import ActorAddressDict
 
         agent_id = uuid.uuid4()
         addr_dict: ActorAddressDict = {
@@ -374,7 +371,6 @@ class TestTeamRuntimeSendFromTo:
     def test_send_from_to_resolves_stale_recipient_proxy(self) -> None:
         """AC4: stale recipient proxy is resolved via _addr_map."""
         from akgentic.core.actor_address_impl import ActorAddressProxy
-        from akgentic.core.utils.deserializer import ActorAddressDict
 
         agent_id = uuid.uuid4()
         addr_dict: ActorAddressDict = {
