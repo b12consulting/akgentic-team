@@ -22,7 +22,8 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.user_proxy import UserProxy
-from akgentic.core.utils.serializer import SerializableBaseModel, hydrate_addresses
+from akgentic.core.utils import hydrate_addresses
+from akgentic.core.utils.serializer import SerializableBaseModel
 
 
 class TeamCardMember(SerializableBaseModel):

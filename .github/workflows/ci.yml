@@ -26,6 +26,12 @@ jobs:
           git fetch origin ${{ github.head_ref || github.ref_name }}
           git checkout FETCH_HEAD
 
+      - name: Bump akgentic-core to include hydrate_addresses (epic-13 PR 45)
+        working-directory: packages/akgentic-core
+        run: |
+          git fetch origin master
+          git checkout FETCH_HEAD
+
       - name: Ensure team package in workspace
         run: |
           if ! grep -q 'akgentic-team' pyproject.toml; then
