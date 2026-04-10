@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import Field, PrivateAttr
 
@@ -22,6 +22,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.user_proxy import UserProxy
+from akgentic.core.utils import hydrate_addresses
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 
@@ -328,31 +329,46 @@ class TeamRuntime(SerializableBaseModel):
         sender_proxy.send(recipient_addr, self._make_message(content))
 
     def process_human_input(self, content: str, message: Message) -> None:
-        """Route human input to the team's UserProxy agent.
+        """Route human input to the correct UserProxy by recipient name.
 
-        Walks the team's agent cards to find the agent whose class is a
-        ``UserProxy`` subclass, resolves its address, obtains a typed proxy,
-        and delegates the call.
+        Validates that the message has a recipient, rehydrates any
+        ``ActorAddressProxy`` references via the orchestrator, then
+        routes by ``message.recipient.name`` to the correct ``UserProxy``.
 
         Args:
             content: The human's text response.
             message: The original message from the requesting agent.
 
         Raises:
-            ValueError: If no UserProxy agent is found in the team or the
-                found agent has no resolved address.
+            ValueError: If the message has no recipient, the recipient
+                cannot be rehydrated, or the target is not a UserProxy.
         """
-        for name, card in self.team.agent_cards.items():
-            if issubclass(card.get_agent_class(), UserProxy):
-                addr = self.addrs.get(name)
-                if addr is None:
-                    msg = f"UserProxy '{name}' found but has no resolved address"
-                    raise ValueError(msg)
-                proxy = self.actor_system.proxy_ask(addr, UserProxy)
-                proxy.process_human_input(content, message)
-                return
-        msg = "No UserProxy found in team"
-        raise ValueError(msg)
+        if message.recipient is None:
+            msg = "Cannot route human input: message has no recipient"
+            raise ValueError(msg)
+
+        def _resolve(proxy: ActorAddressProxy) -> ActorAddress:
+            live = self._orchestrator_proxy.get_team_member(proxy.name)
+            if live is None:
+                err = (
+                    f"Cannot rehydrate address for agent '{proxy.name}': "
+                    "not found in team"
+                )
+                raise ValueError(err)
+            return live
+
+        live_message = cast(Message, hydrate_addresses(message, _resolve))
+
+        target_name = live_message.recipient.name  # type: ignore[union-attr]
+        target_addr = self._lookup_member(target_name)
+
+        card = self.team.agent_cards.get(target_name)
+        if card is None or not issubclass(card.get_agent_class(), UserProxy):
+            msg = f"Agent '{target_name}' is not a UserProxy"
+            raise ValueError(msg)
+
+        proxy = self.actor_system.proxy_ask(target_addr, UserProxy)
+        proxy.process_human_input(content, live_message)
 
     @property
     def orchestrator_proxy(self) -> Orchestrator:
