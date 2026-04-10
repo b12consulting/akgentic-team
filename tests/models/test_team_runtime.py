@@ -6,9 +6,12 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import UserMessage
 from akgentic.core.user_proxy import UserProxy
+from akgentic.core.utils.deserializer import ActorAddressDict
 from pydantic import ValidationError
 
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
@@ -415,127 +418,235 @@ class TestTeamRuntimeSendFromTo:
         assert call_args.args[1].content == "hello"
 
 
+def _make_proxy_addr(name: str, role: str = "Agent") -> ActorAddressProxy:
+    """Create an ActorAddressProxy for testing."""
+    addr_dict: ActorAddressDict = {
+        "__actor_address__": True,
+        "__actor_type__": "akgentic.core.agent.Akgent",
+        "agent_id": str(uuid.uuid4()),
+        "name": name,
+        "role": role,
+        "team_id": str(uuid.uuid4()),
+        "squad_id": str(uuid.uuid4()),
+        "user_message": False,
+    }
+    return ActorAddressProxy(addr_dict)
+
+
+def _make_multi_human_runtime(
+    *,
+    human_class: type = UserProxy,
+    support_class: type = UserProxy,
+) -> TeamRuntime:
+    """Build a TeamRuntime with @Human and @Support both as UserProxy."""
+    human_card = make_agent_card(name="@Human", role="Human", agent_class=human_class)
+    support_card = make_agent_card(
+        name="@Support", role="Support", agent_class=support_class
+    )
+    manager_card = make_agent_card(name="@Manager", role="Manager", agent_class=Akgent)
+    entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+
+    tc = TeamCard(
+        name="multi-human-team",
+        description="Team with two UserProxy agents",
+        entry_point=TeamCardMember(card=entry_card),
+        members=[
+            TeamCardMember(card=human_card),
+            TeamCardMember(card=support_card),
+            TeamCardMember(card=manager_card),
+        ],
+        message_types=[UserMessage],
+    )
+    return make_team_runtime(team_card=tc)
+
+
 class TestTeamRuntimeProcessHumanInput:
-    """AC 1-4 (Story 17.1): process_human_input() routes to UserProxy agent."""
+    """AC 1-7 (Story 16.1): process_human_input rehydrates and routes by recipient."""
 
-    def _make_runtime_with_userproxy(
-        self,
-        *,
-        include_addr: bool = True,
-    ) -> tuple[TeamRuntime, MagicMock]:
-        """Build a TeamRuntime whose team includes a UserProxy agent card.
-
-        Args:
-            include_addr: Whether to populate addrs with the UserProxy address.
-
-        Returns:
-            Tuple of (runtime, user_proxy_addr).
-        """
-        user_proxy_card = make_agent_card(
-            name="human", role="UserProxy", agent_class=UserProxy
-        )
-        worker_card = make_agent_card(name="worker", role="Worker", agent_class=Akgent)
-        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
-
-        entry_member = TeamCardMember(card=entry_card)
-        tc = TeamCard(
-            name="team-with-human",
-            description="A team with a UserProxy",
-            entry_point=entry_member,
-            members=[
-                TeamCardMember(card=user_proxy_card),
-                TeamCardMember(card=worker_card),
-            ],
-            message_types=[UserMessage],
-        )
-
-        proxy_addr = make_stub_addr("human")
-        addrs: dict[str, MagicMock] = {}
-        if include_addr:
-            addrs["human"] = proxy_addr
-
-        runtime = make_team_runtime(team_card=tc, addrs=addrs)
-        return runtime, proxy_addr
-
-    def test_happy_path(self) -> None:
-        """AC1-2: process_human_input routes to UserProxy via proxy_ask."""
-        runtime, proxy_addr = self._make_runtime_with_userproxy()
-        message = UserMessage(content="What should I do?")
-
-        runtime.process_human_input("Continue with plan A", message)
-
-        runtime.actor_system.proxy_ask.assert_any_call(proxy_addr, UserProxy)
-        proxy = runtime.actor_system.proxy_ask.return_value
-        proxy.process_human_input.assert_called_once_with(
-            "Continue with plan A", message
-        )
-
-    def test_no_userproxy_in_team(self) -> None:
-        """AC3: ValueError when no UserProxy agent exists in team."""
-        runtime = make_team_runtime(message_types=[UserMessage])
+    def test_recipient_none_raises_valueerror(self) -> None:
+        """AC1: ValueError when message.recipient is None; resolver never called."""
+        runtime = _make_multi_human_runtime()
         message = UserMessage(content="hello")
+        assert message.recipient is None
 
-        with pytest.raises(ValueError, match="No UserProxy found in team"):
+        with pytest.raises(ValueError, match="no recipient"):
             runtime.process_human_input("response", message)
 
-    def test_userproxy_with_missing_address(self) -> None:
-        """AC4: ValueError when UserProxy has no resolved address."""
-        runtime, _ = self._make_runtime_with_userproxy(include_addr=False)
-        message = UserMessage(content="hello")
+        # Orchestrator should never be consulted
+        runtime._orchestrator_proxy.get_team_member.assert_not_called()
 
-        with pytest.raises(ValueError, match="has no resolved address"):
-            runtime.process_human_input("response", message)
+    def test_rehydration_replaces_proxy_addresses(self) -> None:
+        """AC2: ActorAddressProxy sender/recipient are replaced with live addresses."""
+        proxy_sender = _make_proxy_addr("@Manager", "Manager")
+        proxy_recipient = _make_proxy_addr("@Support", "Support")
 
-    def test_empty_agent_cards(self) -> None:
-        """AC3: ValueError when team has no members at all."""
-        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
-        tc = TeamCard(
-            name="empty-team",
-            description="A team with no members",
-            entry_point=TeamCardMember(card=entry_card),
-            members=[],
-            message_types=[UserMessage],
-        )
-        runtime = make_team_runtime(team_card=tc)
-        message = UserMessage(content="hello")
+        live_sender = make_stub_addr("@Manager")
+        live_recipient = make_stub_addr("@Support")
+        target_addr = make_stub_addr("@Support")
 
-        with pytest.raises(ValueError, match="No UserProxy found in team"):
-            runtime.process_human_input("response", message)
+        runtime = _make_multi_human_runtime()
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: {
+                "@Manager": live_sender,
+                "@Support": live_recipient,
+            }.get(name)
+        )
+        # _lookup_member also calls get_team_member, return target_addr for it
+        original_get = runtime._orchestrator_proxy.get_team_member.side_effect
 
-    def test_multiple_agents_only_userproxy_matched(self) -> None:
-        """AC2: Only the UserProxy agent is called among multiple agents."""
-        user_proxy_card = make_agent_card(
-            name="human", role="UserProxy", agent_class=UserProxy
-        )
-        worker1_card = make_agent_card(
-            name="worker1", role="Worker1", agent_class=Akgent
-        )
-        worker2_card = make_agent_card(
-            name="worker2", role="Worker2", agent_class=Akgent
-        )
-        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+        def combined_get(name: str) -> ActorAddress | None:
+            result = original_get(name)
+            return result if result is not None else target_addr if name == "@Support" else None
 
-        tc = TeamCard(
-            name="multi-agent-team",
-            description="Team with 3+ agents, only one UserProxy",
-            entry_point=TeamCardMember(card=entry_card),
-            members=[
-                TeamCardMember(card=worker1_card),
-                TeamCardMember(card=user_proxy_card),
-                TeamCardMember(card=worker2_card),
-            ],
-            message_types=[UserMessage],
-        )
+        runtime._orchestrator_proxy.get_team_member = MagicMock(side_effect=combined_get)
 
-        proxy_addr = make_stub_addr("human")
-        runtime = make_team_runtime(
-            team_card=tc,
-            addrs={"human": proxy_addr},
-        )
         message = UserMessage(content="question")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
+
+        runtime.process_human_input("I coordinate onboarding", message)
+
+        # Verify the downstream proxy received a message with live addresses
+        proxy = runtime.actor_system.proxy_ask.return_value
+        proxy.process_human_input.assert_called_once()
+        call_args = proxy.process_human_input.call_args
+        live_msg = call_args.args[1]
+        # The rehydrated message should NOT be the original
+        assert live_msg is not message
+        # Sender and recipient should be live (not ActorAddressProxy)
+        assert not isinstance(live_msg.sender, ActorAddressProxy)
+        assert not isinstance(live_msg.recipient, ActorAddressProxy)
+
+    def test_orchestrator_lookup_miss_raises_valueerror(self) -> None:
+        """AC3: ValueError with 'not found in team' when resolver can't find agent."""
+        proxy_sender = _make_proxy_addr("@Ghost", "Ghost")
+        proxy_recipient = _make_proxy_addr("@Support", "Support")
+
+        runtime = _make_multi_human_runtime()
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
+
+        message = UserMessage(content="question")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
+
+        with pytest.raises(ValueError, match="not found in team"):
+            runtime.process_human_input("response", message)
+
+    def test_routes_by_recipient_name_not_first_match(self) -> None:
+        """AC4: Routes to @Support by name, not first UserProxy in dict order."""
+        live_sender = make_stub_addr("@Manager")
+        live_support = make_stub_addr("@Support")
+
+        runtime = _make_multi_human_runtime()
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: {
+                "@Manager": live_sender,
+                "@Support": live_support,
+            }.get(name)
+        )
+
+        proxy_sender = _make_proxy_addr("@Manager", "Manager")
+        proxy_recipient = _make_proxy_addr("@Support", "Support")
+        message = UserMessage(content="describe your role")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
+
+        runtime.process_human_input("I coordinate user onboarding", message)
+
+        # Verify proxy_ask was called with the @Support address
+        runtime.actor_system.proxy_ask.assert_any_call(live_support, UserProxy)
+
+    def test_target_not_userproxy_raises_valueerror(self) -> None:
+        """AC5: ValueError when target agent is not a UserProxy subclass."""
+        live_sender = make_stub_addr("@Human")
+        live_manager = make_stub_addr("@Manager")
+
+        runtime = _make_multi_human_runtime()
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: {
+                "@Human": live_sender,
+                "@Manager": live_manager,
+            }.get(name)
+        )
+
+        proxy_sender = _make_proxy_addr("@Human", "Human")
+        proxy_recipient = _make_proxy_addr("@Manager", "Manager")
+        message = UserMessage(content="hello")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
+
+        with pytest.raises(ValueError, match="is not a UserProxy"):
+            runtime.process_human_input("response", message)
+
+    def test_downstream_receives_rehydrated_message(self) -> None:
+        """AC6: The message passed downstream is the rehydrated copy, not original."""
+        live_sender = make_stub_addr("@Manager")
+        live_support = make_stub_addr("@Support")
+
+        runtime = _make_multi_human_runtime()
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: {
+                "@Manager": live_sender,
+                "@Support": live_support,
+            }.get(name)
+        )
+
+        proxy_sender = _make_proxy_addr("@Manager", "Manager")
+        proxy_recipient = _make_proxy_addr("@Support", "Support")
+        message = UserMessage(content="question")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
 
         runtime.process_human_input("answer", message)
 
-        runtime.actor_system.proxy_ask.assert_any_call(proxy_addr, UserProxy)
         proxy = runtime.actor_system.proxy_ask.return_value
-        proxy.process_human_input.assert_called_once_with("answer", message)
+        call_args = proxy.process_human_input.call_args
+        delivered_msg = call_args.args[1]
+        # Must be a different object (rehydrated copy)
+        assert delivered_msg is not message
+        assert delivered_msg.content == "question"
+
+    def test_dynamic_agent_resolved_by_orchestrator(self) -> None:
+        """AC7: Orchestrator resolves @Expert even if not in self.addrs."""
+        live_sender = make_stub_addr("@Human")
+        live_expert = make_stub_addr("@Expert")
+
+        # Build a runtime where @Expert is in agent_cards as UserProxy
+        expert_card = make_agent_card(
+            name="@Expert", role="Expert", agent_class=UserProxy
+        )
+        human_card = make_agent_card(
+            name="@Human", role="Human", agent_class=UserProxy
+        )
+        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+
+        tc = TeamCard(
+            name="dynamic-team",
+            description="Team where @Expert is hired at runtime",
+            entry_point=TeamCardMember(card=entry_card),
+            members=[
+                TeamCardMember(card=human_card),
+                TeamCardMember(card=expert_card),
+            ],
+            message_types=[UserMessage],
+        )
+        # addrs does NOT include @Expert -- simulating runtime hiring
+        runtime = make_team_runtime(team_card=tc, addrs={})
+
+        runtime._orchestrator_proxy.get_team_member = MagicMock(
+            side_effect=lambda name: {
+                "@Human": live_sender,
+                "@Expert": live_expert,
+            }.get(name)
+        )
+
+        proxy_sender = _make_proxy_addr("@Human", "Human")
+        proxy_recipient = _make_proxy_addr("@Expert", "Expert")
+        message = UserMessage(content="question")
+        message.sender = proxy_sender
+        message.recipient = proxy_recipient
+
+        runtime.process_human_input("I am an expert", message)
+
+        # Verify _lookup_member resolved via orchestrator (not self.addrs)
+        runtime.actor_system.proxy_ask.assert_any_call(live_expert, UserProxy)
