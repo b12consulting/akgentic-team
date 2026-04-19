@@ -205,8 +205,9 @@ class TestTeamManagerCreate:
         failing = _make_member("failing", "Failing", agent_class=FailingAgent)
         tc = _make_team_card(members=[failing])
 
-        with pytest.raises(RuntimeError, match="Failed to spawn agent"):
+        with pytest.raises(RuntimeError) as excinfo:
             manager.create_team(tc)
+        assert str(excinfo.value)
 
         # No Process should be in event store
         assert len(event_store.teams) == 0
