@@ -369,8 +369,11 @@ class TeamRestorer:
         """Phase 2: Rebuild agents from the event log.
 
         Determines live agents via StartMessage/StopMessage filtering,
-        rebuilds the Orchestrator first, registers passed subscribers, spawns
-        remaining agents, restores agent states, and registers agent profiles.
+        rebuilds the Orchestrator first, spawns remaining agents, restores
+        agent states and LLM contexts, registers agent profiles, and
+        finally registers subscribers. Subscribers are registered last
+        so they only start receiving events during Phase 3 replay,
+        ensuring event stream parity with freshly started teams (ADR-014).
 
         Args:
             process: The Process record containing the team card.
@@ -411,10 +414,6 @@ class TeamRestorer:
             orchestrator_start, team_id, spawned_addrs
         )
 
-        # 2c. Register passed subscribers directly (no internal creation)
-        for sub in subscribers:
-            orchestrator_proxy.subscribe(sub)
-
         # 2d. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
@@ -438,6 +437,11 @@ class TeamRestorer:
         # would cause the LLM to hire duplicates via role names.
         if process.team_card.agent_profiles:
             orchestrator_proxy.register_agent_profiles(process.team_card.agent_profiles)
+
+        # 2h. Register subscribers last — ensures they only receive events
+        # during Phase 3 replay, matching fresh-team event stream (ADR-014).
+        for sub in subscribers:
+            orchestrator_proxy.subscribe(sub)
 
         return _RebuildResult(
             orchestrator_addr=orchestrator_addr,
@@ -472,8 +476,6 @@ class TeamRestorer:
         self._resolve_event_addresses(events, addr_map)
 
         for pe in events:
-            if isinstance(pe.event, StartMessage):
-                continue  # Already registered during Phase 2 spawn
             orchestrator_proxy.restore_message(pe.event)
 
         orchestrator_proxy.end_restoration()
