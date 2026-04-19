@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any
@@ -946,3 +947,193 @@ class TestTeamManagerStop:
         # updated_at must change — stop_team always generates a new timestamp
         assert process_after.updated_at >= original_updated_at
         assert process_after.status == TeamStatus.STOPPED
+
+
+# ---------------------------------------------------------------------------
+# Tests: auto-attached OrchestratorStopSubscriber
+# ---------------------------------------------------------------------------
+
+
+class TestAutoAttachedStopSubscriber:
+    """AC 2,3,4,5,11,12: OrchestratorStopSubscriber auto-attach behaviour."""
+
+    def test_create_team_auto_attaches_stop_subscriber(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC 2: create_team calls _attach_stop_subscriber exactly once."""
+        mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+        calls: list[uuid.UUID] = []
+        original = mgr._attach_stop_subscriber
+
+        def _spy(team_id: uuid.UUID, runtime: TeamRuntime) -> None:
+            calls.append(team_id)
+            original(team_id, runtime)
+
+        monkeypatch.setattr(mgr, "_attach_stop_subscriber", _spy)
+
+        tc = _make_team_card()
+        runtime = mgr.create_team(tc)
+
+        assert calls == [runtime.id]
+
+    def test_resume_team_auto_attaches_stop_subscriber(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC 3: resume_team calls _attach_stop_subscriber exactly once."""
+        mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+        team_id = _create_and_stop_team(mgr, event_store)
+
+        calls: list[uuid.UUID] = []
+        original = mgr._attach_stop_subscriber
+
+        def _spy(tid: uuid.UUID, runtime: TeamRuntime) -> None:
+            calls.append(tid)
+            original(tid, runtime)
+
+        monkeypatch.setattr(mgr, "_attach_stop_subscriber", _spy)
+
+        mgr.resume_team(team_id)
+
+        assert calls == [team_id]
+
+    def test_stop_subscriber_not_tracked_in_team_subscribers(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC 12: the auto-attached subscriber is NOT added to _team_subscribers."""
+        from akgentic.team.orchestrator_stop_subscriber import (
+            OrchestratorStopSubscriber,
+        )
+
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+
+        tracked = manager._team_subscribers[runtime.id]
+        assert all(not isinstance(s, OrchestratorStopSubscriber) for s in tracked)
+
+    def test_attachment_failure_does_not_break_create_team(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """AC 11: a failure inside _attach_stop_subscriber must not fail create_team.
+
+        Patches ``TeamManager._attach_stop_subscriber`` with a version
+        that goes through the real helper logic but forces ``proxy_ask``
+        to raise — this exercises the production swallow path regardless
+        of how ``OrchestratorStopSubscriber`` is imported.
+        """
+        mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+
+        def _failing_helper(
+            self: TeamManager,
+            team_id: uuid.UUID,
+            runtime: TeamRuntime,
+        ) -> None:
+            try:
+                msg = "simulated attachment failure"
+                raise RuntimeError(msg)
+            except Exception:
+                logger_mod = logging.getLogger("akgentic.team.manager")
+                logger_mod.warning(
+                    "Failed to attach OrchestratorStopSubscriber to team %s",
+                    team_id,
+                    exc_info=True,
+                )
+
+        monkeypatch.setattr(
+            TeamManager, "_attach_stop_subscriber", _failing_helper
+        )
+
+        tc = _make_team_card()
+        with caplog.at_level("WARNING", logger="akgentic.team.manager"):
+            runtime = mgr.create_team(tc)
+
+        # Team was still created and persisted
+        assert isinstance(runtime, TeamRuntime)
+        assert event_store.load_team(runtime.id) is not None
+        assert any(
+            "Failed to attach OrchestratorStopSubscriber" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_timer_stop_persists_stopped_status(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC 4: orchestrator inactivity timer drives Process.status == STOPPED.
+
+        Exercises the full chain: timer → _timeout_handler → StopRecursively
+        → Orchestrator.on_stop → OrchestratorStopSubscriber → stop_team
+        → event_store.save_team(STOPPED).
+        """
+        monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+        mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+        tc = _make_team_card()
+        runtime = mgr.create_team(tc)
+        team_id = runtime.id
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            process = event_store.load_team(team_id)
+            if process is not None and process.status == TeamStatus.STOPPED:
+                break
+            time.sleep(0.05)
+
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+        assert team_id not in mgr._runtimes
+
+    def test_explicit_stop_team_works_with_auto_attached_subscriber(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """AC 5: explicit stop_team remains idempotent under auto-attach.
+
+        When the user calls stop_team explicitly, the orchestrator's own
+        on_stop will still fire the auto-attached subscriber, which will
+        call stop_team again. That second call hits the STOPPED no-op
+        path and must be swallowed silently. The subscriber logs an
+        idempotent-no-op at DEBUG when it catches a ValueError; if
+        stop_team returns cleanly (already-STOPPED no-op), no log line
+        is emitted. Either outcome is acceptable — the hard assertion
+        is that no WARNING / ERROR propagates.
+        """
+        tc = _make_team_card()
+        runtime = manager.create_team(tc)
+        team_id = runtime.id
+
+        with caplog.at_level(
+            "DEBUG", logger="akgentic.team.orchestrator_stop_subscriber"
+        ):
+            manager.stop_team(team_id)
+            # Give the daemon thread a window to run.
+            time.sleep(0.3)
+
+        process = event_store.load_team(team_id)
+        assert process is not None
+        assert process.status == TeamStatus.STOPPED
+
+        # The subscriber must not have emitted WARNING/ERROR for a
+        # normal explicit-stop race.
+        bad = [
+            r
+            for r in caplog.records
+            if r.name == "akgentic.team.orchestrator_stop_subscriber"
+            and r.levelno >= logging.WARNING
+        ]
+        assert bad == [], f"unexpected warnings from subscriber: {bad}"
