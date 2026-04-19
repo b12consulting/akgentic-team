@@ -725,6 +725,47 @@ class TestTeamRestorerRollback:
             time.sleep(0.01)
         assert recording.stopped is True
 
+    def test_subscriber_receives_start_messages_during_replay(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Subscriber receives StartMessage events for all agents during Phase 3 replay.
+
+        Story 14.9 AC 4: Given a team with 3 agents that is stopped and resumed,
+        when a subscriber is registered during restore, then the subscriber
+        receives StartMessage events for all 3 agents during Phase 3 replay.
+        """
+        worker1 = _make_member("worker1", "Worker")
+        worker2 = _make_member("worker2", "Worker")
+        tc = _make_team_card(members=[worker1, worker2])
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        recording = RecordingSubscriber()
+
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[recording])
+
+        # Filter StartMessage events received by the subscriber
+        start_messages = [
+            m for m in recording.messages if isinstance(m, StartMessage)
+        ]
+
+        # Should receive StartMessages for orchestrator + lead + worker1 + worker2
+        start_names = {
+            m.sender.name for m in start_messages if m.sender is not None
+        }
+        assert "lead" in start_names, (
+            f"Missing StartMessage for 'lead'; received: {start_names}"
+        )
+        assert "worker1" in start_names, (
+            f"Missing StartMessage for 'worker1'; received: {start_names}"
+        )
+        assert "worker2" in start_names, (
+            f"Missing StartMessage for 'worker2'; received: {start_names}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: Hierarchy propagation during restore (Story 10-1, AC 3, 5)
