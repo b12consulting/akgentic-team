@@ -58,6 +58,10 @@ class TeamManager:
         self._instance_id = instance_id or uuid.uuid4()
         self._runtimes: dict[uuid.UUID, TeamRuntime] = {}
         self._team_subscribers: dict[uuid.UUID, list[EventSubscriber]] = {}
+        # Tracks teams with an attached OrchestratorStopSubscriber so
+        # re-entry (e.g. resume → stop → resume) does not stack multiple
+        # bridges that would each spawn a daemon thread on timer-stop.
+        self._stop_subscriber_attached: set[uuid.UUID] = set()
 
     def create_team(
         self,
@@ -116,6 +120,10 @@ class TeamManager:
         # Register with service discovery
         self._service_registry.register_team(self._instance_id, team_id)
 
+        # Bridge orchestrator inactivity-timer stop → stop_team so the
+        # event store transitions to STOPPED when the timer fires.
+        self._attach_stop_subscriber(team_id, runtime)
+
         logger.info("Team '%s' (%s) created successfully", team_card.name, team_id)
         return runtime
 
@@ -164,6 +172,7 @@ class TeamManager:
         # Cleanup runtime tracking
         self._runtimes.pop(team_id, None)
         self._team_subscribers.pop(team_id, None)
+        self._stop_subscriber_attached.discard(team_id)
 
     def resume_team(self, team_id: uuid.UUID) -> TeamRuntime:
         """Resume a stopped team by restoring from persisted EventStore data.
@@ -236,8 +245,66 @@ class TeamManager:
 
         self._service_registry.register_team(self._instance_id, team_id)
 
+        # Bridge orchestrator inactivity-timer stop → stop_team so the
+        # event store transitions to STOPPED when the timer fires.
+        self._attach_stop_subscriber(team_id, runtime)
+
         logger.info("Team '%s' (%s) resumed successfully", process.team_card.name, team_id)
         return runtime
+
+    def _attach_stop_subscriber(
+        self, team_id: uuid.UUID, runtime: TeamRuntime
+    ) -> None:
+        """Auto-attach an OrchestratorStopSubscriber to a team's orchestrator.
+
+        The subscriber bridges the core orchestrator's inactivity-timer
+        ``on_stop`` back into :meth:`stop_team`, so teams that stop via
+        the timer transition their persisted ``Process.status`` to
+        ``STOPPED`` instead of leaving a ghost ``RUNNING`` entry.
+
+        Intentionally NOT tracked in ``_team_subscribers``: the subscriber
+        triggers ``stop_team``, which itself unsubscribes tracked
+        subscribers; tracking the bridge would self-unsubscribe during
+        its own firing.
+
+        Idempotent: if this team already has a bridge attached (e.g. a
+        prior ``create_team`` / ``resume_team`` succeeded), the method
+        is a no-op. The attached flag is cleared in ``stop_team`` once
+        the orchestrator is torn down.
+
+        Attachment failure is logged and swallowed — a failed bridge
+        must not prevent team creation/resume from succeeding.
+        """
+        # Lazy-import keeps the team↔subscriber circular dependency explicit.
+        from akgentic.team.orchestrator_stop_subscriber import (
+            OrchestratorStopSubscriber,
+        )
+
+        assert runtime.id == team_id, (
+            f"runtime.id ({runtime.id}) must match team_id ({team_id})"
+        )
+
+        if team_id in self._stop_subscriber_attached:
+            logger.debug(
+                "OrchestratorStopSubscriber already attached for team %s — skipping",
+                team_id,
+            )
+            return
+
+        try:
+            orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
+                runtime.orchestrator_addr, Orchestrator
+            )
+            subscriber = OrchestratorStopSubscriber(self, team_id)
+            orchestrator_proxy.subscribe(subscriber)
+            self._stop_subscriber_attached.add(team_id)
+            logger.debug("attached OrchestratorStopSubscriber to team_id=%s", team_id)
+        except Exception:
+            logger.warning(
+                "Failed to attach OrchestratorStopSubscriber to team %s",
+                team_id,
+                exc_info=True,
+            )
 
     def _teardown_team(self, team_id: uuid.UUID, runtime: TeamRuntime) -> None:
         """Unsubscribe all subscribers and tear down actors for a running team.
@@ -335,5 +402,6 @@ class TeamManager:
         # Cleanup runtime tracking
         self._runtimes.pop(team_id, None)
         self._team_subscribers.pop(team_id, None)
+        self._stop_subscriber_attached.discard(team_id)
 
         logger.info("Team %s stopped successfully", team_id)
