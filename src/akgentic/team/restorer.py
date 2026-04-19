@@ -368,9 +368,16 @@ class TeamRestorer:
     ) -> _RebuildResult:
         """Phase 2: Rebuild agents from the event log.
 
-        Determines live agents via StartMessage/StopMessage filtering,
-        rebuilds the Orchestrator first, registers passed subscribers, spawns
-        remaining agents, restores agent states, and registers agent profiles.
+        Steps 2a-2g:
+          a. Determine live agents (StartMessage/StopMessage filtering)
+          b. Rebuild Orchestrator first
+          c. Spawn remaining agents through resolved parents
+          d. Restore agent states from snapshots
+          e. Restore LLM contexts from persisted EventMessages
+          f. Register hireable agent profiles with orchestrator
+          g. Register subscribers (last — so they only receive events during
+             Phase 3 replay, ensuring event stream parity with freshly
+             started teams; see ADR-014)
 
         Args:
             process: The Process record containing the team card.
@@ -411,33 +418,34 @@ class TeamRestorer:
             orchestrator_start, team_id, spawned_addrs
         )
 
-        # 2c. Register passed subscribers directly (no internal creation)
-        for sub in subscribers:
-            orchestrator_proxy.subscribe(sub)
-
-        # 2d. Spawn remaining agents through resolved parents
+        # 2c. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
-        # 2e. Restore agent states
+        # 2d. Restore agent states
         state_map: dict[str, AgentStateSnapshot] = {snap.agent_id: snap for snap in agent_states}
         for agent_name, addr in addrs.items():
             if agent_name in state_map:
                 proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy.init_state(state_map[agent_name].state)
 
-        # 2f. Restore LLM context from persisted events
+        # 2e. Restore LLM context from persisted events
         for agent_name, addr in addrs.items():
             agent_events = self._filter_event_messages(events, addr.agent_id)
             if agent_events:
                 proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy_llm.init_llm_context(agent_events)
 
-        # 2g. Register hireable agent profiles with orchestrator
+        # 2f. Register hireable agent profiles with orchestrator
         # Only profiles listed in agent_profiles are available for runtime
         # hiring. Instantiated members are already live — registering them
         # would cause the LLM to hire duplicates via role names.
         if process.team_card.agent_profiles:
             orchestrator_proxy.register_agent_profiles(process.team_card.agent_profiles)
+
+        # 2g. Register subscribers last — ensures they only receive events
+        # during Phase 3 replay, matching fresh-team event stream (ADR-014).
+        for sub in subscribers:
+            orchestrator_proxy.subscribe(sub)
 
         return _RebuildResult(
             orchestrator_addr=orchestrator_addr,
@@ -472,8 +480,6 @@ class TeamRestorer:
         self._resolve_event_addresses(events, addr_map)
 
         for pe in events:
-            if isinstance(pe.event, StartMessage):
-                continue  # Already registered during Phase 2 spawn
             orchestrator_proxy.restore_message(pe.event)
 
         orchestrator_proxy.end_restoration()
