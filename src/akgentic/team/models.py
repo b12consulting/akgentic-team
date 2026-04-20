@@ -351,9 +351,9 @@ class TeamRuntime(SerializableBaseModel):
             live = self._orchestrator_proxy.get_team_member(proxy.name)
             if live is None:
                 err = (
-                    f"Cannot rehydrate address for agent '{proxy.name}': "
-                    "not found in team"
-                )
+                f"Cannot rehydrate address for agent '{proxy.name}': "
+                "not found in team"
+            )
                 raise ValueError(err)
             return live
 
@@ -412,6 +412,13 @@ class Process(SerializableBaseModel):
     user_email: str = Field(default="", description="Email of the user who owns this team")
     created_at: datetime = Field(description="Timestamp when the team was created")
     updated_at: datetime = Field(description="Timestamp of the last status change")
+    catalog_namespace: str | None = Field(
+        default=None,
+        description=(
+            "Optional opaque catalog-namespace tag recorded when this team was "
+            "instantiated from a catalog. Not interpreted by akgentic-team."
+        ),
+    )
 
 
 class PersistedEvent(SerializableBaseModel):

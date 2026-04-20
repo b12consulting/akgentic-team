@@ -167,6 +167,7 @@ def make_process(
     team_id: uuid.UUID | None = None,
     team_card: TeamCard | None = None,
     status: TeamStatus = TeamStatus.RUNNING,
+    catalog_namespace: str | None = None,
 ) -> Process:
     """Create a Process with sensible defaults for testing.
 
@@ -174,6 +175,7 @@ def make_process(
         team_id: Optional team identifier.
         team_card: Optional pre-built TeamCard.
         status: Lifecycle status.
+        catalog_namespace: Optional catalog-namespace tag.
 
     Returns:
         A Process with the specified or default configuration.
@@ -184,6 +186,7 @@ def make_process(
         status=status,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
+        catalog_namespace=catalog_namespace,
     )
 
 
