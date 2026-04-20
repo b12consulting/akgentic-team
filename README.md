@@ -37,8 +37,8 @@ providing:
   is captured for crash recovery
 - **Crash recovery** via `TeamRestorer` — 3-phase restore protocol rebuilds
   teams from persisted events
-- **Two storage backends** (YAML files and MongoDB) behind a common
-  `EventStore` protocol
+- **Three storage backends** (YAML files, MongoDB, and PostgreSQL via Nagra)
+  behind a common `EventStore` protocol
 - **CLI** (`ak-team`) for managing team instances from the command line
 
 ```
@@ -53,9 +53,10 @@ TeamCard ──▶ TeamFactory.build() ──▶ TeamRuntime (live actors)
                               └────────────┘
                                     │
                               EventStore Protocol
-                              ┌─────┴──────┐
-                              │            │
-                         YamlEventStore  MongoEventStore
+                              ┌─────┬──────┬──────────────┐
+                              │     │      │              │
+                         YamlEventStore  MongoEventStore  NagraEventStore
+                                                          (PostgreSQL via Nagra)
 ```
 
 ## Installation
@@ -85,6 +86,9 @@ uv sync --extra cli
 
 # MongoDB backend
 uv sync --extra mongo
+
+# PostgreSQL backend (Nagra)
+uv sync --extra postgres
 
 # Everything
 uv sync --all-extras
@@ -153,7 +157,8 @@ flow:
 │  Models: TeamCard, TeamRuntime, Process      │
 │  Ports:  EventStore, ServiceRegistry         │
 ├──────────────────────────────────────────────┤
-│  Repositories: YamlEventStore, MongoEventStore│
+│  Repositories: YamlEventStore, MongoEventStore,│
+│                NagraEventStore (PostgreSQL)    │
 └──────────────────────────────────────────────┘
 ```
 
@@ -243,6 +248,147 @@ db = pymongo.MongoClient("mongodb://localhost:27017")["akgentic"]
 event_store = MongoEventStore(db)
 # Collections: teams, events, agent_states
 ```
+
+**PostgreSQL (Nagra)** — install the `[postgres]` extra:
+
+```bash
+uv sync --extra postgres
+# or: uv add "akgentic-team[postgres]"
+```
+
+The PostgreSQL backend is built on [Nagra](https://pypi.org/project/nagra/)
+and stores team state across three tables with promoted query keys plus a
+`data JSONB` payload (the payload is authoritative — promoted columns are
+indexes, not the source of truth):
+
+| Table | Natural key | Purpose |
+|---|---|---|
+| `team_process_entries` | `id` | One row per team — `Process` snapshot |
+| `event_entries` | `(team_id, sequence)` | Append-only event log |
+| `agent_state_entries` | `(team_id, agent_id)` | Agent state snapshots |
+
+Each public `NagraEventStore` method opens its own `Transaction`. The one
+exception is `delete_team`, which spans a single transaction across the
+three tables (ordered: `agent_state_entries` → `event_entries` →
+`team_process_entries`) so cascade deletion is atomic. `save_event`
+propagates the raw `psycopg`/Nagra `UniqueViolation` on duplicate
+`(team_id, sequence)` — matching the Mongo backend's raw
+`DuplicateKeyError` propagation.
+
+**Environment variables.** The backend follows the V1 Akgentic conventions
+so existing operator `.env` files work unchanged:
+
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_SERVER` | Database host |
+| `POSTGRES_PORT` | Database port (typically `5432`) |
+| `POSTGRES_USER` | Database user |
+| `POSTGRES_PASSWORD` | Database password |
+| `POSTGRES_DB` | Database name |
+| `DB_CONN_STRING_PERSISTENCE` | Full libpq URL; what `NagraEventStore` receives as `conn_string` |
+
+`DB_CONN_STRING_PERSISTENCE` is **shared verbatim with `akgentic-catalog`** —
+both modules target the same database. Their tables are disjoint by design:
+the catalog owns `template_entries`, `tool_entries`, `agent_entries`, and
+`team_entries`; this package owns `team_process_entries` (renamed from
+`team_entries` to prevent collision), `event_entries`, and
+`agent_state_entries`. A single Postgres instance can serve both modules.
+
+`NagraEventStore.__init__` takes `conn_string` directly as a positional
+argument — env-var reading happens at the wiring layer (application
+startup / infra code), **not** inside the event store. This keeps the
+storage layer decoupled from process-level configuration.
+
+**Schema initialisation.** Call `init_db(conn_string)` once per deployment
+(at application startup or as a deploy hook). The call is idempotent —
+it creates any missing tables and is safe to re-run. `NagraEventStore`'s
+constructor does **not** call `init_db` implicitly.
+
+```python
+from akgentic.team.repositories.postgres import NagraEventStore, init_db
+
+conn_string = "postgresql://akgentic:akgentic@localhost:5432/akgentic"
+
+# One-time (idempotent) schema creation — run at deploy time.
+init_db(conn_string)
+
+# Construct the event store with the same conn_string.
+event_store = NagraEventStore(conn_string)
+```
+
+Schema evolution is handled as a redeploy concern — the backend does not
+adopt a migration framework. Drop-and-recreate semantics or manual
+`ALTER TABLE` statements are the expected evolution path.
+
+#### Database initialization (init container)
+
+For Kubernetes / Nomad deployments, run the schema-creation hook as a
+dedicated init container before the main team-runtime process starts:
+
+```bash
+python -m akgentic.team.scripts.init_db
+```
+
+The script reads `DB_CONN_STRING_PERSISTENCE` and exits with one of:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success — tables created or already present |
+| `2` | `DB_CONN_STRING_PERSISTENCE` not set |
+| `1` | Any other failure (nagra not installed, connection refused, `init_db` raised) |
+
+Catalog and team can share a single init step — both modules expose the
+same entry-point shape (`python -m akgentic.<module>.scripts.init_db`) and
+read the same `DB_CONN_STRING_PERSISTENCE` env var.
+
+**Kubernetes initContainer** snippet:
+
+```yaml
+spec:
+  initContainers:
+    - name: akgentic-team-init-db
+      image: ghcr.io/b12consulting/akgentic-team:latest
+      command: ["python", "-m", "akgentic.team.scripts.init_db"]
+      env:
+        - name: DB_CONN_STRING_PERSISTENCE
+          valueFrom:
+            secretKeyRef:
+              name: akgentic-postgres
+              key: conn-string
+```
+
+**Nomad prestart task** snippet:
+
+```hcl
+task "init-db" {
+  driver = "docker"
+  lifecycle {
+    hook    = "prestart"
+    sidecar = false
+  }
+  config {
+    image   = "ghcr.io/b12consulting/akgentic-team:latest"
+    command = "python"
+    args    = ["-m", "akgentic.team.scripts.init_db"]
+  }
+  template {
+    destination = "secrets/db.env"
+    env         = true
+    data        = <<EOF
+DB_CONN_STRING_PERSISTENCE={{ with secret "kv/akgentic" }}{{ .Data.data.conn_string }}{{ end }}
+EOF
+  }
+}
+```
+
+#### Out of scope: enterprise wiring
+
+Wiring `NagraEventStore` into `akgentic-infra-enterprise`'s server +
+worker bootstrap (opt-in via `AKGENTIC_EVENT_STORE = "postgres"` or
+equivalent) is a **follow-up story tracked in `akgentic-infra-enterprise`**.
+This package only ships the backend implementation, the `[postgres]`
+extra, the deployment hook, and the documentation. The enterprise
+deployment project owns the application-level switch.
 
 ### Crash Recovery
 
