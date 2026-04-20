@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 mongo = ["pymongo>=4.0.0"]
+postgres = ["nagra>=0.5", "psycopg[binary]>=3.1"]
 cli = ["typer>=0.9.0", "rich>=13.0.0"]
 dev = [
     "pytest>=8.0.0",
@@ -25,6 +26,9 @@ dev = [
     "ruff>=0.1.0",
     "mongomock>=4.0.0",
     "python-dotenv>=1.0.0",
+    "nagra>=0.5",
+    "psycopg[binary]>=3.1",
+    "testcontainers[postgres]>=4.0.0",
 ]
 
 [project.scripts]
@@ -39,6 +43,12 @@ akgentic = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/akgentic"]
+
+# Explicitly ship non-Python assets needed at runtime (e.g., Nagra schema TOML
+# for the Postgres backend). Without this, hatchling's default heuristics may
+# skip files like *.toml under src/.
+[tool.hatch.build.targets.wheel.force-include]
+"src/akgentic/team/repositories/postgres/schema.toml" = "akgentic/team/repositories/postgres/schema.toml"
 
 [tool.mypy]
 python_version = "3.12"
