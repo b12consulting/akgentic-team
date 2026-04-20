@@ -1,31 +1,16 @@
-"""Test fixtures for MongoDB repository tests."""
+"""Skip-gate for the Mongo-specific test directory.
+
+The actual ``mongo_client`` / ``mongo_db`` / ``mongo_store`` fixtures
+live in the parent ``tests/repositories/conftest.py`` so that the shared
+``TestEventStoreContract`` parametrized suite can compose them. Tests
+under this directory inherit those fixtures through normal pytest
+fixture resolution. This module only exists to skip the entire directory
+cleanly when ``pymongo`` or ``mongomock`` is unavailable.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import mongomock
 import pytest
 
-if TYPE_CHECKING:
-    from akgentic.team.repositories.mongo import MongoEventStore
-
-
-@pytest.fixture
-def mongo_client() -> mongomock.MongoClient:
-    """Create a mongomock client for testing."""
-    return mongomock.MongoClient()
-
-
-@pytest.fixture
-def mongo_db(mongo_client: mongomock.MongoClient) -> mongomock.Database:
-    """Create a test database from the mongomock client."""
-    return mongo_client["test_akgentic_team"]
-
-
-@pytest.fixture
-def mongo_store(mongo_db: mongomock.Database) -> MongoEventStore:
-    """Create a MongoEventStore backed by a mongomock database."""
-    from akgentic.team.repositories.mongo import MongoEventStore
-
-    return MongoEventStore(mongo_db)
+pytest.importorskip("pymongo")
+pytest.importorskip("mongomock")
