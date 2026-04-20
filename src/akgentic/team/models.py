@@ -351,9 +351,9 @@ class TeamRuntime(SerializableBaseModel):
             live = self._orchestrator_proxy.get_team_member(proxy.name)
             if live is None:
                 err = (
-                f"Cannot rehydrate address for agent '{proxy.name}': "
-                "not found in team"
-            )
+                    f"Cannot rehydrate address for agent '{proxy.name}': "
+                    "not found in team"
+                )
                 raise ValueError(err)
             return live
 
