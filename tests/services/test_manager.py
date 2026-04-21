@@ -950,12 +950,12 @@ class TestTeamManagerStop:
 
 
 # ---------------------------------------------------------------------------
-# Tests: auto-attached OrchestratorStopSubscriber
+# Tests: auto-attached TimerStopSubscriber
 # ---------------------------------------------------------------------------
 
 
 class TestAutoAttachedStopSubscriber:
-    """AC 2,3,4,5,11,12: OrchestratorStopSubscriber auto-attach behaviour."""
+    """AC 2,3,4,5,11,12: TimerStopSubscriber auto-attach behaviour."""
 
     def test_create_team_auto_attaches_stop_subscriber(
         self,
@@ -1007,15 +1007,13 @@ class TestAutoAttachedStopSubscriber:
         manager: TeamManager,
     ) -> None:
         """AC 12: the auto-attached subscriber is NOT added to _team_subscribers."""
-        from akgentic.team.orchestrator_stop_subscriber import (
-            OrchestratorStopSubscriber,
-        )
+        from akgentic.team.subscriber import TimerStopSubscriber
 
         tc = _make_team_card()
         runtime = manager.create_team(tc)
 
         tracked = manager._team_subscribers[runtime.id]
-        assert all(not isinstance(s, OrchestratorStopSubscriber) for s in tracked)
+        assert all(not isinstance(s, TimerStopSubscriber) for s in tracked)
 
     def test_attachment_failure_does_not_break_create_team(
         self,
@@ -1029,7 +1027,7 @@ class TestAutoAttachedStopSubscriber:
         Patches ``TeamManager._attach_stop_subscriber`` with a version
         that goes through the real helper logic but forces ``proxy_ask``
         to raise — this exercises the production swallow path regardless
-        of how ``OrchestratorStopSubscriber`` is imported.
+        of how ``TimerStopSubscriber`` is imported.
         """
         mgr = TeamManager(actor_system=actor_system, event_store=event_store)
 
@@ -1044,7 +1042,7 @@ class TestAutoAttachedStopSubscriber:
             except Exception:
                 logger_mod = logging.getLogger("akgentic.team.manager")
                 logger_mod.warning(
-                    "Failed to attach OrchestratorStopSubscriber to team %s",
+                    "Failed to attach TimerStopSubscriber to team %s",
                     team_id,
                     exc_info=True,
                 )
@@ -1061,7 +1059,7 @@ class TestAutoAttachedStopSubscriber:
         assert isinstance(runtime, TeamRuntime)
         assert event_store.load_team(runtime.id) is not None
         assert any(
-            "Failed to attach OrchestratorStopSubscriber" in r.getMessage()
+            "Failed to attach TimerStopSubscriber" in r.getMessage()
             for r in caplog.records
         )
 
@@ -1073,9 +1071,9 @@ class TestAutoAttachedStopSubscriber:
     ) -> None:
         """AC 4: orchestrator inactivity timer drives Process.status == STOPPED.
 
-        Exercises the full chain: timer → _timeout_handler → StopRecursively
-        → Orchestrator.on_stop → OrchestratorStopSubscriber → stop_team
-        → event_store.save_team(STOPPED).
+        Exercises the full chain: timer → _timeout_handler
+        → _notify_subscribers("on_stop_request") → TimerStopSubscriber
+        → stop_team → event_store.save_team(STOPPED).
         """
         monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
 
@@ -1102,26 +1100,26 @@ class TestAutoAttachedStopSubscriber:
         event_store: InMemoryEventStore,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """AC 5: explicit stop_team remains idempotent under auto-attach.
+        """AC 5: explicit stop_team works cleanly under auto-attach.
 
-        When the user calls stop_team explicitly, the orchestrator's own
-        on_stop will still fire the auto-attached subscriber, which will
-        call stop_team again. That second call hits the STOPPED no-op
-        path and must be swallowed silently. The subscriber logs an
-        idempotent-no-op at DEBUG when it catches a ValueError; if
-        stop_team returns cleanly (already-STOPPED no-op), no log line
-        is emitted. Either outcome is acceptable — the hard assertion
-        is that no WARNING / ERROR propagates.
+        Under the new ADR-15 contract, the auto-attached subscriber
+        only fires off ``on_stop_request`` (from the inactivity timer).
+        Explicit ``stop_team`` tears down the orchestrator via
+        ``proxy_ask(orchestrator).stop()``; the orchestrator's own
+        ``on_stop`` then fans out to subscribers, but
+        ``TimerStopSubscriber.on_stop`` is intentionally a no-op — so
+        no re-entry race can occur. The subscriber must NOT emit any
+        WARNING / ERROR during an explicit-stop flow.
         """
         tc = _make_team_card()
         runtime = manager.create_team(tc)
         team_id = runtime.id
 
         with caplog.at_level(
-            "DEBUG", logger="akgentic.team.orchestrator_stop_subscriber"
+            "DEBUG", logger="akgentic.team.subscriber"
         ):
             manager.stop_team(team_id)
-            # Give the daemon thread a window to run.
+            # Give any (unexpected) daemon thread a window to run.
             time.sleep(0.3)
 
         process = event_store.load_team(team_id)
@@ -1129,11 +1127,11 @@ class TestAutoAttachedStopSubscriber:
         assert process.status == TeamStatus.STOPPED
 
         # The subscriber must not have emitted WARNING/ERROR for a
-        # normal explicit-stop race.
+        # normal explicit-stop flow.
         bad = [
             r
             for r in caplog.records
-            if r.name == "akgentic.team.orchestrator_stop_subscriber"
+            if r.name == "akgentic.team.subscriber"
             and r.levelno >= logging.WARNING
         ]
         assert bad == [], f"unexpected warnings from subscriber: {bad}"
