@@ -68,6 +68,7 @@ class TeamManager:
         team_card: TeamCard,
         user_id: str = "cli",
         user_email: str = "",
+        catalog_namespace: str | None = None,
     ) -> TeamRuntime:
         """Create and start a new team from a TeamCard.
 
@@ -82,6 +83,10 @@ class TeamManager:
             team_card: Declarative team definition.
             user_id: Identifier of the user creating the team.
             user_email: Email of the user creating the team.
+            catalog_namespace: Optional opaque tag identifying the catalog
+                namespace this team was instantiated from. Stored verbatim on
+                the persisted ``Process``; ``akgentic-team`` does not interpret
+                it. Consumers read it back via ``get_team(team_id)``.
 
         Returns:
             A TeamRuntime handle to the running team.
@@ -114,6 +119,7 @@ class TeamManager:
             user_email=user_email,
             created_at=now,
             updated_at=now,
+            catalog_namespace=catalog_namespace,
         )
         self._event_store.save_team(process)
 
@@ -240,6 +246,7 @@ class TeamManager:
             user_email=process.user_email,
             created_at=process.created_at,
             updated_at=now,
+            catalog_namespace=process.catalog_namespace,
         )
         self._event_store.save_team(updated_process)
 
@@ -391,6 +398,7 @@ class TeamManager:
             user_email=process.user_email,
             created_at=process.created_at,
             updated_at=now,
+            catalog_namespace=process.catalog_namespace,
         )
         self._event_store.save_team(updated_process)
 
