@@ -58,7 +58,7 @@ class TeamManager:
         self._instance_id = instance_id or uuid.uuid4()
         self._runtimes: dict[uuid.UUID, TeamRuntime] = {}
         self._team_subscribers: dict[uuid.UUID, list[EventSubscriber]] = {}
-        # Tracks teams with an attached OrchestratorStopSubscriber so
+        # Tracks teams with an attached TimerStopSubscriber so
         # re-entry (e.g. resume → stop → resume) does not stack multiple
         # bridges that would each spawn a daemon thread on timer-stop.
         self._stop_subscriber_attached: set[uuid.UUID] = set()
@@ -262,12 +262,12 @@ class TeamManager:
     def _attach_stop_subscriber(
         self, team_id: uuid.UUID, runtime: TeamRuntime
     ) -> None:
-        """Auto-attach an OrchestratorStopSubscriber to a team's orchestrator.
+        """Auto-attach a :class:`TimerStopSubscriber` to a team's orchestrator.
 
         The subscriber bridges the core orchestrator's inactivity-timer
-        ``on_stop`` back into :meth:`stop_team`, so teams that stop via
-        the timer transition their persisted ``Process.status`` to
-        ``STOPPED`` instead of leaving a ghost ``RUNNING`` entry.
+        ``on_stop_request`` fan-out back into :meth:`stop_team`, so teams
+        that stop via the timer transition their persisted ``Process.status``
+        to ``STOPPED`` instead of leaving a ghost ``RUNNING`` entry.
 
         Intentionally NOT tracked in ``_team_subscribers``: the subscriber
         triggers ``stop_team``, which itself unsubscribes tracked
@@ -283,9 +283,7 @@ class TeamManager:
         must not prevent team creation/resume from succeeding.
         """
         # Lazy-import keeps the team↔subscriber circular dependency explicit.
-        from akgentic.team.orchestrator_stop_subscriber import (
-            OrchestratorStopSubscriber,
-        )
+        from akgentic.team.subscriber import TimerStopSubscriber
 
         assert runtime.id == team_id, (
             f"runtime.id ({runtime.id}) must match team_id ({team_id})"
@@ -293,7 +291,7 @@ class TeamManager:
 
         if team_id in self._stop_subscriber_attached:
             logger.debug(
-                "OrchestratorStopSubscriber already attached for team %s — skipping",
+                "TimerStopSubscriber already attached for team %s — skipping",
                 team_id,
             )
             return
@@ -302,13 +300,13 @@ class TeamManager:
             orchestrator_proxy: Orchestrator = self._actor_system.proxy_ask(
                 runtime.orchestrator_addr, Orchestrator
             )
-            subscriber = OrchestratorStopSubscriber(self, team_id)
+            subscriber = TimerStopSubscriber(self, team_id)
             orchestrator_proxy.subscribe(subscriber)
             self._stop_subscriber_attached.add(team_id)
-            logger.debug("attached OrchestratorStopSubscriber to team_id=%s", team_id)
+            logger.debug("attached TimerStopSubscriber to team_id=%s", team_id)
         except Exception:
             logger.warning(
-                "Failed to attach OrchestratorStopSubscriber to team %s",
+                "Failed to attach TimerStopSubscriber to team %s",
                 team_id,
                 exc_info=True,
             )

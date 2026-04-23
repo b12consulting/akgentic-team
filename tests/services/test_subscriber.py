@@ -61,7 +61,7 @@ class TestPersistenceSubscriber:
     # -- 3.4: Agent state snapshot on StateChangedMessage ------------------
 
     def test_state_snapshot_on_state_changed_message(self) -> None:
-        """AC 2: StateChangedMessage triggers both save_event and save_agent_state."""
+        """AC 1-3: StateChangedMessage writes snapshot only — no PersistedEvent, no sequence bump."""
         sub, store, team_id = self._make_subscriber()
 
         sender = MagicMock(spec=ActorAddress)
@@ -71,11 +71,13 @@ class TestPersistenceSubscriber:
 
         sub.on_message(msg)
 
-        # Event saved
-        assert len(store.events) == 1
-        assert store.events[0].event == msg
+        # No event saved (AC 1: StateChangedMessage excluded from event log)
+        assert len(store.events) == 0
 
-        # Agent state snapshot saved
+        # Sequence not advanced (AC 3: gap-free numbering over behavioral events)
+        assert sub._sequence == 0  # noqa: SLF001
+
+        # Agent state snapshot saved (AC 2: snapshot still written)
         key = (team_id, "worker-agent")
         assert key in store.agent_states
         snapshot = store.agent_states[key]
@@ -85,6 +87,23 @@ class TestPersistenceSubscriber:
         assert snapshot.updated_at is not None
         assert isinstance(snapshot.state, SampleAgentState)
         assert snapshot.state.task_count == 5
+
+    def test_state_changed_does_not_break_sequence_continuity(self) -> None:
+        """AC 3: Interleaved StateChangedMessage keeps event-log sequence gap-free."""
+        sub, store, _team_id = self._make_subscriber()
+
+        sender = MagicMock(spec=ActorAddress)
+        sender.name = "agent-a"
+
+        sub.on_message(UserMessage(content="first"))  # seq 1
+        sub.on_message(StateChangedMessage(sender=sender, state=SampleAgentState(task_count=1)))
+        sub.on_message(UserMessage(content="second"))  # seq 2
+        sub.on_message(StateChangedMessage(sender=sender, state=SampleAgentState(task_count=2)))
+        sub.on_message(UserMessage(content="third"))  # seq 3
+
+        sequences = [e.sequence for e in store.events]
+        assert sequences == [1, 2, 3]
+        assert len(store.agent_states) == 1  # overwritten by last snapshot
 
     def test_state_changed_message_with_none_sender_skips_snapshot(self) -> None:
         """AC 2: StateChangedMessage with sender=None saves event but no snapshot."""
