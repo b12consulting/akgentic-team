@@ -61,8 +61,12 @@ class TeamCard(SerializableBaseModel):
         message_types: Message classes the team handles; first is the default.
     """
 
-    name: str = Field(description="Unique name identifying this team definition")
-    description: str = Field(description="Human-readable summary of what the team does")
+    name: str | None = Field(
+        default=None, description="Unique name identifying this team definition"
+    )
+    description: str | None = Field(
+        default=None, description="Human-readable summary of what the team does"
+    )
     entry_point: TeamCardMember = Field(
         description="The member that serves as the team's external interface",
     )
