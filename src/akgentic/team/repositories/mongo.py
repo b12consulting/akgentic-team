@@ -56,6 +56,11 @@ class MongoEventStore:
         self._agent_states.create_index(
             [("team_id", 1), ("agent_id", 1)], unique=True
         )
+        # ADR-16 §5: B-tree index backing the ``list_teams(user_id=...)`` push-down.
+        # ``create_index`` is idempotent — re-running the constructor against the
+        # same database returns silently when an index with the same key spec
+        # already exists, so this is safe across redeploys.
+        self._teams.create_index("user_id", name="teams_user_id_idx")
         logger.debug("Initialized MongoEventStore with database '%s'", db.name)
 
     def save_team(self, process: Process) -> None:
@@ -100,32 +105,32 @@ class MongoEventStore:
         return process
 
     def list_teams(self, user_id: str | None = None) -> list[Process]:
-        """Load all team process snapshots from the teams collection.
+        """Load team process snapshots from the teams collection.
 
-        Queries all documents in the ``teams`` collection and reconstructs
-        each as a Process via ``model_validate()``. Corrupted documents
-        are skipped with a warning.
+        When ``user_id`` is provided, the filter is pushed down into the
+        Mongo ``find`` call as ``{"user_id": user_id}`` and runs in MongoDB
+        against the ``teams_user_id_idx`` B-tree index (created in
+        ``__init__``) — not in Python after hydration. When ``user_id`` is
+        ``None``, the call issues ``find({})`` and returns every team.
+        Corrupted documents are skipped with a warning. See ADR-16 §5.
 
         Args:
             user_id: If provided, return only snapshots whose
-                ``Process.user_id`` matches. If ``None`` (default), return all
-                snapshots. See ADR-16 §1.
+                ``Process.user_id`` matches via a Mongo backend filter.
+                If ``None`` (default), return all snapshots. See ADR-16 §1.
 
         Returns:
-            List of all loadable Process snapshots (filtered by ``user_id``
-            when provided).
+            List of loadable Process snapshots (filtered by ``user_id``
+            at the database level when provided).
         """
+        query: dict[str, str] = {"user_id": user_id} if user_id is not None else {}
         teams: list[Process] = []
-        for doc in self._teams.find({}):
+        for doc in self._teams.find(query):
             doc.pop("_id", None)
             try:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
                 logger.warning("Skipping corrupted team document: %s", exc)
-        # Interim in-memory filter for story 19-1 — replaced by
-        # find({"user_id": user_id}) + index in story 19-3 (ADR-16 §5).
-        if user_id is not None:
-            teams = [t for t in teams if t.user_id == user_id]
         logger.debug("Listed %d teams", len(teams))
         return teams
 
