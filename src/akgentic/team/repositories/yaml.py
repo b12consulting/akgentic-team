@@ -116,6 +116,9 @@ class YamlEventStore:
         Iterates subdirectories of ``data_dir``, attempts to parse each
         directory name as a UUID, and loads the team snapshot for valid
         team directories. Non-UUID directories are skipped with a warning.
+        When ``user_id`` is provided, non-matching snapshots are skipped
+        in-memory during the iteration (skip-on-load) rather than after
+        the loop — see ADR-16 §3.
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -138,12 +141,14 @@ class YamlEventStore:
                 logger.warning("Skipping non-team directory: %s", child.name)
                 continue
             process = self.load_team(team_id)
-            if process is not None:
-                teams.append(process)
-        # Interim in-memory filter for story 19-1 — replaced by the
-        # skip-on-load filter in story 19-2 (ADR-16 §3).
-        if user_id is not None:
-            teams = [t for t in teams if t.user_id == user_id]
+            if process is None:
+                continue
+            # Skip-on-load user_id filter (ADR-16 §3): discard non-matching
+            # snapshots in-memory before appending. No new I/O — the load
+            # already happened; we just don't keep the result.
+            if user_id is not None and process.user_id != user_id:
+                continue
+            teams.append(process)
         return teams
 
     def save_event(self, event: PersistedEvent) -> None:
