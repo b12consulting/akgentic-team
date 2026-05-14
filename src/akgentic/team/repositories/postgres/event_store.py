@@ -69,12 +69,24 @@ class NagraEventStore:
             return None
         return Process.model_validate(decode_jsonb_column(row[0]))
 
-    def list_teams(self) -> list[Process]:
-        """Return every persisted team process. Order is unspecified."""
+    def list_teams(self, user_id: str | None = None) -> list[Process]:
+        """Return persisted team processes. Order is unspecified.
+
+        Args:
+            user_id: If provided, return only snapshots whose
+                ``Process.user_id`` matches. If ``None`` (default), return all
+                snapshots. See ADR-16 §1.
+        """
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute("SELECT data FROM team_process_entries")
             rows = cursor.fetchall()
-        return [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
+        teams = [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
+        # Interim in-memory filter for story 19-1 — replaced by
+        # WHERE (data ->> 'user_id') = %s + functional expression index in
+        # story 19-4 (ADR-16 §4).
+        if user_id is not None:
+            teams = [t for t in teams if t.user_id == user_id]
+        return teams
 
     def delete_team(self, team_id: uuid.UUID) -> None:
         """Cascade-delete a team across all three tables in ONE transaction.

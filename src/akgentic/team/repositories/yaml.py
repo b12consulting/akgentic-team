@@ -110,15 +110,21 @@ class YamlEventStore:
         logger.debug("Loaded team %s from %s", team_id, team_path)
         return process
 
-    def list_teams(self) -> list[Process]:
+    def list_teams(self, user_id: str | None = None) -> list[Process]:
         """Load all team process snapshots from the data directory.
 
         Iterates subdirectories of ``data_dir``, attempts to parse each
         directory name as a UUID, and loads the team snapshot for valid
         team directories. Non-UUID directories are skipped with a warning.
 
+        Args:
+            user_id: If provided, return only snapshots whose
+                ``Process.user_id`` matches. If ``None`` (default), return all
+                snapshots. See ADR-16 §1.
+
         Returns:
-            List of all loadable Process snapshots.
+            List of all loadable Process snapshots (filtered by ``user_id``
+            when provided).
         """
         if not self._data_dir.exists():
             return []
@@ -134,6 +140,10 @@ class YamlEventStore:
             process = self.load_team(team_id)
             if process is not None:
                 teams.append(process)
+        # Interim in-memory filter for story 19-1 — replaced by the
+        # skip-on-load filter in story 19-2 (ADR-16 §3).
+        if user_id is not None:
+            teams = [t for t in teams if t.user_id == user_id]
         return teams
 
     def save_event(self, event: PersistedEvent) -> None:

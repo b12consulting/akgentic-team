@@ -83,6 +83,19 @@ class TestEventStoreContract:
         assert len(result) == 3
         assert {p.team_id for p in result} == {p1.team_id, p2.team_id, p3.team_id}
 
+    def test_list_teams_user_id_none_equals_no_arg(self, event_store: EventStore) -> None:
+        """``list_teams(user_id=None)`` is equivalent to ``list_teams()`` (no arg)."""
+        p1 = make_process()
+        p2 = make_process()
+        p3 = make_process()
+        event_store.save_team(p1)
+        event_store.save_team(p2)
+        event_store.save_team(p3)
+
+        no_arg = event_store.list_teams()
+        with_none = event_store.list_teams(user_id=None)
+        assert {p.team_id for p in with_none} == {p.team_id for p in no_arg}
+
     # --- save_event / load_events ordering --------------------------------
 
     def test_save_and_load_events_in_sequence_order(self, event_store: EventStore) -> None:

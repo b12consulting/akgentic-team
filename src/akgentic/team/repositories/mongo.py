@@ -99,15 +99,21 @@ class MongoEventStore:
         logger.debug("Loaded team %s", team_id)
         return process
 
-    def list_teams(self) -> list[Process]:
+    def list_teams(self, user_id: str | None = None) -> list[Process]:
         """Load all team process snapshots from the teams collection.
 
         Queries all documents in the ``teams`` collection and reconstructs
         each as a Process via ``model_validate()``. Corrupted documents
         are skipped with a warning.
 
+        Args:
+            user_id: If provided, return only snapshots whose
+                ``Process.user_id`` matches. If ``None`` (default), return all
+                snapshots. See ADR-16 §1.
+
         Returns:
-            List of all loadable Process snapshots.
+            List of all loadable Process snapshots (filtered by ``user_id``
+            when provided).
         """
         teams: list[Process] = []
         for doc in self._teams.find({}):
@@ -116,6 +122,10 @@ class MongoEventStore:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
                 logger.warning("Skipping corrupted team document: %s", exc)
+        # Interim in-memory filter for story 19-1 — replaced by
+        # find({"user_id": user_id}) + index in story 19-3 (ADR-16 §5).
+        if user_id is not None:
+            teams = [t for t in teams if t.user_id == user_id]
         logger.debug("Listed %d teams", len(teams))
         return teams
 
