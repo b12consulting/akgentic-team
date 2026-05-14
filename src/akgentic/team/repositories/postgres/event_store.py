@@ -72,21 +72,29 @@ class NagraEventStore:
     def list_teams(self, user_id: str | None = None) -> list[Process]:
         """Return persisted team processes. Order is unspecified.
 
+        When ``user_id`` is provided, the filter is pushed down to the
+        database via a JSONB extraction ``WHERE`` clause
+        (``WHERE (data ->> 'user_id') = %s``) backed by the functional
+        expression index ``team_process_user_id_idx`` created by
+        :func:`init_db`. ``user_id`` is bound through psycopg's ``%s``
+        placeholder — no f-strings, no string concatenation. See ADR-16 §4.
+
         Args:
             user_id: If provided, return only snapshots whose
                 ``Process.user_id`` matches. If ``None`` (default), return all
                 snapshots. See ADR-16 §1.
         """
         with Transaction(self._conn_string) as trn:
-            cursor = trn.execute("SELECT data FROM team_process_entries")
+            if user_id is None:
+                cursor = trn.execute("SELECT data FROM team_process_entries")
+            else:
+                cursor = trn.execute(
+                    "SELECT data FROM team_process_entries "
+                    "WHERE (data ->> 'user_id') = %s",
+                    (user_id,),
+                )
             rows = cursor.fetchall()
-        teams = [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
-        # Interim in-memory filter for story 19-1 — replaced by
-        # WHERE (data ->> 'user_id') = %s + functional expression index in
-        # story 19-4 (ADR-16 §4).
-        if user_id is not None:
-            teams = [t for t in teams if t.user_id == user_id]
-        return teams
+        return [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
 
     def delete_team(self, team_id: uuid.UUID) -> None:
         """Cascade-delete a team across all three tables in ONE transaction.
