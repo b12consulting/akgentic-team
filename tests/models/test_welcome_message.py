@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import akgentic.team
 import pytest
 from akgentic.core.messages.message import Message
 from akgentic.core.utils.deserializer import deserialize_object
 from pydantic import ValidationError
 
+import akgentic.team
 from akgentic.team.messages import WelcomeMessage
 
 
