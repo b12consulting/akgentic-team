@@ -92,7 +92,7 @@ class TestWelcomeAnnouncement:
         """AC #1, #3: build() records a SentMessage wrapping a WelcomeMessage.
 
         The WelcomeMessage carries content == welcome_message,
-        sender == entry_addr, and team_id == the team's id.
+        sender == orchestrator_addr, and team_id == the team's id.
         """
         runtime = TeamFactory.build(_make_team_card(_GREETING), actor_system)
         orchestrator: Orchestrator = actor_system.proxy_ask(runtime.orchestrator_addr, Orchestrator)
@@ -113,7 +113,7 @@ class TestWelcomeAnnouncement:
         welcome = sent.message
         assert isinstance(welcome, WelcomeMessage)
         assert welcome.content == _GREETING
-        assert welcome.sender == runtime.entry_addr
+        assert welcome.sender == runtime.orchestrator_addr
         assert welcome.team_id == runtime.id
         assert sent.recipient == runtime.entry_addr
 
