@@ -18,10 +18,11 @@ class TestWelcomeMessage:
         """WelcomeMessage is a subclass of the core Message type."""
         assert issubclass(WelcomeMessage, Message)
 
-    def test_display_type_defaults_to_ai(self) -> None:
-        """display_type defaults to 'ai', overriding the base 'other' default."""
+    def test_display_type_defaults_to_other(self) -> None:
+        """display_type defaults to 'other' — the greeting is a synthetic system
+        announcement, not an AI turn (see ADR-17 amendment 2026-05-18)."""
         msg = WelcomeMessage(content="hi")
-        assert msg.display_type == "ai"
+        assert msg.display_type == "other"
 
     def test_content_is_required(self) -> None:
         """content is a required field — omitting it raises ValidationError."""
@@ -30,8 +31,8 @@ class TestWelcomeMessage:
 
     def test_display_type_can_be_overridden(self) -> None:
         """display_type accepts any value of the three-value Literal."""
-        msg = WelcomeMessage(content="hi", display_type="other")
-        assert msg.display_type == "other"
+        msg = WelcomeMessage(content="hi", display_type="ai")
+        assert msg.display_type == "ai"
 
     def test_round_trip_via_deserialize_object(self) -> None:
         """A WelcomeMessage round-trips through model_dump / deserialize_object.
@@ -45,7 +46,7 @@ class TestWelcomeMessage:
         assert type(restored) is WelcomeMessage
         assert restored == original
         assert restored.content == "Welcome to the team!"
-        assert restored.display_type == "ai"
+        assert restored.display_type == "other"
         assert restored.id == original.id
 
 
