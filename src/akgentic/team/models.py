@@ -59,6 +59,8 @@ class TeamCard(SerializableBaseModel):
         entry_point: The member that serves as the team's external interface.
         members: Top-level members of the team (excluding the entry point).
         message_types: Message classes the team handles; first is the default.
+        welcome_message: Optional static greeting announced on the team's event
+            stream when the team is first created. ``None`` disables it.
     """
 
     name: str | None = Field(
@@ -81,6 +83,13 @@ class TeamCard(SerializableBaseModel):
     agent_profiles: list[AgentCard] = Field(
         default_factory=list,
         description="AgentCards available for runtime hiring, not instantiated at startup",
+    )
+    welcome_message: str | None = Field(
+        default=None,
+        description=(
+            "Optional static greeting announced on the team's event stream when "
+            "the team is first created. None disables it."
+        ),
     )
 
     @property
