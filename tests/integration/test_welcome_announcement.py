@@ -144,7 +144,7 @@ class TestWelcomeAnnouncement:
         welcome = sent.message
         assert isinstance(welcome, WelcomeMessage)
         assert welcome.content == _GREETING
-        assert welcome.display_type == "ai"
+        assert welcome.display_type == "other"
 
     def test_no_announcement_when_welcome_message_none(
         self,

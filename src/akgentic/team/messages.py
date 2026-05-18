@@ -22,8 +22,9 @@ class WelcomeMessage(Message):
 
     Attributes:
         content: The greeting text declared on the TeamCard.
-        display_type: Display category for UI rendering; defaults to "ai".
+        display_type: Display category for UI rendering; defaults to "other"
+            -- the greeting is a synthetic system announcement, not an AI turn.
     """
 
     content: str
-    display_type: Literal["human", "ai", "other"] = "ai"
+    display_type: Literal["human", "ai", "other"] = "other"
