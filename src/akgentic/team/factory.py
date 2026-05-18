@@ -129,7 +129,7 @@ class TeamFactory:
                     SentMessage(
                         message=WelcomeMessage(
                             content=team_card.welcome_message,
-                            sender=entry_addr,
+                            sender=orchestrator_addr,
                             team_id=team_id,
                         ),
                         recipient=entry_addr,
