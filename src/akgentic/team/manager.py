@@ -68,6 +68,7 @@ class TeamManager:
         team_card: TeamCard,
         user_id: str = "cli",
         user_email: str = "",
+        team_id: uuid.UUID | None = None,
         catalog_namespace: str | None = None,
     ) -> TeamRuntime:
         """Create and start a new team from a TeamCard.
@@ -83,6 +84,7 @@ class TeamManager:
             team_card: Declarative team definition.
             user_id: Identifier of the user creating the team.
             user_email: Email of the user creating the team.
+            team_id: Optional team identifier. Auto-generated if None.
             catalog_namespace: Optional opaque tag identifying the catalog
                 namespace this team was instantiated from. Stored verbatim on
                 the persisted ``Process``; ``akgentic-team`` does not interpret
@@ -95,7 +97,8 @@ class TeamManager:
             ValueError: If the TeamCard is invalid (e.g. entry_point headcount != 1).
             Exception: Any exception from TeamFactory.build propagates unchanged.
         """
-        team_id = uuid.uuid4()
+        if team_id is None:
+            team_id = uuid.uuid4()
         logger.info("Creating team '%s' with id %s", team_card.name, team_id)
 
         # Build subscriber list: PersistenceSubscriber always first
