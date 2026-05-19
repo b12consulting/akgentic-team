@@ -29,6 +29,7 @@ dev = [
     "nagra>=0.5",
     "psycopg[binary]>=3.1",
     "testcontainers[postgres]>=4.0.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
