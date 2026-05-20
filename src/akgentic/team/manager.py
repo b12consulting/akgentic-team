@@ -12,7 +12,7 @@ from akgentic.team.factory import TeamFactory
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
 from akgentic.team.restorer import TeamRestorer
-from akgentic.team.subscriber import PersistenceSubscriber
+from akgentic.team.subscriber import PersistenceSubscriber, TimerStopSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,9 @@ class TeamManager:
                 shared across all teams. These must be thread-safe since
                 different teams' orchestrators may call on_message()
                 concurrently from different actor threads.
-                PersistenceSubscriber is per-team and created internally
-                by TeamManager.
+                ``PersistenceSubscriber`` and ``TimerStopSubscriber`` are
+                per-team and constructed internally by ``TeamManager`` in
+                ``create_team`` / ``resume_team``.
             instance_id: Worker instance identifier. Auto-generated if None.
         """
         self._actor_system = actor_system
@@ -91,9 +92,14 @@ class TeamManager:
             team_id = uuid.uuid4()
         logger.info("Creating team '%s' with id %s", team_card.name, team_id)
 
-        # Build subscriber list: PersistenceSubscriber always first
+        # Build subscriber list: per-team subscribers first, shared subscribers behind
         persistence_sub = PersistenceSubscriber(team_id, self._event_store)
-        subscribers: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
+        timer_stop_sub = TimerStopSubscriber(self, team_id)
+        subscribers: list[EventSubscriber] = [
+            persistence_sub,
+            timer_stop_sub,
+            *self._shared_subscribers,
+        ]
 
         # Build the team — if this raises, no Process is persisted
         runtime = TeamFactory.build(team_card, self._actor_system, subscribers, team_id=team_id)
@@ -201,11 +207,16 @@ class TeamManager:
         # Compute max existing sequence so new events continue monotonically
         max_seq = self._event_store.get_max_sequence(team_id)
 
-        # Create PersistenceSubscriber once — passed to restorer and tracked for stop
+        # Create per-team subscribers once — passed to restorer and tracked for stop
         persistence_sub = PersistenceSubscriber(
             team_id, self._event_store, initial_sequence=max_seq
         )
-        all_subs: list[EventSubscriber] = [persistence_sub] + list(self._shared_subscribers)
+        timer_stop_sub = TimerStopSubscriber(self, team_id)
+        all_subs: list[EventSubscriber] = [
+            persistence_sub,
+            timer_stop_sub,
+            *self._shared_subscribers,
+        ]
 
         # Toggle restoring guard on all subscribers.
         # Each subscriber decides independently whether to skip during restore.

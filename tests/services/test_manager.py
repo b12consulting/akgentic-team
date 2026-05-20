@@ -1017,25 +1017,10 @@ class TestTeamManagerStop:
 
 # ---------------------------------------------------------------------------
 # Tests: TimerStopSubscriber → STOPPED bridge
-#
-# Removed in Story 21.2 — _attach_stop_subscriber and the
-# _stop_subscriber_attached / _team_subscribers registry were deleted.
-# Equivalent coverage lands in Story 21.3 against the
-# standard-subscriber-list path (TimerStopSubscriber registered alongside
-# PersistenceSubscriber in create_team / resume_team). The single
-# end-to-end timer-driven STOPPED assertion is preserved below as a
-# skipped placeholder so it surfaces in `pytest --collect-only` and
-# Story 21.3 can unskip it without re-writing the harness.
+# Timer-stop bridge: TimerStopSubscriber is a standard per-team subscriber.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "TimerStopSubscriber re-attached in Story 21.3 via the standard "
-        "per-team subscriber list; bridge is intentionally absent on the "
-        "21.2 stacked branch."
-    )
-)
 def test_timer_stop_persists_stopped_status(
     actor_system: ActorSystem,
     event_store: InMemoryEventStore,
