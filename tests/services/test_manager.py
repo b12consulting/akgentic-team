@@ -48,7 +48,12 @@ class FailingAgent(Akgent[BaseConfig, BaseState]):
 
 
 class RecordingSubscriber(EventSubscriber):
-    """Subscriber that records received messages."""
+    """Subscriber that records received messages.
+
+    Implements the team_id-aware ``EventSubscriber`` Protocol. The shared-
+    subscriber case (one instance attached to many teams) is irrelevant here
+    so the stub accepts any ``team_id`` without asserting.
+    """
 
     def __init__(self) -> None:
         self.messages: list[Message] = []
@@ -58,12 +63,18 @@ class RecordingSubscriber(EventSubscriber):
         """Record received message."""
         self.messages.append(msg)
 
-    def on_stop(self) -> None:
+    def on_stop(self, team_id: uuid.UUID) -> None:
         """Record stop."""
+        del team_id
         self.stopped = True
 
-    def set_restoring(self, restoring: bool) -> None:  # noqa: FBT001
+    def on_stop_request(self, team_id: uuid.UUID) -> None:
         """No-op for test subscriber."""
+        del team_id
+
+    def set_restoring(self, team_id: uuid.UUID, restoring: bool) -> None:  # noqa: FBT001
+        """No-op for test subscriber."""
+        del team_id, restoring
 
 
 def _make_card(
