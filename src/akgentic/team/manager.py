@@ -222,13 +222,13 @@ class TeamManager:
         # Toggle restoring guard on all subscribers.
         # Each subscriber decides independently whether to skip during restore.
         for sub in all_subs:
-            sub.set_restoring(True)
+            sub.set_restoring(team_id, True)
 
         try:
             runtime = restorer.restore(process, subscribers=all_subs)
         finally:
             for sub in all_subs:
-                sub.set_restoring(False)
+                sub.set_restoring(team_id, False)
 
         # Track runtime and subscribers for stop_team
         self._runtimes[team_id] = runtime
