@@ -299,17 +299,35 @@ class TestTeamFactoryBuild:
             TeamFactory.build(tc, actor_system)
 
     def test_rollback_handles_stop_failure(self, actor_system: ActorSystem) -> None:
-        """Rollback continues even if stopping an actor raises."""
+        """Rollback completes promptly even when stopping an actor raises.
+
+        A broken ``Akgent.stop`` means the failed worker never emits a
+        StopMessage, so the orchestrator's roster never empties and its stop
+        finalizes only via the backstop timer. Drive the rollback grace down to
+        a fraction of a second (patching the module-level ``GRACE_TIMEOUT_SECONDS``
+        the rollback reads) so this best-effort cleanup path does not block for
+        the full production grace on a wedged team. The rollback must still log
+        the stop failure and re-raise the original build error.
+        """
         failing = _make_member("failing", "Failing", agent_class=FailingAgent)
         tc = _make_team_card(members=[failing])
 
-        with patch.object(Akgent, "stop", side_effect=RuntimeError("stop failed")):
+        with (
+            patch("akgentic.team.factory.GRACE_TIMEOUT_SECONDS", 0.1),
+            patch.object(Akgent, "stop", side_effect=RuntimeError("stop failed")),
+        ):
+            start = time.monotonic()
             with pytest.raises(RuntimeError) as excinfo:
                 TeamFactory.build(tc, actor_system)
+            elapsed = time.monotonic() - start
+
             # The original spawn failure from FailingAgent propagates as-is
             # (no wrapping). Test asserts on type + non-empty str, not a
             # fragile match on the fixture's own message text.
             assert str(excinfo.value)
+            # Rollback returned promptly via the small grace backstop rather than
+            # blocking for the full production grace on the wedged orchestrator.
+            assert elapsed < 5.0, f"rollback blocked too long: {elapsed:.1f}s"
 
 
 # ---------------------------------------------------------------------------
