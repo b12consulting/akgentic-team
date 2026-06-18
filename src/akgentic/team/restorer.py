@@ -51,6 +51,10 @@ class _RebuildResult:
     orchestrator_addr: ActorAddress
     orchestrator_proxy: Orchestrator
     addrs: dict[str, ActorAddress] = field(default_factory=dict)
+    # Snapshot lookup built in phase 2d, keyed by str(agent UUID) with legacy
+    # name keys. Threaded into Phase 3 so each restored agent's state can be
+    # re-emitted onto the event stream after its StartMessage (ADR-020 §3).
+    state_map: dict[str, AgentStateSnapshot] = field(default_factory=dict)
 
 
 class TeamRestorer:
@@ -125,6 +129,7 @@ class TeamRestorer:
                 result.orchestrator_proxy,
                 events,
                 addr_map,
+                result.state_map,
             )
 
             # Build and return TeamRuntime
@@ -475,6 +480,7 @@ class TeamRestorer:
             orchestrator_addr=orchestrator_addr,
             orchestrator_proxy=orchestrator_proxy,
             addrs=addrs,
+            state_map=state_map,
         )
 
     def _replay_events(
@@ -483,12 +489,21 @@ class TeamRestorer:
         orchestrator_proxy: Orchestrator,
         events: list[PersistedEvent],
         addr_map: dict[uuid.UUID, ActorAddress],
+        state_map: dict[str, AgentStateSnapshot],
     ) -> None:
         """Phase 3: Replay all persisted events through the orchestrator.
 
         Resolves ``ActorAddressProxy`` instances in events to live addresses
         before replay so that ``get_team()`` returns live ``ActorAddressImpl``
         refs instead of stale proxies.
+
+        After each replayed ``StartMessage``, re-emits the sender agent's state
+        snapshot onto the event stream via ``Akgent.notify_state_change`` so a
+        restored team's stream carries agent state exactly like a fresh team
+        (ADR-020 §3). Subscribers are attached by now (phase 2g), so this reaches
+        the stream; the orchestrator fans it out without appending to the event
+        log, and the caller's ``restoring=True`` guard keeps it out of the
+        snapshot store.
 
         The caller is responsible for toggling PersistenceSubscriber.set_restoring()
         before and after calling restore().
@@ -498,6 +513,8 @@ class TeamRestorer:
             orchestrator_proxy: Proxy to the restored orchestrator actor.
             events: Sorted persisted events to replay.
             addr_map: Mapping of agent_id to live ActorAddress for proxy resolution.
+            state_map: Snapshot lookup (str(agent UUID) preferred, name fallback)
+                built in phase 2d; used to re-emit state after each StartMessage.
         """
         logger.info("Restoring team %s: phase 3 -- replaying %d events", team_id, len(events))
 
@@ -506,7 +523,37 @@ class TeamRestorer:
         for pe in events:
             orchestrator_proxy.restore_message(pe.event)
 
+            # Re-emit the agent's state right after its StartMessage so the
+            # restored stream matches a fresh team's (ADR-020 §3).
+            if isinstance(pe.event, StartMessage) and pe.event.sender is not None:
+                self._reemit_state(pe.event.sender, state_map)
+
         orchestrator_proxy.end_restoration()
+
+    def _reemit_state(
+        self,
+        sender: ActorAddress,
+        state_map: dict[str, AgentStateSnapshot],
+    ) -> None:
+        """Re-emit a restored agent's state onto the event stream.
+
+        Resolves the snapshot for ``sender`` (UUID-preferred, name fallback --
+        mirroring phase 2d) and, if found, notifies the live agent's state change
+        so the resulting ``StateChangedMessage`` (keyed by the agent UUID) reaches
+        attached subscribers. A sender with no matching snapshot (e.g. the
+        orchestrator's StartMessage) is a no-op.
+
+        ``sender`` is already a live address here -- ``_resolve_event_addresses``
+        ran at the top of ``_replay_events``.
+
+        Args:
+            sender: The live address of the replayed StartMessage's sender.
+            state_map: Snapshot lookup keyed by str(agent UUID) with legacy names.
+        """
+        snap = state_map.get(str(sender.agent_id)) or state_map.get(sender.name)
+        if snap is not None:
+            proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(sender, Akgent)
+            proxy.notify_state_change(snap.state)
 
     def _resolve_event_addresses(
         self,

@@ -21,6 +21,7 @@ from akgentic.core.messages.orchestrator import (
     EventMessage,
     SentMessage,
     StartMessage,
+    StateChangedMessage,
     StopMessage,
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
@@ -1924,3 +1925,238 @@ class TestRestorerToolActorSpawnOrder:
         team = runtime.orchestrator_proxy.get_team()
         agent_ids = [addr.agent_id for addr in team]
         assert len(agent_ids) == len(set(agent_ids)), "Duplicate agents in roster"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Re-emit agent state onto the event stream on restore (Story 23-3)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerReemitStateOnRestore:
+    """AC #1-#6: Phase 3 re-emits each restored agent's state after its StartMessage.
+
+    Uses a ``RecordingSubscriber`` as the stand-in for the live event stream:
+    it is the subscriber attached at phase 2g, so it observes exactly the
+    messages a fresh team's stream would. ``notify_state_change`` is an ask-mode
+    proxy call, so the agent's ``StateChangedMessage`` is enqueued on the
+    orchestrator mailbox before the next replayed event -- ordering is
+    deterministic.
+    """
+
+    def test_state_reaches_restored_stream_after_start_message(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #1, #5: a snapshot's state is re-emitted right after its StartMessage.
+
+        The restored stream carries exactly one ``StateChangedMessage`` for the
+        agent-with-snapshot, positioned after that agent's ``StartMessage`` and
+        carrying the snapshot state -- the parity a fresh team's live stream has.
+        """
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+
+        snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id=str(lead_agent_id),
+            name="lead",
+            state=_MarkerState(marker="restored"),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(snapshot)
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        # Exactly one re-emit for the single agent-with-snapshot (AC #5).
+        assert len(state_msgs) == 1
+        applied = state_msgs[0].state
+        assert isinstance(applied, _MarkerState)
+        assert applied.marker == "restored"
+
+        # Positioned after the lead's StartMessage in the replay order (AC #1).
+        lead_start_idx = next(
+            i
+            for i, m in enumerate(recording.messages)
+            if isinstance(m, StartMessage) and m.sender is not None and m.sender.name == "lead"
+        )
+        state_idx = recording.messages.index(state_msgs[0])
+        assert state_idx > lead_start_idx
+
+    def test_reemitted_state_message_is_keyed_by_uuid(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #2: the re-emitted StateChangedMessage's sender.agent_id is the UUID."""
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+
+        snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id=str(lead_agent_id),
+            name="lead",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(snapshot)
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        assert len(state_msgs) == 1
+        sender = state_msgs[0].sender
+        assert sender is not None
+        # Emitted via the live agent -> sender carries the agent UUID, matching
+        # the live lead address (so a UUID-keyed consumer folds it correctly).
+        assert sender.agent_id == lead_agent_id
+        assert sender.agent_id == runtime.addrs["lead"].agent_id
+
+    def test_legacy_name_keyed_snapshot_is_reemitted_via_name_fallback(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #3: a legacy (name-keyed) snapshot is also re-emitted via name fallback.
+
+        The UUID lookup misses, but the stored ``agent_id`` ("lead") matches the
+        live agent's name, so the snapshot state still reaches the stream.
+        """
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        legacy_snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="lead",  # OLD shape: agent_id holds the name
+            state=_MarkerState(marker="legacy"),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(legacy_snapshot)
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        assert len(state_msgs) == 1
+        applied = state_msgs[0].state
+        assert isinstance(applied, _MarkerState)
+        assert applied.marker == "legacy"
+
+    def test_no_reemit_for_sender_without_snapshot(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #3, #5: senders without a snapshot (orchestrator, plain agents) no-op.
+
+        With no snapshots persisted at all, restore replays every StartMessage
+        (orchestrator + lead) but emits zero StateChangedMessages and does not
+        raise.
+        """
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        assert state_msgs == []
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_one_reemit_per_agent_with_snapshot(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #5: exactly one StateChangedMessage per agent-with-snapshot.
+
+        Two agents have snapshots and one (the orchestrator) does not; the
+        stream carries exactly two re-emits, one per snapshotted agent.
+        """
+        from akgentic.team.models import AgentStateSnapshot
+
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        lead_id = _lead_agent_id_from_events(event_store, team_id, name="lead")
+        worker_id = _lead_agent_id_from_events(event_store, team_id, name="worker")
+
+        for agent_id, name in ((lead_id, "lead"), (worker_id, "worker")):
+            event_store.save_agent_state(
+                AgentStateSnapshot(
+                    team_id=team_id,
+                    agent_id=str(agent_id),
+                    name=name,
+                    state=BaseState(),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        emitted_ids = {m.sender.agent_id for m in state_msgs if m.sender is not None}
+        assert len(state_msgs) == 2
+        assert emitted_ids == {lead_id, worker_id}
+
+    def test_reemit_does_not_repersist_events_or_states(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #4: load_events and load_agent_states are unchanged across a restore.
+
+        Phase 3 runs with PersistenceSubscriber.set_restoring(True), so the
+        re-emitted StateChangedMessage is neither appended to the event log nor
+        written to the snapshot store -- the ADR-013 invariant holds.
+        """
+        from akgentic.team.models import AgentStateSnapshot
+        from akgentic.team.subscriber import PersistenceSubscriber
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+
+        snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id=str(lead_agent_id),
+            name="lead",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(snapshot)
+
+        events_before = [pe.model_dump() for pe in event_store.load_events(team_id)]
+        states_before = [s.model_dump() for s in event_store.load_agent_states(team_id)]
+
+        persistence_sub = PersistenceSubscriber(team_id, event_store)
+        persistence_sub.set_restoring(team_id, True)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[persistence_sub])
+
+        persistence_sub.set_restoring(team_id, False)
+
+        events_after = [pe.model_dump() for pe in event_store.load_events(team_id)]
+        states_after = [s.model_dump() for s in event_store.load_agent_states(team_id)]
+
+        assert events_after == events_before, "Re-emit must not append to the event log"
+        assert states_after == states_before, "Re-emit must not write the snapshot store"
