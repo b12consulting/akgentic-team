@@ -439,14 +439,15 @@ class TeamRestorer:
         # 2c. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
-        # 2d. Restore agent states (keyed by agent UUID -- ADR-020 §Amendment).
-        # Snapshots persist agent_id=str(sender.agent_id); a restored agent keeps
-        # its original UUID (see _spawn_agents / _create_orchestrator), so the live
-        # address UUID is the exact key. Legacy name-keyed snapshots never match a
-        # UUID, so they are skipped and self-heal on the next state change.
+        # 2d. Restore agent states. Prefer the agent UUID (ADR-020 §Amendment): snapshots
+        # persist agent_id=str(sender.agent_id), and a restored agent keeps its original
+        # UUID (see _spawn_agents / _create_orchestrator), so the live address UUID is the
+        # exact key. Fall back to the agent NAME for legacy (pre-Epic-23) snapshots, whose
+        # agent_id holds the name -- this restores their state deterministically on every
+        # restore (the UUID match still wins for current/new snapshots).
         state_map: dict[str, AgentStateSnapshot] = {snap.agent_id: snap for snap in agent_states}
-        for addr in addrs.values():
-            snap = state_map.get(str(addr.agent_id))
+        for agent_name, addr in addrs.items():
+            snap = state_map.get(str(addr.agent_id)) or state_map.get(agent_name)
             if snap is not None:
                 proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy.init_state(snap.state)

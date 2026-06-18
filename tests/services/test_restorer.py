@@ -24,7 +24,6 @@ from akgentic.core.messages.orchestrator import (
     StopMessage,
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
-
 from akgentic.team.models import (
     PersistedEvent,
     Process,
@@ -34,6 +33,7 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.restorer import GRACE_TIMEOUT_SECONDS, TeamRestorer
+
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,16 @@ class StubAgent(Akgent[BaseConfig, BaseState]):
     """Minimal agent for restorer tests."""
 
     pass
+
+
+class _MarkerState(BaseState):
+    """BaseState carrying a distinguishing marker for snapshot-preference tests.
+
+    Used to tell two competing snapshots (UUID-keyed vs name-keyed legacy) apart
+    by the value the restorer applies via ``init_state``.
+    """
+
+    marker: str = ""
 
 
 class RecordingSubscriber(EventSubscriber):
@@ -541,17 +551,18 @@ class TestTeamRestorerRestore:
         assert "lead" in init_state_calls
         assert runtime.addrs["lead"].is_alive()
 
-    def test_restore_with_legacy_name_keyed_snapshot_loads_and_is_skipped(
+    def test_restore_with_legacy_name_keyed_snapshot_loads_and_is_restored_via_name_fallback(
         self,
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC #4: a legacy name-keyed snapshot loads (name=None) and is skipped.
+        """AC #2/#6: a legacy name-keyed snapshot loads (name=None) and is restored.
 
-        Migration-safety: a snapshot persisted in the OLD shape -- ``agent_id``
-        holding the agent **name** and no ``name`` key -- (a) loads via
-        ``load_agent_states`` with ``name is None`` and (b) is NOT applied on
-        restore (its name never equals ``str(addr.agent_id)``), without raising.
+        Migration-safety + name fallback: a snapshot persisted in the OLD shape --
+        ``agent_id`` holding the agent **name** and no ``name`` key -- (a) loads via
+        ``load_agent_states`` with ``name is None`` and (b) is now APPLIED on restore
+        via the name fallback (its stored ``agent_id`` equals the live agent's name),
+        without raising. This is the direct inverse of Story 23-1's "legacy skipped".
         """
         from unittest.mock import patch as mock_patch
 
@@ -586,7 +597,7 @@ class TestTeamRestorerRestore:
 
         restorer = TeamRestorer(actor_system, event_store)
 
-        # Spy init_state to prove the legacy snapshot is NOT applied on restore.
+        # Spy init_state to prove the legacy snapshot IS applied on restore.
         init_state_calls: list[str] = []
         original_proxy_ask = actor_system.proxy_ask
 
@@ -606,7 +617,130 @@ class TestTeamRestorerRestore:
         with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
             runtime = restorer.restore(process)
 
-        # (b) Not applied on restore -- the name never equals a live address UUID.
+        # (b) Applied on restore via the name fallback -- the UUID lookup misses, but
+        # the stored agent_id ("lead") matches the live agent's name.
+        assert init_state_calls == ["lead"]
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_restore_prefers_uuid_keyed_over_same_name_legacy_snapshot(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #3: UUID-keyed snapshot wins over a same-name legacy snapshot.
+
+        Both a UUID-keyed snapshot (agent_id=str(lead UUID)) and a name-keyed legacy
+        snapshot (agent_id="lead") exist for the SAME live lead agent, carrying
+        distinguishable states. The restorer tries the UUID lookup first, so the
+        UUID-keyed snapshot's state is the one applied -- the legacy one is shadowed.
+        """
+        from unittest.mock import patch as mock_patch
+
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+
+        # UUID-keyed (current) snapshot -- this one must win.
+        uuid_snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id=str(lead_agent_id),
+            name="lead",
+            state=_MarkerState(marker="uuid"),
+            updated_at=datetime.now(UTC),
+        )
+        # Name-keyed legacy snapshot -- same live agent, must be shadowed.
+        legacy_snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="lead",
+            state=_MarkerState(marker="legacy"),
+            updated_at=datetime.now(UTC),
+        )
+        # Different agent_id keys -> both coexist in load_agent_states.
+        event_store.save_agent_state(uuid_snapshot)
+        event_store.save_agent_state(legacy_snapshot)
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        # Spy init_state capturing BOTH the agent name and the applied state, so we
+        # can assert WHICH snapshot's state won.
+        init_state_records: list[tuple[str, Any]] = []
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(addr: ActorAddress, cls: type[Any]) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init = proxy.init_state
+                addr_name = addr.name
+
+                def tracked_init(state: Any, _name: str = addr_name) -> None:
+                    init_state_records.append((_name, state))
+                    return original_init(state)
+
+                proxy.init_state = tracked_init
+            return proxy
+
+        with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime = restorer.restore(process)
+
+        # Exactly one init_state for the lead agent, carrying the UUID-keyed state.
+        lead_records = [(name, st) for name, st in init_state_records if name == "lead"]
+        assert len(lead_records) == 1
+        applied_state = lead_records[0][1]
+        assert isinstance(applied_state, _MarkerState)
+        assert applied_state.marker == "uuid"
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_restore_legacy_snapshot_no_false_match(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #4: a legacy snapshot whose name matches no live agent is a no-op.
+
+        A name-keyed snapshot (agent_id="ghost") matches neither a live UUID nor a
+        live agent name, so no agent receives init_state and restore does not raise;
+        the live agents stay alive.
+        """
+        from unittest.mock import patch as mock_patch
+
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        ghost_snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="ghost",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(ghost_snapshot)
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        init_state_calls: list[str] = []
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(addr: ActorAddress, cls: type[Any]) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init = proxy.init_state
+                addr_name = addr.name
+
+                def tracked_init(state: Any, _name: str = addr_name) -> None:
+                    init_state_calls.append(_name)
+                    return original_init(state)
+
+                proxy.init_state = tracked_init
+            return proxy
+
+        with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime = restorer.restore(process)
+
+        # No agent matched -> no init_state applied, restore did not raise.
         assert init_state_calls == []
         assert runtime.addrs["lead"].is_alive()
 
