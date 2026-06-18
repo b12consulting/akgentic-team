@@ -524,9 +524,10 @@ class TestTeamRestorerRestore:
             proxy = original_proxy_ask(addr, cls)
             if cls is Akgent:
                 original_init = proxy.init_state
+                addr_name = addr.name
 
-                def tracked_init(state: Any) -> None:
-                    init_state_calls.append("lead")
+                def tracked_init(state: Any, _name: str = addr_name) -> None:
+                    init_state_calls.append(_name)
                     return original_init(state)
 
                 proxy.init_state = tracked_init
@@ -535,7 +536,8 @@ class TestTeamRestorerRestore:
         with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
             runtime = restorer.restore(process)
 
-        # Verify init_state was called for the agent with snapshot
+        # Verify init_state was applied to the lead agent's own address (matched
+        # by UUID), not merely that some agent received state.
         assert "lead" in init_state_calls
         assert runtime.addrs["lead"].is_alive()
 
@@ -573,6 +575,15 @@ class TestTeamRestorerRestore:
         assert loaded[0].agent_id == "lead"
         assert loaded[0].name is None
 
+        # (a') A serialized payload that literally OMITS the ``name`` key (the true
+        # on-disk legacy shape) validates cleanly with name=None -- this is the
+        # deserialization boundary the no-migration design rests on.
+        legacy_payload = legacy_snapshot.model_dump()
+        legacy_payload.pop("name", None)
+        revalidated = AgentStateSnapshot.model_validate(legacy_payload)
+        assert revalidated.name is None
+        assert revalidated.agent_id == "lead"
+
         restorer = TeamRestorer(actor_system, event_store)
 
         # Spy init_state to prove the legacy snapshot is NOT applied on restore.
@@ -583,9 +594,10 @@ class TestTeamRestorerRestore:
             proxy = original_proxy_ask(addr, cls)
             if cls is Akgent:
                 original_init = proxy.init_state
+                addr_name = addr.name
 
-                def tracked_init(state: Any) -> None:
-                    init_state_calls.append(addr.name)
+                def tracked_init(state: Any, _name: str = addr_name) -> None:
+                    init_state_calls.append(_name)
                     return original_init(state)
 
                 proxy.init_state = tracked_init
