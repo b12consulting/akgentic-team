@@ -24,6 +24,7 @@ from akgentic.core.messages.orchestrator import (
     StopMessage,
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
+
 from akgentic.team.models import (
     PersistedEvent,
     Process,
@@ -33,7 +34,6 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.restorer import GRACE_TIMEOUT_SECONDS, TeamRestorer
-
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
