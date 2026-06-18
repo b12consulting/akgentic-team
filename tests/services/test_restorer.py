@@ -317,6 +317,27 @@ def _populate_stopped_team(
     return team_id, process
 
 
+def _lead_agent_id_from_events(
+    event_store: InMemoryEventStore,
+    team_id: uuid.UUID,
+    name: str = "lead",
+) -> uuid.UUID:
+    """Read an agent's persisted UUID from its ``StartMessage`` sender.
+
+    Used to key UUID-based ``AgentStateSnapshot`` fixtures by the same UUID the
+    restorer re-injects when re-spawning the agent.
+    """
+    for pe in event_store.load_events(team_id):
+        if (
+            isinstance(pe.event, StartMessage)
+            and pe.event.sender is not None
+            and pe.event.sender.name == name
+        ):
+            return pe.event.sender.agent_id
+    msg = f"{name} agent_id not found in events"
+    raise AssertionError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -463,7 +484,12 @@ class TestTeamRestorerRestore:
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 11: Persisted AgentStateSnapshot is restored via init_state()."""
+        """AC #3: a UUID-keyed AgentStateSnapshot is restored via init_state().
+
+        The snapshot is keyed by the lead agent's actual UUID (read from its
+        persisted ``StartMessage`` sender), and the restorer matches it against
+        the live address UUID -- no name fallback.
+        """
         from unittest.mock import patch as mock_patch
 
         from akgentic.team.models import AgentStateSnapshot
@@ -471,10 +497,15 @@ class TestTeamRestorerRestore:
         tc = _make_team_card()
         team_id, process = _populate_stopped_team(event_store, tc)
 
-        # Inject a state snapshot for the "lead" agent
+        # The restorer now matches by str(addr.agent_id), so the snapshot MUST be
+        # keyed by the lead agent's real UUID -- read it from its StartMessage.
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+
+        # Inject a state snapshot for the "lead" agent, keyed by UUID.
         snapshot = AgentStateSnapshot(
             team_id=team_id,
-            agent_id="lead",
+            agent_id=str(lead_agent_id),
+            name="lead",
             state=BaseState(),
             updated_at=datetime.now(UTC),
         )
@@ -506,6 +537,65 @@ class TestTeamRestorerRestore:
 
         # Verify init_state was called for the agent with snapshot
         assert "lead" in init_state_calls
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_restore_with_legacy_name_keyed_snapshot_loads_and_is_skipped(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC #4: a legacy name-keyed snapshot loads (name=None) and is skipped.
+
+        Migration-safety: a snapshot persisted in the OLD shape -- ``agent_id``
+        holding the agent **name** and no ``name`` key -- (a) loads via
+        ``load_agent_states`` with ``name is None`` and (b) is NOT applied on
+        restore (its name never equals ``str(addr.agent_id)``), without raising.
+        """
+        from unittest.mock import patch as mock_patch
+
+        from akgentic.team.models import AgentStateSnapshot
+
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        # OLD shape: agent_id holds the name, no name field (default None applies).
+        legacy_snapshot = AgentStateSnapshot(
+            team_id=team_id,
+            agent_id="lead",
+            state=BaseState(),
+            updated_at=datetime.now(UTC),
+        )
+        event_store.save_agent_state(legacy_snapshot)
+
+        # (a) The legacy snapshot loads with name=None and raises no error.
+        loaded = event_store.load_agent_states(team_id)
+        assert len(loaded) == 1
+        assert loaded[0].agent_id == "lead"
+        assert loaded[0].name is None
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        # Spy init_state to prove the legacy snapshot is NOT applied on restore.
+        init_state_calls: list[str] = []
+        original_proxy_ask = actor_system.proxy_ask
+
+        def tracking_proxy_ask(addr: ActorAddress, cls: type[Any]) -> Any:
+            proxy = original_proxy_ask(addr, cls)
+            if cls is Akgent:
+                original_init = proxy.init_state
+
+                def tracked_init(state: Any) -> None:
+                    init_state_calls.append(addr.name)
+                    return original_init(state)
+
+                proxy.init_state = tracked_init
+            return proxy
+
+        with mock_patch.object(actor_system, "proxy_ask", side_effect=tracking_proxy_ask):
+            runtime = restorer.restore(process)
+
+        # (b) Not applied on restore -- the name never equals a live address UUID.
+        assert init_state_calls == []
         assert runtime.addrs["lead"].is_alive()
 
     def test_restore_agent_profiles_registered(

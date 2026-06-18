@@ -439,12 +439,17 @@ class TeamRestorer:
         # 2c. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)
 
-        # 2d. Restore agent states
+        # 2d. Restore agent states (keyed by agent UUID -- ADR-020 §Amendment).
+        # Snapshots persist agent_id=str(sender.agent_id); a restored agent keeps
+        # its original UUID (see _spawn_agents / _create_orchestrator), so the live
+        # address UUID is the exact key. Legacy name-keyed snapshots never match a
+        # UUID, so they are skipped and self-heal on the next state change.
         state_map: dict[str, AgentStateSnapshot] = {snap.agent_id: snap for snap in agent_states}
-        for agent_name, addr in addrs.items():
-            if agent_name in state_map:
+        for addr in addrs.values():
+            snap = state_map.get(str(addr.agent_id))
+            if snap is not None:
                 proxy: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
-                proxy.init_state(state_map[agent_name].state)
+                proxy.init_state(snap.state)
 
         # 2e. Restore LLM context from persisted events
         for agent_name, addr in addrs.items():
