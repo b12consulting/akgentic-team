@@ -6,6 +6,12 @@ re-exported here via explicit __all__.
 
 from __future__ import annotations
 
+from akgentic.team.diagnostics import (
+    LeakReport,
+    ReferrerInfo,
+    RetainedType,
+    TeamMemoryProbe,
+)
 from akgentic.team.factory import TeamFactory
 from akgentic.team.manager import TeamManager
 from akgentic.team.messages import WelcomeMessage
@@ -25,6 +31,14 @@ from akgentic.team.ports import (
 )
 from akgentic.team.repositories import YamlEventStore
 from akgentic.team.restorer import TeamRestorer
+from akgentic.team.sampler import (
+    MemorySample,
+    MemorySampler,
+    MemoryTrend,
+    ObjectCensus,
+    TypeGrowth,
+    census_by_type,
+)
 from akgentic.team.subscriber import PersistenceSubscriber
 
 __version__ = "1.0.0-alpha.2"
@@ -33,11 +47,20 @@ __all__: list[str] = [
     "__version__",
     "AgentStateSnapshot",
     "EventStore",
+    "LeakReport",
+    "MemorySample",
+    "MemorySampler",
+    "MemoryTrend",
     "NullServiceRegistry",
+    "ObjectCensus",
     "PersistenceSubscriber",
     "PersistedEvent",
     "Process",
+    "ReferrerInfo",
+    "RetainedType",
     "ServiceRegistry",
+    "TeamMemoryProbe",
+    "TypeGrowth",
     "TeamCard",
     "TeamCardMember",
     "TeamFactory",
@@ -47,6 +70,7 @@ __all__: list[str] = [
     "TeamStatus",
     "WelcomeMessage",
     "YamlEventStore",
+    "census_by_type",
 ]
 
 _mongo_available = False
