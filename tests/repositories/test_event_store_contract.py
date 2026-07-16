@@ -20,7 +20,7 @@ import pytest
 from akgentic.core.messages.message import UserMessage
 
 from akgentic.team.models import TeamStatus
-from akgentic.team.ports import EventStore
+from akgentic.team.ports import EventNotFoundError, EventStore
 from tests.models.conftest import (
     SampleAgentState,
     make_agent_state_snapshot,
@@ -151,6 +151,32 @@ class TestEventStoreContract:
     def test_load_events_returns_empty_list_when_missing(self, event_store: EventStore) -> None:
         """Protocol contract: no events for a team yields ``[]``."""
         assert event_store.load_events(uuid.uuid4()) == []
+
+    # --- load_events(after_event_id) cursor baseline -----------------------
+
+    def test_load_events_after_event_id_none_equals_no_arg(self, event_store: EventStore) -> None:
+        """``load_events(t, after_event_id=None)`` is equivalent to ``load_events(t)``."""
+        team_id = uuid.uuid4()
+        for seq in (1, 2, 3):
+            event_store.save_event(make_persisted_event(team_id=team_id, sequence=seq))
+
+        no_arg = event_store.load_events(team_id)
+        with_none = event_store.load_events(team_id, after_event_id=None)
+        assert [e.event.id for e in with_none] == [e.event.id for e in no_arg]
+        assert [e.sequence for e in with_none] == [1, 2, 3]
+
+    def test_load_events_unknown_after_event_id_raises(self, event_store: EventStore) -> None:
+        """An anchor that was never persisted raises rather than returning ``[]``.
+
+        Returning ``[]`` would be indistinguishable from the legitimate
+        "you are already up to date" answer (ADR-21 §2).
+        """
+        team_id = uuid.uuid4()
+        for seq in (1, 2, 3):
+            event_store.save_event(make_persisted_event(team_id=team_id, sequence=seq))
+
+        with pytest.raises(EventNotFoundError):
+            event_store.load_events(team_id, after_event_id=uuid.uuid4())
 
     # --- get_max_sequence -------------------------------------------------
 

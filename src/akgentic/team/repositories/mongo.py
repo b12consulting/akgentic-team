@@ -36,6 +36,7 @@ except ImportError as exc:
     ) from exc
 
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process
+from akgentic.team.ports import EventNotFoundError
 
 if TYPE_CHECKING:
     import pymongo.collection
@@ -201,17 +202,22 @@ class MongoEventStore:
         self._events.insert_one(doc)
         logger.debug("Saved event seq=%d for team %s", event.sequence, event.team_id)
 
-    def load_events(self, team_id: uuid.UUID) -> list[PersistedEvent]:
-        """Load all persisted events for a team, ordered by sequence.
-
-        Queries the ``events`` collection by ``team_id`` and sorts by
-        ``sequence`` ascending.
+    def load_events(
+        self, team_id: uuid.UUID, after_event_id: uuid.UUID | None = None
+    ) -> list[PersistedEvent]:
+        """Load persisted events for a team, ordered by sequence.
 
         Args:
             team_id: Unique identifier of the team.
+            after_event_id: If provided, return only events after the matching
+                event — anchor excluded. If ``None`` (default), the full log.
 
         Returns:
             List of PersistedEvent ordered by sequence, or empty list if none.
+
+        Raises:
+            EventNotFoundError: If ``after_event_id`` does not resolve to an
+                event of this team.
         """
         cursor = self._events.find({"team_id": str(team_id)}).sort("sequence", 1)
         events: list[PersistedEvent] = []
@@ -224,7 +230,14 @@ class MongoEventStore:
                     "Skipping corrupted event for team %s: %s", team_id, exc
                 )
         logger.debug("Loaded %d events for team %s", len(events), team_id)
-        return events
+        if after_event_id is None:
+            return events
+        # Interim in-memory slice; the $gt push-down lands in story 24-3.
+        # event.id is persisted as a string, so compare stringified ids.
+        for index, event in enumerate(events):
+            if str(event.event.id) == str(after_event_id):
+                return events[index + 1 :]
+        raise EventNotFoundError(f"Event {after_event_id} not found for team {team_id}")
 
     def get_max_sequence(self, team_id: uuid.UUID) -> int:
         """Return the highest event sequence number for a team, or 0.
