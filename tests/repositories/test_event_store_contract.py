@@ -165,6 +165,19 @@ class TestEventStoreContract:
         assert [e.event.id for e in with_none] == [e.event.id for e in no_arg]
         assert [e.sequence for e in with_none] == [1, 2, 3]
 
+    def test_load_events_after_event_id_excludes_anchor(self, event_store: EventStore) -> None:
+        """A resolving anchor yields the strict tail — the anchor itself is excluded."""
+        team_id = uuid.uuid4()
+        for seq in (1, 2, 3, 4, 5):
+            event_store.save_event(make_persisted_event(team_id=team_id, sequence=seq))
+
+        anchor = event_store.load_events(team_id)[2]
+        assert anchor.sequence == 3
+
+        tail = event_store.load_events(team_id, after_event_id=anchor.event.id)
+        assert [e.sequence for e in tail] == [4, 5]
+        assert anchor.event.id not in [e.event.id for e in tail]
+
     def test_load_events_unknown_after_event_id_raises(self, event_store: EventStore) -> None:
         """An anchor that was never persisted raises rather than returning ``[]``.
 

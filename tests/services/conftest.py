@@ -52,16 +52,18 @@ class InMemoryEventStore:
         Round-trips through model_dump/model_validate so that
         ActorAddressImpl becomes ActorAddressProxy, matching real
         persistence backends (YAML, MongoDB). Honours the same tail-slice
-        contract as the real backends.
+        contract as the real backends, which slice a ``sequence``-ordered
+        list — so sort before slicing rather than trusting insertion order.
 
         Raises:
             EventNotFoundError: If ``after_event_id`` does not resolve to an
                 event of this team.
         """
         tid = str(team_id)
-        events = [
-            PersistedEvent.model_validate(d) for d in self._event_dicts if d["team_id"] == tid
-        ]
+        events = sorted(
+            (PersistedEvent.model_validate(d) for d in self._event_dicts if d["team_id"] == tid),
+            key=lambda e: e.sequence,
+        )
         if after_event_id is None:
             return events
         # event.id is persisted as a string, so compare stringified ids.
