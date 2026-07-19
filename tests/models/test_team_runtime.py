@@ -104,10 +104,10 @@ class TestTeamRuntimeConstruction:
         )
         assert runtime.supervisor_addrs == {"supervisor": sup_addr}
 
-    def test_model_post_init_builds_orchestrator_tell(self) -> None:
-        """AC1: model_post_init builds _orchestrator_tell via proxy_tell(orchestrator_addr)."""
+    def test_model_post_init_builds_orchestrator_proxy_tell(self) -> None:
+        """AC1: model_post_init builds _orchestrator_proxy_tell via proxy_tell(orchestrator_addr)."""
         runtime = make_team_runtime()
-        assert runtime._orchestrator_tell is not None
+        assert runtime._orchestrator_proxy_tell is not None
         runtime.actor_system.proxy_tell.assert_any_call(runtime.orchestrator_addr, Orchestrator)
 
 
@@ -118,7 +118,7 @@ class TestTeamRuntimeSerialization:
         runtime = make_team_runtime()
         data = runtime.model_dump()
         assert "_orchestrator_proxy" not in data
-        assert "_orchestrator_tell" not in data
+        assert "_orchestrator_proxy_tell" not in data
         assert "_entry_proxy" not in data
         assert "_message_cls" not in data
 
@@ -241,11 +241,11 @@ class TestTeamRuntimeEmitMessage:
     """AC3: emitMessage tell-forwards a pre-formed message to the orchestrator."""
 
     def test_emit_message_tell_forwards(self) -> None:
-        """emitMessage delegates to _orchestrator_tell.emitMessage with the same instance."""
+        """emitMessage delegates to _orchestrator_proxy_tell.emitMessage with the same instance."""
         runtime = make_team_runtime(message_types=[UserMessage])
         msg = UserMessage(content="banner")
         runtime.emitMessage(msg)
-        runtime._orchestrator_tell.emitMessage.assert_called_once_with(msg)
+        runtime._orchestrator_proxy_tell.emitMessage.assert_called_once_with(msg)
 
     def test_emit_message_returns_none(self) -> None:
         """emitMessage is fire-and-forget — returns None."""

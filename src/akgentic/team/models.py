@@ -192,7 +192,7 @@ class TeamRuntime(SerializableBaseModel):
     )
 
     _orchestrator_proxy: Orchestrator = PrivateAttr()
-    _orchestrator_tell: Orchestrator = PrivateAttr()
+    _orchestrator_proxy_tell: Orchestrator = PrivateAttr()
     _entry_proxy: Akgent[Any, Any] = PrivateAttr()
     _message_cls: type[Message] | None = PrivateAttr(default=None)
     _addr_map: dict[uuid.UUID, ActorAddress] = PrivateAttr(default_factory=dict)
@@ -207,7 +207,9 @@ class TeamRuntime(SerializableBaseModel):
             __context: Pydantic validation context (unused).
         """
         self._orchestrator_proxy = self.actor_system.proxy_ask(self.orchestrator_addr, Orchestrator)
-        self._orchestrator_tell = self.actor_system.proxy_tell(self.orchestrator_addr, Orchestrator)
+        self._orchestrator_proxy_tell = self.actor_system.proxy_tell(
+            self.orchestrator_addr, Orchestrator
+        )
         entry_agent_class = self.team.entry_point.card.get_agent_class()
         self._entry_proxy = self.actor_system.proxy_tell(self.entry_addr, entry_agent_class)
 
@@ -245,7 +247,7 @@ class TeamRuntime(SerializableBaseModel):
         fans out to subscribers (persist + live stream) with no agent processing
         and no outbound dispatch. Rationale: ADR-22.
         """
-        self._orchestrator_tell.emitMessage(message)
+        self._orchestrator_proxy_tell.emitMessage(message)
 
     def send(self, content: str | Message) -> None:
         """Send a message into the team through the entry-point agent.
@@ -397,12 +399,12 @@ class TeamRuntime(SerializableBaseModel):
 
     @property
     def orchestrator_proxy(self) -> Orchestrator:
-        """Read-only access to the orchestrator proxy."""
+        """Read-only access to the orchestrator proxy (ask)."""
         return self._orchestrator_proxy
 
     @property
     def entry_proxy(self) -> Akgent[Any, Any]:
-        """Read-only access to the entry-point proxy."""
+        """Read-only access to the entry-point proxy (tell)."""
         return self._entry_proxy
 
 
