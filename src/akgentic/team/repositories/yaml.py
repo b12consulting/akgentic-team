@@ -110,7 +110,14 @@ class YamlEventStore:
         try:
             with open(team_path) as f:
                 return yaml.safe_load(f)
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, ValueError) as exc:
+            # ValueError is load-bearing, not defensive padding: a file that
+            # is not valid UTF-8 fails in the text stream's decode inside
+            # safe_load and surfaces as UnicodeDecodeError, a ValueError that
+            # is NOT a yaml.YAMLError. Together with the ValueError clause in
+            # _validate_team_data this reproduces exactly the one
+            # (yaml.YAMLError, ValueError) clause load_team used to have, so
+            # unreadable bytes stay a skip and never escape a list_teams call.
             logger.error("Corrupted team.yaml for team %s: %s", team_id, exc)
             return None
 
