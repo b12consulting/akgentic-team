@@ -23,7 +23,7 @@ from unittest.mock import patch
 import pytest
 from pymongo.errors import OperationFailure
 
-from akgentic.team.repositories.mongo import MongoEventStore
+from akgentic.team.repositories.mongo import MongoEventStore, ensure_indexes
 
 if TYPE_CHECKING:
     from akgentic.team.ports import EventStore
@@ -35,6 +35,28 @@ from tests.models.conftest import (
     make_persisted_event,
     make_process,
 )
+
+
+def _assert_ungated_indexes_present(db: Any) -> None:
+    """Assert the three non-teams indexes survive a teams-collection opt-out.
+
+    ``auto_create_indexes`` / ``MONGO_TEAM_AUTO_INDEX`` gate the teams
+    collection only. The ``events`` and ``agent_states`` indexes have been
+    built on every boot since those backends shipped, so they already exist in
+    production and the call there is a cheap no-op; gating them would be an
+    unrequested behaviour change. Called from every opt-out test so a future
+    refactor cannot widen the gate unnoticed.
+    """
+    events_info = db["events"].index_information()
+    assert [("team_id", 1), ("sequence", 1)] in [e["key"] for e in events_info.values()]
+    assert "events_event_id_idx" in events_info
+
+    agent_info = db["agent_states"].index_information()
+    compound = [
+        e for e in agent_info.values() if e["key"] == [("team_id", 1), ("agent_id", 1)]
+    ]
+    assert compound, f"agent_states (team_id, agent_id) index missing: {agent_info}"
+    assert compound[0].get("unique") is True
 
 
 class TestMongoEventStoreMongoSpecific:
@@ -355,6 +377,223 @@ class TestMongoEventStoreMongoSpecific:
         """
         specs = [entry["key"] for entry in mongo_db["events"].index_information().values()]
         assert [("team_id", 1), ("sequence", 1)] in specs
+
+    # --- teams index provisioning -------------------------------------------
+
+    def test_ensure_indexes_creates_both_teams_indexes(self, mongo_db: Any) -> None:
+        """``ensure_indexes`` provisions ``teams_user_id_idx`` and ``teams_status_idx``.
+
+        Both are single-field ascending — the specs backing ``list_teams``'
+        ``user_id`` and ``status`` push-downs, and the exact name and spec the
+        enterprise orphan reconciler probes for.
+        """
+        ensure_indexes(mongo_db)
+
+        info = mongo_db["teams"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+
+    def test_ensure_indexes_targets_the_env_overridden_teams_collection(
+        self, mongo_db: Any
+    ) -> None:
+        """``MONGO_TEAMS_COLLECTION`` moves both indexes to the renamed collection.
+
+        The same resolution the constructor uses, so a deployment sharing one
+        database under a custom collection name is indexed identically.
+        """
+        with patch.dict(os.environ, {"MONGO_TEAMS_COLLECTION": "t_custom"}):
+            ensure_indexes(mongo_db)
+
+        info = mongo_db["t_custom"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert "teams_status_idx" not in mongo_db["teams"].index_information()
+
+    def test_ensure_indexes_is_idempotent(self, mongo_db: Any) -> None:
+        """A second call does not raise; each index stays present exactly once.
+
+        ``create_index`` returns silently for an identical name and key spec,
+        which is what makes the routine safe from a constructor, an init
+        container and a migration job alike.
+        """
+        ensure_indexes(mongo_db)
+        ensure_indexes(mongo_db)  # second call — must NOT raise
+
+        info = mongo_db["teams"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert list(info.keys()).count("teams_user_id_idx") == 1
+        assert list(info.keys()).count("teams_status_idx") == 1
+
+    def test_ensure_indexes_guards_each_index_independently(
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A rejected spec is logged at WARNING and skipped, never raised.
+
+        Both names must appear: one ``try`` wrapping the whole loop would
+        abandon ``teams_status_idx`` — the index the reconciler waits on — the
+        moment ``teams_user_id_idx`` was refused.
+        """
+        real_create_index = type(mongo_db["teams"]).create_index
+
+        def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") in {"teams_user_id_idx", "teams_status_idx"}:
+                raise OperationFailure("index not supported on this account")
+            return real_create_index(self, keys, **kwargs)
+
+        with patch.object(type(mongo_db["teams"]), "create_index", _reject_teams):
+            with caplog.at_level(logging.WARNING):
+                assert ensure_indexes(mongo_db) is None
+
+        assert "teams_user_id_idx" in caplog.text
+        assert "teams_status_idx" in caplog.text
+        assert "teams_status_idx" not in mongo_db["teams"].index_information()
+
+    def test_teams_index_rejection_does_not_block_construction(
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A backend that rejects the teams specs must not stop the process.
+
+        The wrapper refuses only the two teams indexes and delegates every
+        other key: a patch that rejected everything would take construction
+        down on the ungated ``(team_id, sequence)`` index and prove nothing
+        about the teams guard. ``mongomock`` shares one ``Collection`` class
+        across collections, so the patch is seen by all of them.
+        """
+        real_create_index = type(mongo_db["teams"]).create_index
+
+        def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") in {"teams_user_id_idx", "teams_status_idx"}:
+                raise OperationFailure("index not supported on this account")
+            return real_create_index(self, keys, **kwargs)
+
+        with patch.object(type(mongo_db["teams"]), "create_index", _reject_teams):
+            with caplog.at_level(logging.WARNING):
+                MongoEventStore(mongo_db)  # must NOT raise
+
+        assert "teams_user_id_idx" in caplog.text
+        assert "teams_status_idx" in caplog.text
+        assert "collection scan" in caplog.text
+
+    # --- teams index opt-out -------------------------------------------------
+
+    def test_teams_indexes_created_by_default(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No argument and no env var: construction creates both teams indexes.
+
+        Parity with how ``teams_user_id_idx`` behaved before the opt-out
+        existed — small deployments get the indexes for free.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+
+        MongoEventStore(mongo_db)
+
+        info = mongo_db["teams"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+
+    def test_auto_create_indexes_false_creates_neither_teams_index(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``auto_create_indexes=False`` suppresses both teams indexes.
+
+        Including ``teams_user_id_idx``, which was unconditional before this
+        story: one provisioning path, two indexes — which is why the opt-out is
+        paired with ``python -m akgentic.team.scripts.init_mongo``.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+
+        MongoEventStore(mongo_db, auto_create_indexes=False)
+
+        info = mongo_db["teams"].index_information()
+        assert "teams_user_id_idx" not in info
+        assert "teams_status_idx" not in info
+        _assert_ungated_indexes_present(mongo_db)
+
+    @pytest.mark.parametrize("raw", ["0", "false", "no", "FALSE", "No"])
+    def test_env_disabling_value_creates_neither_teams_index(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        """``MONGO_TEAM_AUTO_INDEX`` in {0, false, no} disables, case-insensitively.
+
+        This is the production safety valve: an enterprise teams collection of
+        ~100 GB cannot absorb a foreground index build at boot.
+        """
+        monkeypatch.setenv("MONGO_TEAM_AUTO_INDEX", raw)
+
+        MongoEventStore(mongo_db)
+
+        info = mongo_db["teams"].index_information()
+        assert "teams_user_id_idx" not in info
+        assert "teams_status_idx" not in info
+        _assert_ungated_indexes_present(mongo_db)
+
+    @pytest.mark.parametrize("raw", ["", "1", "true", "yes", "maybe"])
+    def test_env_non_disabling_value_leaves_the_default_on(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        """Any other value — empty included — leaves the boot-time build on.
+
+        The variable is an explicit opt-out, not a tri-state: a typo must fail
+        towards the historical behaviour rather than silently dropping indexes.
+        """
+        monkeypatch.setenv("MONGO_TEAM_AUTO_INDEX", raw)
+
+        MongoEventStore(mongo_db)
+
+        info = mongo_db["teams"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+
+    def test_explicit_argument_beats_the_disabling_environment(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``auto_create_indexes=True`` overrides ``MONGO_TEAM_AUTO_INDEX=0``.
+
+        A caller that knows its collection is small stays in control of its own
+        store even under a deployment-wide opt-out.
+        """
+        monkeypatch.setenv("MONGO_TEAM_AUTO_INDEX", "0")
+
+        MongoEventStore(mongo_db, auto_create_indexes=True)
+
+        info = mongo_db["teams"].index_information()
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+
+    def test_auto_create_indexes_is_keyword_only(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The flag cannot be passed positionally.
+
+        Keyword-only so no positional caller can drift into it — a second
+        positional argument is a ``TypeError``, not a silent opt-out.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+
+        with pytest.raises(TypeError):
+            MongoEventStore(mongo_db, False)  # type: ignore[misc]
+
+    def test_list_teams_status_filter_works_without_the_status_index(
+        self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The status filter is correct against a collection with no status index.
+
+        Correctness must never depend on the index being present — a store that
+        failed closed while an operator provisioned out of band would turn a
+        performance opt-out into an outage.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+        store = MongoEventStore(mongo_db, auto_create_indexes=False)
+        running = make_process(status=TeamStatus.RUNNING)
+        store.save_team(running)
+        store.save_team(make_process(status=TeamStatus.STOPPED))
+
+        assert "teams_status_idx" not in mongo_db["teams"].index_information()
+        assert {p.team_id for p in store.list_teams(status=TeamStatus.RUNNING)} == {
+            running.team_id
+        }
 
     # --- Collection name configuration --------------------------------------
 
