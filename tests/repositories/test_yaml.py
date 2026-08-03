@@ -8,6 +8,9 @@ once per backend. This module retains only YAML-specific invariants:
 * Protocol structural-typing check.
 * On-disk directory-layout and lazy-creation behaviour.
 * List-teams skipping non-UUID directories.
+* List-teams filtering the raw parsed mapping ahead of validation —
+  a YAML-only property, since the other backends push the filter into
+  the query.
 * Corrupted-file resilience (YAML parser errors → ``None`` / ``[]`` /
   skip rather than raise — this is the YamlEventStore contract).
 """
@@ -19,7 +22,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
+from akgentic.team.models import Process, TeamStatus
 from akgentic.team.repositories.yaml import YamlEventStore
 
 if TYPE_CHECKING:
@@ -73,6 +78,89 @@ class TestYamlEventStoreYamlSpecific:
         result = yaml_store.list_teams()
         assert len(result) == 1
         assert result[0].team_id == p1.team_id
+
+    # --- list_teams filters before validating -------------------------------
+
+    def test_list_teams_validates_only_the_teams_it_returns(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A filtered ``list_teams`` hydrates only the teams it returns.
+
+        This is the whole point of the pre-validation filter: a skip
+        applied *after* ``load_team`` returns identical results while
+        still paying for ``Process.model_validate`` — the expensive half,
+        which builds the full ``TeamCard`` graph — on every team it is
+        about to discard. YAML is the community tier's boot path, so that
+        cost is the one this filter exists to avoid.
+
+        The unfiltered assertion at the end keeps the filtered one from
+        passing vacuously: a store that validated nothing at all would
+        satisfy ``len(calls) == 1`` by accident.
+        """
+        # Seed BEFORE installing the spy — save_team uses model_dump, so
+        # seeding cannot pollute the model_validate count.
+        yaml_store.save_team(make_process(status=TeamStatus.RUNNING))
+        for _ in range(3):
+            yaml_store.save_team(make_process(status=TeamStatus.STOPPED))
+
+        calls: list[object] = []
+        original = Process.model_validate
+
+        def counting(data: object, *args: object, **kwargs: object) -> Process:
+            calls.append(data)
+            return original(data, *args, **kwargs)
+
+        monkeypatch.setattr(Process, "model_validate", counting)
+
+        running = yaml_store.list_teams(status=TeamStatus.RUNNING)
+        assert len(running) == 1
+        assert len(calls) == 1  # NOT 4 — the stopped teams are never hydrated
+
+        calls.clear()
+        assert len(yaml_store.list_teams()) == 4
+        assert len(calls) == 4
+
+    def test_list_teams_skips_team_with_missing_status_key(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """A ``team.yaml`` with no ``status`` key is skipped, not raised on."""
+        process = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(process)
+        team_path = tmp_path / str(process.team_id) / "team.yaml"
+        data = yaml.safe_load(team_path.read_text())
+        del data["status"]
+        team_path.write_text(yaml.dump(data))
+
+        assert yaml_store.list_teams(status=TeamStatus.RUNNING) == []
+        # Unfiltered it is absent too — it fails validation, exactly as today.
+        assert yaml_store.list_teams() == []
+
+    def test_list_teams_skips_team_with_non_scalar_status(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """A ``status`` that parses to a mapping matches nothing and does not raise."""
+        process = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(process)
+        team_path = tmp_path / str(process.team_id) / "team.yaml"
+        data = yaml.safe_load(team_path.read_text())
+        data["status"] = {"nested": "mapping"}
+        team_path.write_text(yaml.dump(data))
+
+        assert yaml_store.list_teams(status=TeamStatus.RUNNING) == []
+        assert yaml_store.list_teams() == []
+
+    def test_list_teams_skips_document_that_is_not_a_mapping(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """Valid YAML of the wrong shape cannot match a filter and is skipped."""
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "team.yaml").write_text("- just\n- a\n- list\n")
+
+        assert yaml_store.list_teams(status=TeamStatus.RUNNING) == []
+        assert yaml_store.list_teams(user_id="cli") == []
+        assert yaml_store.list_teams() == []
 
     # --- Corrupted-file resilience ------------------------------------------
 

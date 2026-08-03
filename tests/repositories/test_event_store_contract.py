@@ -199,6 +199,43 @@ class TestEventStoreContract:
         assert {p.team_id for p in positional} == {p.team_id for p in keyword}
         assert {p.team_id for p in positional} == {p1.team_id}
 
+    def test_list_teams_user_id_and_status_return_the_intersection(
+        self, event_store: EventStore
+    ) -> None:
+        """``user_id`` and ``status`` together select the intersection.
+
+        Each user owns one running and one stopped team, so every single
+        term matches two teams and only the conjunction narrows to one. A
+        backend that ORed the terms, or honoured just one of them, would
+        return two or three teams here.
+        """
+        u1_running = make_process(user_id="u1", status=TeamStatus.RUNNING)
+        u1_stopped = make_process(user_id="u1", status=TeamStatus.STOPPED)
+        u2_running = make_process(user_id="u2", status=TeamStatus.RUNNING)
+        u2_stopped = make_process(user_id="u2", status=TeamStatus.STOPPED)
+        for process in (u1_running, u1_stopped, u2_running, u2_stopped):
+            event_store.save_team(process)
+
+        result = event_store.list_teams(user_id="u1", status=TeamStatus.RUNNING)
+        assert {p.team_id for p in result} == {u1_running.team_id}
+
+        stopped = event_store.list_teams(user_id="u2", status=TeamStatus.STOPPED)
+        assert {p.team_id for p in stopped} == {u2_stopped.team_id}
+
+    def test_list_teams_user_id_and_status_with_no_common_team_returns_empty(
+        self, event_store: EventStore
+    ) -> None:
+        """A combination no single team satisfies returns ``[]``, never a union.
+
+        ``u2`` owns a team and a running team exists, so both terms match
+        something on their own — but no one team matches both. AND yields
+        ``[]``; OR would yield two.
+        """
+        event_store.save_team(make_process(user_id="u1", status=TeamStatus.RUNNING))
+        event_store.save_team(make_process(user_id="u2", status=TeamStatus.STOPPED))
+
+        assert event_store.list_teams(user_id="u2", status=TeamStatus.RUNNING) == []
+
     # --- save_event / load_events ordering --------------------------------
 
     def test_save_and_load_events_in_sequence_order(self, event_store: EventStore) -> None:
