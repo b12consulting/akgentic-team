@@ -206,8 +206,9 @@ class MongoEventStore:
                 with ``user_id`` by AND. See ADR-23 §1.
 
         Returns:
-            List of loadable Process snapshots (filtered by ``user_id``
-            at the database level when provided, and by ``status``).
+            List of loadable Process snapshots — filtered by ``user_id``
+            at the database level when provided, and by ``status`` in
+            Python until story 26.3 pushes it down.
         """
         query: dict[str, str] = {"user_id": user_id} if user_id is not None else {}
         teams: list[Process] = []
@@ -219,9 +220,9 @@ class MongoEventStore:
                 logger.warning("Skipping corrupted team document: %s", exc)
         # TEMPORARY in-memory status filter — story 26.3 replaces it with a
         # real push-down that folds ``status`` into the ``find`` filter dict
-        # above (backed by the teams_status_idx index from story 26.4). Kept
-        # deliberately outside the query here so 26.3 has a non-empty change
-        # to make. Results are already correct; only the scan is wasteful.
+        # above (backed by the teams_status_idx index from story 26.4).
+        # Leaving it outside the query is deliberate, not an oversight.
+        # Results are already correct; only the scan is wasteful.
         if status is not None:
             teams = [t for t in teams if t.status == status]
         logger.debug("Listed %d teams", len(teams))

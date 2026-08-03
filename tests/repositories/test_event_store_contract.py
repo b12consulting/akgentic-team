@@ -177,6 +177,28 @@ class TestEventStoreContract:
         assert {p.team_id for p in deleted_result} == {deleted.team_id}
         assert len(deleted_result) == 1
 
+    def test_list_teams_user_id_still_accepts_a_positional_argument(
+        self, event_store: EventStore
+    ) -> None:
+        """``status`` was appended, not inserted: ``list_teams("u1")`` still works.
+
+        The whole point of appending the parameter is that no existing
+        call site moves. Pinned across all three backends because stories
+        26.2 / 26.3 / 26.5 rewrite each of these method bodies — reordering
+        the parameters, or making them keyword-only, would break positional
+        callers silently and no other test would notice.
+        """
+        p1 = make_process(user_id="u1")
+        p2 = make_process(user_id="u2")
+        event_store.save_team(p1)
+        event_store.save_team(p2)
+
+        positional = event_store.list_teams("u1")
+        keyword = event_store.list_teams(user_id="u1")
+
+        assert {p.team_id for p in positional} == {p.team_id for p in keyword}
+        assert {p.team_id for p in positional} == {p1.team_id}
+
     # --- save_event / load_events ordering --------------------------------
 
     def test_save_and_load_events_in_sequence_order(self, event_store: EventStore) -> None:
