@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -90,6 +90,30 @@ class TestInitMongoScriptExitCodes:
                 side_effect=RuntimeError("connection refused"),
             ),
         ):
+            assert script.main() == 1
+
+    def test_unreachable_server_returns_1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A server that cannot be reached exits 1, not a false success.
+
+        :func:`ensure_indexes` swallows every ``PyMongoError`` by design — a
+        rejected spec must never stop a process from starting — and
+        ``MongoClient`` connects lazily, so without a reachability check a
+        refused or authentication-rejected server logs two warnings and lets
+        this script report success having created nothing. That is the worst
+        outcome for the only provisioning path a deployment which set
+        ``MONGO_TEAM_AUTO_INDEX=0`` has left: the operator sees a green init
+        container while the teams indexes never appear.
+        """
+        pytest.importorskip("pymongo")
+        from pymongo.errors import ServerSelectionTimeoutError
+
+        monkeypatch.setenv("MONGO_URI", "mongodb://unreachable")
+        monkeypatch.setenv("MONGO_DB", "akgentic")
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.admin.command.side_effect = ServerSelectionTimeoutError("no servers")
+
+        with patch("pymongo.MongoClient", return_value=client):
             assert script.main() == 1
 
     def test_unavailable_backend_returns_1(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -69,6 +69,15 @@ def main() -> int:
         # here and which is irrelevant to index creation. Closing the client is
         # what the context manager buys: this process is short-lived.
         with pymongo.MongoClient(uri) as client:  # type: ignore[var-annotated]
+            # Reach the server before provisioning. ensure_indexes swallows
+            # every PyMongoError by design — a rejected spec must never stop a
+            # process from starting — so an unreachable, refused or
+            # authentication-rejected server would otherwise leave this script
+            # logging success and exiting 0 having created nothing. The ping is
+            # what keeps the exit codes above honest, and this is the only
+            # provisioning path a deployment that set MONGO_TEAM_AUTO_INDEX=0
+            # has left.
+            client.admin.command("ping")
             ensure_indexes(client[db_name])
     except Exception:
         logger.exception("Mongo index initialization failed")
