@@ -24,7 +24,7 @@ from pathlib import Path
 
 import yaml
 
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process
+from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,9 @@ class YamlEventStore:
         logger.debug("Loaded team %s from %s", team_id, team_path)
         return process
 
-    def list_teams(self, user_id: str | None = None) -> list[Process]:
+    def list_teams(
+        self, user_id: str | None = None, status: TeamStatus | None = None
+    ) -> list[Process]:
         """Load all team process snapshots from the data directory.
 
         Iterates subdirectories of ``data_dir``, attempts to parse each
@@ -119,16 +121,22 @@ class YamlEventStore:
         team directories. Non-UUID directories are skipped with a warning.
         When ``user_id`` is provided, non-matching snapshots are skipped
         in-memory during the iteration (skip-on-load) rather than after
-        the loop — see ADR-16 §3.
+        the loop — see ADR-16 §3. The ``status`` filter is interim and runs
+        after the loop; story 26.2 replaces BOTH filters with a single check
+        on the raw parsed mapping, ahead of ``Process.model_validate``.
 
         Args:
             user_id: If provided, return only snapshots whose
                 ``Process.user_id`` matches. If ``None`` (default), return all
                 snapshots. See ADR-16 §1.
+            status: If provided, return only snapshots whose
+                ``Process.status`` matches. If ``None`` (default), every
+                lifecycle state is returned, including ``DELETED``. Combines
+                with ``user_id`` by AND. See ADR-23 §1.
 
         Returns:
             List of all loadable Process snapshots (filtered by ``user_id``
-            when provided).
+            and ``status`` when provided).
         """
         if not self._data_dir.exists():
             return []
@@ -150,6 +158,18 @@ class YamlEventStore:
             if user_id is not None and process.user_id != user_id:
                 continue
             teams.append(process)
+        # INTERIM in-memory status filter — a placeholder, replaced by story
+        # 26.2. Results are correct; the placement is what costs. The community
+        # tier wires YamlEventStore into LocalRuntimeCache.warm(), the boot-path
+        # RUNNING scan this epic exists to fix, and discarding here saves that
+        # scan nothing: load_team() above has already run yaml.safe_load AND
+        # Process.model_validate, building the whole TeamCard graph for a team
+        # we are about to throw away. 26.2 moves the check onto the raw parsed
+        # mapping so only survivors get validated — which is also why it does
+        # NOT simply move up beside the user_id skip, that one being
+        # post-validate too.
+        if status is not None:
+            teams = [t for t in teams if t.status == status]
         return teams
 
     def save_event(self, event: PersistedEvent) -> None:

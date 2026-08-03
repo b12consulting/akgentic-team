@@ -137,6 +137,46 @@ class TestEventStoreContract:
         assert {p.team_id for p in result} == {p_empty.team_id}
         assert len(result) == 1
 
+    def test_list_teams_status_none_equals_no_arg_and_includes_deleted(
+        self, event_store: EventStore
+    ) -> None:
+        """``status=None`` means *no status filter*, not "not deleted".
+
+        A backend that quietly excluded ``DELETED`` from the unfiltered
+        result would move the default result set — the one thing the
+        additive parameter must never do. A caller that wants only live
+        teams asks for them explicitly.
+        """
+        running = make_process(status=TeamStatus.RUNNING)
+        stopped = make_process(status=TeamStatus.STOPPED)
+        deleted = make_process(status=TeamStatus.DELETED)
+        for process in (running, stopped, deleted):
+            event_store.save_team(process)
+
+        no_arg_ids = {p.team_id for p in event_store.list_teams()}
+        with_none_ids = {p.team_id for p in event_store.list_teams(status=None)}
+
+        assert with_none_ids == no_arg_ids
+        assert deleted.team_id in with_none_ids
+        assert with_none_ids == {running.team_id, stopped.team_id, deleted.team_id}
+
+    def test_list_teams_filters_by_status(self, event_store: EventStore) -> None:
+        """``list_teams(status=...)`` returns exactly the snapshots in that state."""
+        r1 = make_process(status=TeamStatus.RUNNING)
+        r2 = make_process(status=TeamStatus.RUNNING)
+        stopped = make_process(status=TeamStatus.STOPPED)
+        deleted = make_process(status=TeamStatus.DELETED)
+        for process in (r1, r2, stopped, deleted):
+            event_store.save_team(process)
+
+        running_result = event_store.list_teams(status=TeamStatus.RUNNING)
+        assert {p.team_id for p in running_result} == {r1.team_id, r2.team_id}
+        assert all(p.status == TeamStatus.RUNNING for p in running_result)
+
+        deleted_result = event_store.list_teams(status=TeamStatus.DELETED)
+        assert {p.team_id for p in deleted_result} == {deleted.team_id}
+        assert len(deleted_result) == 1
+
     # --- save_event / load_events ordering --------------------------------
 
     def test_save_and_load_events_in_sequence_order(self, event_store: EventStore) -> None:

@@ -37,7 +37,7 @@ except ImportError as exc:
 
 from pymongo.errors import PyMongoError
 
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process
+from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
 if TYPE_CHECKING:
@@ -182,7 +182,9 @@ class MongoEventStore:
         logger.debug("Loaded team %s", team_id)
         return process
 
-    def list_teams(self, user_id: str | None = None) -> list[Process]:
+    def list_teams(
+        self, user_id: str | None = None, status: TeamStatus | None = None
+    ) -> list[Process]:
         """Load team process snapshots from the teams collection.
 
         When ``user_id`` is provided, the filter is pushed down into the
@@ -190,16 +192,22 @@ class MongoEventStore:
         against the ``teams_user_id_idx`` B-tree index (created in
         ``__init__``) — not in Python after hydration. When ``user_id`` is
         ``None``, the call issues ``find({})`` and returns every team.
-        Corrupted documents are skipped with a warning. See ADR-16 §5.
+        ``status`` is filtered in Python for now; story 26.3 folds it into
+        the same ``find`` filter. Corrupted documents are skipped with a
+        warning. See ADR-16 §5 and ADR-23 §5.
 
         Args:
             user_id: If provided, return only snapshots whose
                 ``Process.user_id`` matches via a Mongo backend filter.
                 If ``None`` (default), return all snapshots. See ADR-16 §1.
+            status: If provided, return only snapshots whose
+                ``Process.status`` matches. If ``None`` (default), every
+                lifecycle state is returned, including ``DELETED``. Combines
+                with ``user_id`` by AND. See ADR-23 §1.
 
         Returns:
             List of loadable Process snapshots (filtered by ``user_id``
-            at the database level when provided).
+            at the database level when provided, and by ``status``).
         """
         query: dict[str, str] = {"user_id": user_id} if user_id is not None else {}
         teams: list[Process] = []
@@ -209,6 +217,13 @@ class MongoEventStore:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
                 logger.warning("Skipping corrupted team document: %s", exc)
+        # TEMPORARY in-memory status filter — story 26.3 replaces it with a
+        # real push-down that folds ``status`` into the ``find`` filter dict
+        # above (backed by the teams_status_idx index from story 26.4). Kept
+        # deliberately outside the query here so 26.3 has a non-empty change
+        # to make. Results are already correct; only the scan is wasteful.
+        if status is not None:
+            teams = [t for t in teams if t.status == status]
         logger.debug("Listed %d teams", len(teams))
         return teams
 
