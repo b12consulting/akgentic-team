@@ -109,6 +109,146 @@ class TestMongoEventStoreMongoSpecific:
         assert len(loaded) == 1
         assert loaded[0].agent_id == "good-agent"
 
+    # --- list_teams push-down -----------------------------------------------
+
+    def test_list_teams_pushes_status_into_the_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """``status`` reaches MongoDB inside the ``find`` filter, not Python.
+
+        An in-memory filter returns the same list, so the assertion has to
+        bite on the shape of the call: exactly one ``find``, carrying
+        ``{"status": "running"}``. ``wraps=`` keeps the real query running
+        so the result is pinned by the same test.
+        """
+        mongo_store.save_team(make_process(status=TeamStatus.RUNNING))
+        mongo_store.save_team(make_process(status=TeamStatus.STOPPED))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(status=TeamStatus.RUNNING)
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {"status": "running"}
+        assert len(result) == 1
+        assert result[0].status == TeamStatus.RUNNING
+
+    def test_list_teams_pushes_user_id_and_status_into_one_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """Both filters travel down in a single ``find`` call, ANDed.
+
+        Never two ``find`` calls intersected afterwards, and never a
+        ``find`` plus a second pass in Python.
+        """
+        mine_running = make_process(user_id="u1", status=TeamStatus.RUNNING)
+        mongo_store.save_team(mine_running)
+        mongo_store.save_team(make_process(user_id="u1", status=TeamStatus.STOPPED))
+        mongo_store.save_team(make_process(user_id="u2", status=TeamStatus.RUNNING))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(user_id="u1", status=TeamStatus.RUNNING)
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {"user_id": "u1", "status": "running"}
+        assert [p.team_id for p in result] == [mine_running.team_id]
+
+    def test_list_teams_without_filters_issues_an_empty_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """A ``None`` parameter contributes no key — the filter stays ``{}``.
+
+        Both the no-argument call and the explicit ``user_id=None,
+        status=None`` call must reach MongoDB unfiltered and return every
+        lifecycle state, ``DELETED`` included.
+        """
+        mongo_store.save_team(make_process(status=TeamStatus.RUNNING))
+        mongo_store.save_team(make_process(status=TeamStatus.DELETED))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            no_argument = mongo_store.list_teams()
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {}
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            explicit_none = mongo_store.list_teams(user_id=None, status=None)
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {}
+        assert len(no_argument) == 2
+        assert {p.team_id for p in explicit_none} == {p.team_id for p in no_argument}
+
+    def test_list_teams_positional_user_id_still_reaches_the_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """``list_teams("u1")`` keeps working and still pushes ``user_id`` down.
+
+        Guards the parameter order against the rewrite: a keyword-only
+        regression would be caught at the Mongo layer too, not only in the
+        shared contract suite.
+        """
+        mine = make_process(user_id="u1", status=TeamStatus.RUNNING)
+        mongo_store.save_team(mine)
+        mongo_store.save_team(make_process(user_id="u2", status=TeamStatus.RUNNING))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams("u1")
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {"user_id": "u1"}
+        assert [p.team_id for p in result] == [mine.team_id]
+
+    def test_list_teams_does_not_filter_status_in_python(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """No post-hydration ``status`` comparison survives in the method body.
+
+        ``find`` is stubbed to hand back BOTH documents whatever filter the
+        store asks for. Any surviving Python-side comparison would drop the
+        stopped team while leaving every result-level assertion elsewhere
+        green — which is exactly what this test exists to catch.
+        """
+        running = make_process(status=TeamStatus.RUNNING)
+        stopped = make_process(status=TeamStatus.STOPPED)
+        mongo_store.save_team(running)
+        mongo_store.save_team(stopped)
+
+        all_docs = list(mongo_store._teams.find({}))
+        with patch.object(mongo_store._teams, "find", return_value=iter(all_docs)):
+            result = mongo_store.list_teams(status=TeamStatus.RUNNING)
+
+        assert {p.team_id for p in result} == {running.team_id, stopped.team_id}
+
+    def test_list_teams_skips_corrupted_documents(
+        self, mongo_store: MongoEventStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A corrupted team document is skipped, logged, and does not raise.
+
+        Seeded beside a healthy team so a ``list_teams`` broken to return
+        nothing cannot pass: the healthy team must still come back.
+        """
+        healthy = make_process(status=TeamStatus.RUNNING)
+        mongo_store.save_team(healthy)
+        mongo_store._teams.insert_one(
+            {"team_id": str(uuid.uuid4()), "not_a_valid_field": 123}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = mongo_store.list_teams()
+
+        assert {p.team_id for p in result} == {healthy.team_id}
+        assert "Skipping corrupted team document" in caplog.text
+
     # --- user_id index presence ---------------------------------------------
 
     def test_teams_user_id_index_created_on_init(

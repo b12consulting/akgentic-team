@@ -187,30 +187,34 @@ class MongoEventStore:
     ) -> list[Process]:
         """Load team process snapshots from the teams collection.
 
-        When ``user_id`` is provided, the filter is pushed down into the
-        Mongo ``find`` call as ``{"user_id": user_id}`` and runs in MongoDB
-        against the ``teams_user_id_idx`` B-tree index (created in
-        ``__init__``) — not in Python after hydration. When ``user_id`` is
-        ``None``, the call issues ``find({})`` and returns every team.
-        ``status`` is filtered in Python for now; story 26.3 folds it into
-        the same ``find`` filter. Corrupted documents are skipped with a
-        warning. See ADR-16 §5 and ADR-23 §5.
+        Both filters are pushed into the same Mongo ``find`` filter dict —
+        ``{"user_id": ...}`` and ``{"status": ...}``. A parameter left at
+        ``None`` contributes no key, so ``list_teams()`` issues ``find({})``
+        and returns every team; supplying both yields one query whose terms
+        AND. The selection happens in MongoDB, never in Python after
+        hydration. Indexes (``teams_user_id_idx``, and a ``status`` index)
+        only make the scan cheaper — an unindexed filter still returns the
+        right teams. Corrupted documents are skipped with a warning. See
+        ADR-16 §5 and ADR-23 §§5-6.
 
         Args:
             user_id: If provided, return only snapshots whose
-                ``Process.user_id`` matches via a Mongo backend filter.
-                If ``None`` (default), return all snapshots. See ADR-16 §1.
+                ``Process.user_id`` matches. If ``None`` (default), the
+                filter carries no ``user_id`` key. See ADR-16 §1.
             status: If provided, return only snapshots whose
                 ``Process.status`` matches. If ``None`` (default), every
                 lifecycle state is returned, including ``DELETED``. Combines
                 with ``user_id`` by AND. See ADR-23 §1.
 
         Returns:
-            List of loadable Process snapshots — filtered by ``user_id``
-            at the database level when provided, and by ``status`` in
-            Python until story 26.3 pushes it down.
+            List of loadable Process snapshots, filtered at the database
+            level by whichever of ``user_id`` and ``status`` were given.
         """
-        query: dict[str, str] = {"user_id": user_id} if user_id is not None else {}
+        query: dict[str, str] = {}
+        if user_id is not None:
+            query["user_id"] = user_id
+        if status is not None:
+            query["status"] = status
         teams: list[Process] = []
         for doc in self._teams.find(query):
             doc.pop("_id", None)
@@ -218,13 +222,6 @@ class MongoEventStore:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
                 logger.warning("Skipping corrupted team document: %s", exc)
-        # TEMPORARY in-memory status filter — story 26.3 replaces it with a
-        # real push-down that folds ``status`` into the ``find`` filter dict
-        # above (backed by the teams_status_idx index from story 26.4).
-        # Leaving it outside the query is deliberate, not an oversight.
-        # Results are already correct; only the scan is wasteful.
-        if status is not None:
-            teams = [t for t in teams if t.status == status]
         logger.debug("Listed %d teams", len(teams))
         return teams
 
