@@ -11,6 +11,11 @@ keywords = ["agents", "ai", "akgentic", "teams", "lifecycle"]
 
 dependencies = [
     "pydantic>=2.0.0",
+    # YamlEventStore and the CLI import `yaml` directly. Undeclared until now:
+    # it resolved only because a sibling package pulled PyYAML into the shared
+    # workspace environment, so a standalone install raised ImportError at
+    # first use. Standalone CI is what surfaced it.
+    "pyyaml>=6.0",
     "akgentic-core",
 ]
 
@@ -29,6 +34,7 @@ dev = [
     "nagra>=0.5",
     "psycopg[binary]>=3.1",
     "testcontainers[postgres]>=4.0.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
