@@ -11,6 +11,11 @@ keywords = ["agents", "ai", "akgentic", "teams", "lifecycle"]
 
 dependencies = [
     "pydantic>=2.0.0",
+    # YamlEventStore and the CLI import `yaml` directly. Undeclared until now:
+    # it resolved only because a sibling package pulled PyYAML into the shared
+    # workspace environment, so a standalone install raised ImportError at
+    # first use. Standalone CI is what surfaced it.
+    "pyyaml>=6.0",
     "akgentic-core",
 ]
 
@@ -29,6 +34,7 @@ dev = [
     "nagra>=0.5",
     "psycopg[binary]>=3.1",
     "testcontainers[postgres]>=4.0.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -38,8 +44,13 @@ ak-team = "akgentic.team.cli.main:app"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv.sources]
-akgentic-core = { workspace = true }
+# Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.
+# - Inside the akgentic-quick-start workspace, the workspace root's
+#   [tool.uv.sources] resolves them as editable workspace members.
+# - In standalone CI, they are built from RELEASE_BRANCH into a local
+#   wheelhouse and installed via `uv pip install --find-links` — see ci.yml.
+# A `akgentic-core = { workspace = true }` entry here is fatal standalone:
+# uv rejects a workspace source whose member does not exist.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/akgentic"]
@@ -59,7 +70,18 @@ disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 markers = ["integration: Full lifecycle tests requiring real LLM and API keys"]
-addopts = "-m 'not integration'"
+# --ignore: test_llm_lifecycle.py imports akgentic.agent at module scope, which
+# is not a dependency of akgentic-team. Collection therefore fails with
+# ModuleNotFoundError before the 'not integration' marker filter can deselect
+# it — a marker filters at run time, it does not prevent import. This went
+# unnoticed while CI installed the whole akgentic-quick-start workspace, where
+# akgentic-agent is present; standalone CI surfaced it.
+# DELIBERATE DIVERGENCE FROM master, which ignores all of tests/integration.
+# Only test_llm_lifecycle.py imports akgentic.agent; the other four modules in
+# that directory import akgentic.core only and contribute 16 passing tests
+# (factory, lifecycle, persistence, process_human_input). Ignoring the whole
+# directory would drop them silently.
+addopts = "-m 'not integration' --ignore=tests/integration/test_llm_lifecycle.py"
 
 [tool.ruff]
 target-version = "py312"
