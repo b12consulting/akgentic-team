@@ -38,8 +38,13 @@ ak-team = "akgentic.team.cli.main:app"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv.sources]
-akgentic-core = { workspace = true }
+# Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.
+# - Inside the akgentic-quick-start workspace, the workspace root's
+#   [tool.uv.sources] resolves them as editable workspace members.
+# - In standalone CI, they are built from RELEASE_BRANCH into a local
+#   wheelhouse and installed via `uv pip install --find-links` — see ci.yml.
+# A `akgentic-core = { workspace = true }` entry here is fatal standalone:
+# uv rejects a workspace source whose member does not exist.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/akgentic"]
