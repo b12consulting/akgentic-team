@@ -400,7 +400,7 @@ deployment project owns the application-level switch.
 ## CLI
 
 The `ak-team` command is available when the `[cli]` extra is installed.
-See the [CLI README](src/akgentic/team/cli/README.md) for full documentation.
+See the [CLI README](https://github.com/b12consulting/akgentic-team/blob/master/src/akgentic/team/cli/README.md) for full documentation.
 
 ```bash
 # List all teams
@@ -425,8 +425,8 @@ ak-team --backend mongodb --mongo-uri mongodb://localhost:27017 --mongo-db akgen
 
 ## Examples
 
-Six progressive, self-contained examples in the [examples/](examples/)
-directory. See the [Examples README](examples/README.md) for full
+Six progressive, self-contained examples in the [examples/](https://github.com/b12consulting/akgentic-team/tree/master/examples)
+directory. See the [Examples README](https://github.com/b12consulting/akgentic-team/blob/master/examples/README.md) for full
 descriptions and learning path. Each includes a runnable `.py` script
 and a companion `.md` explaining concepts and pitfalls.
 
