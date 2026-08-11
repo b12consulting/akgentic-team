@@ -59,6 +59,11 @@ class TeamCard(SerializableBaseModel):
         entry_point: The member that serves as the team's external interface.
         members: Top-level members of the team (excluding the entry point).
         message_types: Message classes the team handles; first is the default.
+        metadata_type: Model class describing this team's business metadata.
+            ``None`` when the team carries none. Declared as a field rather than
+            a type parameter on purpose -- a parameterised ``TeamCard[X]`` has no
+            importable dotted path, which would break the ``__model__``
+            round-trip ``Process.team_card`` exists to perform.
         welcome_message: Optional static greeting announced on the team's event
             stream when the team is first created. ``None`` disables it.
     """
@@ -79,6 +84,13 @@ class TeamCard(SerializableBaseModel):
     message_types: list[type] = Field(
         default_factory=list,
         description="Message classes the team handles; first is the default",
+    )
+    metadata_type: type[SerializableBaseModel] | None = Field(
+        default=None,
+        description=(
+            "Model class describing this team's business metadata, typically a "
+            "TeamMetadata subclass. None when the team carries none."
+        ),
     )
     agent_profiles: list[AgentCard] = Field(
         default_factory=list,
@@ -425,6 +437,21 @@ class Process(SerializableBaseModel):
     Stores the TeamCard blueprint so the team can be rebuilt on resume,
     along with lifecycle status and audit fields. This is NOT the
     TeamRuntime -- addresses are stale after stop/crash.
+
+    Attributes:
+        team_id: Unique identifier for this team instance.
+        team_card: Declarative team definition for rebuilding on resume.
+        status: Current lifecycle state of the team.
+        user_id: Identifier of the user who owns this team.
+        user_email: Email of the user who owns this team.
+        created_at: Timestamp when the team was created.
+        updated_at: Timestamp of the last status change.
+        catalog_namespace: Opaque catalog-namespace tag, or ``None``.
+        metadata: The team's business metadata value, an instance of the card's
+            declared ``metadata_type``, or ``None``.
+        metadata_indexes: Flattened ``"key|value"`` entries derived from
+            ``metadata``. Derived on write by ``derive_metadata_indexes``, never
+            accepted from a caller, and never written apart from ``metadata``.
     """
 
     team_id: uuid.UUID = Field(description="Unique identifier for this team instance")
@@ -439,6 +466,21 @@ class Process(SerializableBaseModel):
         description=(
             "Optional opaque catalog-namespace tag recorded when this team was "
             "instantiated from a catalog. Not interpreted by akgentic-team."
+        ),
+    )
+    metadata: SerializableBaseModel | None = Field(
+        default=None,
+        description=(
+            "The team's business metadata value, an instance of the card's "
+            "declared metadata_type. None when the team carries none."
+        ),
+    )
+    metadata_indexes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Flattened 'key|value' index derived from metadata on every write. "
+            "Never client-supplied and never derived on read -- a read-time "
+            "derivation would mask a write path that forgot to update it."
         ),
     )
 

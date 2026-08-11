@@ -394,6 +394,7 @@ class TeamRestorer:
         Steps 2a-2g:
           a. Determine live agents (StartMessage/StopMessage filtering)
           b. Rebuild Orchestrator first
+          b-bis. Repopulate the orchestrator's team metadata from the Process
           c. Spawn remaining agents through resolved parents
           d. Restore agent states from snapshots
           e. Restore LLM contexts from persisted EventMessages
@@ -440,6 +441,19 @@ class TeamRestorer:
         orchestrator_addr, orchestrator_proxy = self._create_orchestrator(
             orchestrator_start, team_id, spawned_addrs
         )
+
+        # 2b-bis. Repopulate the team metadata from the Process — the database is
+        # the source of truth, the actor only ever a cache. Metadata is
+        # deliberately not a BaseState field, so the snapshot replay at 2d that
+        # recovers everything else recovers nothing here; omitting this push is a
+        # silent regression in which the team resumes correctly in every other
+        # respect while get_metadata() returns None. It also heals a write whose
+        # best-effort push to the previously live orchestrator failed. Done
+        # before 2c so agents spawned during restore can already consult it, and
+        # as a direct proxy call (like 2f) rather than an event, so it does not
+        # disturb the event-stream parity 2g protects. See ADR-24 §D8.
+        if process.metadata is not None:
+            orchestrator_proxy.set_metadata(process.metadata)
 
         # 2c. Spawn remaining agents through resolved parents
         addrs = self._spawn_agents(agent_starts, orchestrator_addr, spawned_addrs)

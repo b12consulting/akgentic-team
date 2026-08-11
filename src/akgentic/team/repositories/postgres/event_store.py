@@ -20,6 +20,7 @@ import uuid
 
 from nagra import Transaction  # type: ignore[import-untyped]
 
+from akgentic.team.metadata import make_index_entry
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
@@ -71,7 +72,10 @@ class NagraEventStore:
         return Process.model_validate(decode_jsonb_column(row[0]))
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
         """Return persisted team processes. Order is unspecified.
 
@@ -81,8 +85,9 @@ class NagraEventStore:
         expression index ``team_process_user_id_idx`` created by
         :func:`init_db`. ``user_id`` is bound through psycopg's ``%s``
         placeholder — no f-strings, no string concatenation. See ADR-16 §4.
-        ``status`` is filtered on the hydrated rows instead; see the comment
-        at the filter for why that is the shipped behaviour here.
+        ``status`` and ``metadata`` are filtered on the hydrated rows
+        instead; see the comments at each filter for why that is the shipped
+        behaviour here.
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -90,8 +95,14 @@ class NagraEventStore:
                 snapshots. See ADR-16 §1.
             status: If provided, return only snapshots whose
                 ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. Combines
-                with ``user_id`` by AND. See ADR-23 §1.
+                lifecycle state is returned, including ``DELETED``. See
+                ADR-23 §1.
+            metadata: If provided, return only snapshots whose
+                ``metadata_indexes`` contains an entry for EVERY key/value
+                pair given. An empty dict matches everything, like ``None``.
+                See ADR-24 §D5.
+
+        All three filters are independent terms combining as a conjunction.
         """
         with Transaction(self._conn_string) as trn:
             if user_id is None:
@@ -112,6 +123,15 @@ class NagraEventStore:
         # what is missing is only the row-count reduction at the database.
         if status is not None:
             teams = [t for t in teams if t.status == status]
+        # In-memory metadata filter, same story as the status one above: the
+        # Postgres push-down (a `text[]` column, a GIN index and a `@>`
+        # containment term) is DEFERRED, so this discard is the current
+        # shipped behaviour of this backend and not a placeholder awaiting
+        # replacement. Entries are built with the shared helper so the `|`
+        # escaping stays symmetric with the derivation side.
+        if metadata:
+            entries = {make_index_entry(k, v) for k, v in metadata.items()}
+            teams = [t for t in teams if entries.issubset(set(t.metadata_indexes))]
         return teams
 
     def delete_team(self, team_id: uuid.UUID) -> None:

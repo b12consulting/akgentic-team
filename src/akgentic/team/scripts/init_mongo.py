@@ -2,8 +2,13 @@
 
 Runs :func:`akgentic.team.repositories.mongo.ensure_indexes` against the
 MongoDB database identified by the ``MONGO_URI`` and ``MONGO_DB``
-environment variables, provisioning ``teams_user_id_idx`` and
-``teams_status_idx`` on the teams collection.
+environment variables, provisioning ``teams_user_id_idx``,
+``teams_status_idx`` and ``teams_metadata_indexes_idx`` on the teams
+collection — every index ``MONGO_TEAM_AUTO_INDEX=0`` suppresses, so an
+operator who took the opt-out needs no second, hand-rolled step here. The
+list is deliberately exhaustive: a name missing from it reads as an index
+this path does not cover, and hand-creating it under a different name is
+what leaves deployment tooling probing for a name that never arrives.
 
 Intended to be invoked by a Kubernetes initContainer or Nomad prestart
 task before the main team-runtime process starts:

@@ -25,14 +25,42 @@ from pymongo.errors import OperationFailure
 from akgentic.team.repositories.mongo import MongoEventStore, ensure_indexes
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    from akgentic.team.models import Process
     from akgentic.team.ports import EventStore
 
 from akgentic.team.models import TeamStatus
 from tests.models.conftest import (
+    AcmeTeamMetadata,
     make_agent_state_snapshot,
+    make_indexed_process,
     make_persisted_event,
     make_process,
 )
+
+
+def _metadata_fixtures() -> list[Process]:
+    """Six teams spanning the metadata filter matrix, in a fixed order.
+
+    Built through ``make_indexed_process`` so ``metadata`` and its derived
+    ``metadata_indexes`` are seeded together exactly as a real write path
+    leaves them — an index seeded by hand would let a query-side escaping bug
+    pass. Two tenants, two owning users, one ``case_ref`` holding a literal
+    ``|``, and one team carrying no metadata at all: that last one must be
+    excluded by every non-empty filter and returned by ``metadata=None``.
+
+    Returns:
+        The teams, positionally addressable by the parity matrix's indices.
+    """
+    return [
+        make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1"), user_id="u1"),
+        make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C|1234"), user_id="u1"),
+        make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-2"), user_id="u2"),
+        make_indexed_process(AcmeTeamMetadata(tenant="contoso", case_ref="C-1"), user_id="u2"),
+        make_indexed_process(AcmeTeamMetadata(tenant="contoso"), user_id="u1"),
+        make_indexed_process(None, user_id="u2"),
+    ]
 
 
 def _assert_ungated_indexes_present(db: Any) -> None:
@@ -378,25 +406,33 @@ class TestMongoEventStoreMongoSpecific:
 
     # --- teams index provisioning -------------------------------------------
 
-    def test_ensure_indexes_creates_both_teams_indexes(self, mongo_db: Any) -> None:
-        """``ensure_indexes`` provisions ``teams_user_id_idx`` and ``teams_status_idx``.
+    def test_ensure_indexes_creates_every_teams_index(self, mongo_db: Any) -> None:
+        """``ensure_indexes`` provisions all three teams-collection indexes.
 
-        Both are single-field ascending — the specs backing ``list_teams``'
-        ``user_id`` and ``status`` push-downs, and the exact name and spec the
-        enterprise orphan reconciler probes for.
+        Each is single-field ascending — the specs backing ``list_teams``'
+        ``user_id``, ``status`` and ``metadata`` push-downs, and the exact
+        names deployment tooling probes for.
+
+        ``teams_metadata_indexes_idx`` is the multikey one. MongoDB derives
+        multikey automatically from the array-valued ``metadata_indexes``
+        field, so the requested spec is a plain ``[("metadata_indexes", 1)]``
+        and there is no separate index type to ask for.
         """
         ensure_indexes(mongo_db)
 
         info = mongo_db["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
 
     def test_ensure_indexes_is_idempotent(self, mongo_db: Any) -> None:
         """A second call does not raise; each index stays present exactly once.
 
         ``create_index`` returns silently for an identical name and key spec,
         which is what makes the routine safe from a constructor, an init
-        container and a migration job alike.
+        container and a migration job alike. A same-name-different-spec
+        re-request would raise instead, so this also pins that the second call
+        asks for byte-identical specs.
         """
         ensure_indexes(mongo_db)
         ensure_indexes(mongo_db)  # second call — must NOT raise
@@ -404,22 +440,25 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
         assert list(info.keys()).count("teams_user_id_idx") == 1
         assert list(info.keys()).count("teams_status_idx") == 1
+        assert list(info.keys()).count("teams_metadata_indexes_idx") == 1
 
     def test_ensure_indexes_guards_each_index_independently(
         self, mongo_db: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A rejected spec is logged at WARNING and skipped, never raised.
 
-        Both names must appear: one ``try`` wrapping the whole loop would
+        All three names must appear: one ``try`` wrapping the whole loop would
         abandon ``teams_status_idx`` — the index the reconciler waits on — the
         moment ``teams_user_id_idx`` was refused.
         """
         real_create_index = type(mongo_db["teams"]).create_index
+        rejected = {"teams_user_id_idx", "teams_status_idx", "teams_metadata_indexes_idx"}
 
         def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
-            if kwargs.get("name") in {"teams_user_id_idx", "teams_status_idx"}:
+            if kwargs.get("name") in rejected:
                 raise OperationFailure("index not supported on this account")
             return real_create_index(self, keys, **kwargs)
 
@@ -427,25 +466,101 @@ class TestMongoEventStoreMongoSpecific:
             with caplog.at_level(logging.WARNING):
                 assert ensure_indexes(mongo_db) is None
 
+        info = mongo_db["teams"].index_information()
+        for name in rejected:
+            assert name in caplog.text
+            assert name not in info
+
+    def test_a_rejected_spec_does_not_skip_the_specs_after_it(
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Refusing the FIRST spec still provisions the ones behind it.
+
+        ``teams_user_id_idx`` leads ``_TEAM_INDEX_SPECS``, so rejecting only it
+        is what actually proves the ``try`` sits inside the loop: with one
+        ``try`` around the whole loop, ``teams_metadata_indexes_idx`` would
+        never be requested and the metadata push-down would run unindexed
+        forever on an account that merely dislikes one unrelated spec.
+        """
+        real_create_index = type(mongo_db["teams"]).create_index
+
+        def _reject_user_id(self: Any, keys: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") == "teams_user_id_idx":
+                raise OperationFailure("index not supported on this account")
+            return real_create_index(self, keys, **kwargs)
+
+        with patch.object(type(mongo_db["teams"]), "create_index", _reject_user_id):
+            with caplog.at_level(logging.WARNING):
+                assert ensure_indexes(mongo_db) is None
+
+        info = mongo_db["teams"].index_information()
         assert "teams_user_id_idx" in caplog.text
-        assert "teams_status_idx" in caplog.text
-        assert "teams_status_idx" not in mongo_db["teams"].index_information()
+        assert "teams_user_id_idx" not in info
+        assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+
+    def test_metadata_index_rejection_is_logged_and_construction_still_succeeds(
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rejecting only the metadata spec warns by name and does not raise.
+
+        Cosmos for MongoDB supports single-field indexes on array fields, but
+        account capabilities vary. The index is an optimization — a store that
+        refused to construct because one index was unavailable would turn a
+        capability gap into a server that will not boot, while ``list_teams``
+        would have returned correct results the whole time.
+
+        The environment is normalised first: this test asserts on a warning
+        that is only reachable when the build is actually attempted, so an
+        ambient ``MONGO_TEAM_AUTO_INDEX=0`` would skip provisioning entirely
+        and fail it for a reason that has nothing to do with the guard.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+        real_create_index = type(mongo_db["teams"]).create_index
+
+        def _reject_metadata(self: Any, keys: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") == "teams_metadata_indexes_idx":
+                raise OperationFailure("index not supported on this account")
+            return real_create_index(self, keys, **kwargs)
+
+        with patch.object(type(mongo_db["teams"]), "create_index", _reject_metadata):
+            with caplog.at_level(logging.WARNING):
+                store = MongoEventStore(mongo_db)  # must NOT raise
+
+        assert "teams_metadata_indexes_idx" in caplog.text
+        assert "collection scan" in caplog.text
+        info = mongo_db["teams"].index_information()
+        assert "teams_metadata_indexes_idx" not in info
+        assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
+        # Still usable: the filter runs, it just runs unindexed.
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        store.save_team(acme)
+        store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="contoso")))
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": "acme"})] == [
+            acme.team_id
+        ]
 
     def test_teams_index_rejection_does_not_block_construction(
-        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A backend that rejects the teams specs must not stop the process.
 
-        The wrapper refuses only the two teams indexes and delegates every
+        The wrapper refuses only the three teams indexes and delegates every
         other key: a patch that rejected everything would take construction
         down on the ungated ``(team_id, sequence)`` index and prove nothing
         about the teams guard. ``mongomock`` shares one ``Collection`` class
         across collections, so the patch is seen by all of them.
+
+        The environment is normalised first for the same reason as the
+        metadata-only rejection test above: an ambient opt-out would skip the
+        build and leave nothing to warn about.
         """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
         real_create_index = type(mongo_db["teams"]).create_index
+        rejected = {"teams_user_id_idx", "teams_status_idx", "teams_metadata_indexes_idx"}
 
         def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
-            if kwargs.get("name") in {"teams_user_id_idx", "teams_status_idx"}:
+            if kwargs.get("name") in rejected:
                 raise OperationFailure("index not supported on this account")
             return real_create_index(self, keys, **kwargs)
 
@@ -453,8 +568,8 @@ class TestMongoEventStoreMongoSpecific:
             with caplog.at_level(logging.WARNING):
                 MongoEventStore(mongo_db)  # must NOT raise
 
-        assert "teams_user_id_idx" in caplog.text
-        assert "teams_status_idx" in caplog.text
+        for name in rejected:
+            assert name in caplog.text
         assert "collection scan" in caplog.text
 
     # --- teams index opt-out -------------------------------------------------
@@ -462,7 +577,7 @@ class TestMongoEventStoreMongoSpecific:
     def test_teams_indexes_created_by_default(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No argument and no env var: construction creates both teams indexes.
+        """No argument and no env var: construction creates every teams index.
 
         Parity with how ``teams_user_id_idx`` behaved before the opt-out
         existed — small deployments get the indexes for free.
@@ -474,15 +589,19 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
 
-    def test_auto_create_indexes_false_creates_neither_teams_index(
+    def test_auto_create_indexes_false_creates_no_teams_index(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``auto_create_indexes=False`` suppresses both teams indexes.
+        """``auto_create_indexes=False`` suppresses every teams index.
 
-        Including ``teams_user_id_idx``, which was unconditional before this
-        story: one provisioning path, two indexes — which is why the opt-out is
-        paired with ``python -m akgentic.team.scripts.init_mongo``.
+        Including ``teams_user_id_idx``, which was unconditional before the
+        opt-out existed: one provisioning path, three indexes — which is why
+        the opt-out is paired with
+        ``python -m akgentic.team.scripts.init_mongo``. Absence is asserted by
+        name, never as ``index_information() == {}``: mongomock adds an
+        ``_id_`` entry as soon as anything touches the collection.
         """
         monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
 
@@ -491,10 +610,11 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert "teams_user_id_idx" not in info
         assert "teams_status_idx" not in info
+        assert "teams_metadata_indexes_idx" not in info
         _assert_ungated_indexes_present(mongo_db)
 
     @pytest.mark.parametrize("raw", ["0", "false", "no", "FALSE", "No"])
-    def test_env_disabling_value_creates_neither_teams_index(
+    def test_env_disabling_value_creates_no_teams_index(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch, raw: str
     ) -> None:
         """``MONGO_TEAM_AUTO_INDEX`` in {0, false, no} disables, case-insensitively.
@@ -509,6 +629,7 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert "teams_user_id_idx" not in info
         assert "teams_status_idx" not in info
+        assert "teams_metadata_indexes_idx" not in info
         _assert_ungated_indexes_present(mongo_db)
 
     @pytest.mark.parametrize("raw", ["", "1", "true", "yes", "maybe"])
@@ -527,6 +648,7 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
 
     def test_explicit_argument_beats_the_disabling_environment(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
@@ -534,7 +656,8 @@ class TestMongoEventStoreMongoSpecific:
         """``auto_create_indexes=True`` overrides ``MONGO_TEAM_AUTO_INDEX=0``.
 
         A caller that knows its collection is small stays in control of its own
-        store even under a deployment-wide opt-out.
+        store even under a deployment-wide opt-out. Fails under an env-first or
+        truthiness-based resolution, which is the point.
         """
         monkeypatch.setenv("MONGO_TEAM_AUTO_INDEX", "0")
 
@@ -543,6 +666,7 @@ class TestMongoEventStoreMongoSpecific:
         info = mongo_db["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
 
     def test_auto_create_indexes_is_keyword_only(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
@@ -576,6 +700,276 @@ class TestMongoEventStoreMongoSpecific:
         assert {p.team_id for p in store.list_teams(status=TeamStatus.RUNNING)} == {
             running.team_id
         }
+
+    # --- metadata push-down --------------------------------------------------
+
+    def test_list_teams_pushes_metadata_into_the_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """``metadata`` reaches MongoDB as an ``$all`` term, not a Python pass.
+
+        An in-memory filter returns the identical list, so the assertion bites
+        on the query dict handed to ``find``. The expected entry is written as
+        a literal rather than built through the helper, so a change to the
+        separator or to the key/value ordering fails here instead of passing
+        symmetrically on both sides.
+        """
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        mongo_store.save_team(acme)
+        mongo_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="contoso")))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(metadata={"tenant": "acme"})
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {"metadata_indexes": {"$all": ["tenant|acme"]}}
+        assert [p.team_id for p in result] == [acme.team_id]
+
+    def test_list_teams_pushes_user_id_and_metadata_into_one_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """Both terms travel down in a single ``find`` call, ANDed.
+
+        ``user_id`` is a trust boundary: it is applied server-side regardless
+        of what metadata is asked for, never replaced by the more specific
+        term. Two ``find`` calls intersected afterwards, or a ``user_id``
+        dropped because metadata "already narrows enough", would both make a
+        metadata filter a way to reach another user's teams.
+        """
+        mine = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u1")
+        mongo_store.save_team(mine)
+        mongo_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u2"))
+        mongo_store.save_team(
+            make_indexed_process(AcmeTeamMetadata(tenant="contoso"), user_id="u1")
+        )
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {
+            "user_id": "u1",
+            "metadata_indexes": {"$all": ["tenant|acme"]},
+        }
+        assert [p.team_id for p in result] == [mine.team_id]
+
+    def test_list_teams_pushes_all_three_filters_into_one_find_filter(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """``user_id``, ``status`` and ``metadata`` coexist in one query dict.
+
+        The metadata term is additive: it must not displace the two filters
+        that were already pushed down before it existed.
+        """
+        wanted = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.RUNNING
+        )
+        mongo_store.save_team(wanted)
+        mongo_store.save_team(
+            make_indexed_process(
+                AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.STOPPED
+            )
+        )
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(
+                user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+            )
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {
+            "user_id": "u1",
+            "status": "running",
+            "metadata_indexes": {"$all": ["tenant|acme"]},
+        }
+        assert [p.team_id for p in result] == [wanted.team_id]
+
+    @pytest.mark.parametrize("metadata", [None, {}], ids=["none", "empty-dict"])
+    def test_list_teams_no_metadata_filter_carries_no_metadata_key(
+        self, mongo_store: MongoEventStore, metadata: dict[str, str] | None
+    ) -> None:
+        """``None`` and ``{}`` both leave the query dict without the key.
+
+        ``{}`` is the dangerous one: ``$all`` over an EMPTY array matches ZERO
+        documents in MongoDB, so an ``is not None`` gate would turn "no
+        metadata filter" into "no results". Asserting the key is ABSENT — not
+        just that the rows look right — is what catches it, and the teams are
+        seeded so the result-level assertion has something to lose too.
+        """
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        plain = make_indexed_process(None)
+        mongo_store.save_team(acme)
+        mongo_store.save_team(plain)
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(metadata=metadata)
+
+        spy_find.assert_called_once()
+        assert "metadata_indexes" not in spy_find.call_args.args[0]
+        assert {p.team_id for p in result} == {acme.team_id, plain.team_id}
+
+    def test_list_teams_does_not_filter_metadata_in_python(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """No post-hydration metadata comparison survives in the method body.
+
+        ``find`` is stubbed to hand back BOTH documents whatever filter the
+        store asks for. A surviving Python-side ``issubset`` would drop the
+        contoso team while leaving every result-level assertion elsewhere
+        green — which is exactly the false pin this test exists to catch.
+        """
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        contoso = make_indexed_process(AcmeTeamMetadata(tenant="contoso"))
+        mongo_store.save_team(acme)
+        mongo_store.save_team(contoso)
+
+        all_docs = list(mongo_store._teams.find({}))
+        with patch.object(mongo_store._teams, "find", return_value=iter(all_docs)):
+            result = mongo_store.list_teams(metadata={"tenant": "acme"})
+
+        assert {p.team_id for p in result} == {acme.team_id, contoso.team_id}
+
+    def test_list_teams_metadata_query_entries_carry_the_shared_escaping(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """A value holding a literal ``|`` is escaped in the query, as on write.
+
+        Both sides go through ``make_index_entry``, so ``acme|corp`` becomes
+        ``tenant|acme\\|corp`` and matches the entry the write path derived. A
+        hand-rolled ``f"{k}|{v}"`` would build ``tenant|acme|corp``, match
+        nothing, and be invisible to any test that only used pipe-free values.
+        """
+        piped = make_indexed_process(AcmeTeamMetadata(tenant="acme|corp"))
+        mongo_store.save_team(piped)
+        mongo_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(metadata={"tenant": "acme|corp"})
+
+        spy_find.assert_called_once()
+        assert spy_find.call_args.args[0] == {
+            "metadata_indexes": {"$all": ["tenant|acme\\|corp"]}
+        }
+        assert [p.team_id for p in result] == [piped.team_id]
+
+    def test_list_teams_does_not_branch_on_whether_the_index_exists(
+        self, mongo_client: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The read path is identical with and without ``ensure_indexes()``.
+
+        Two stores over the same fixtures, one indexed and one built with the
+        opt-out, issue the **same query dict** and return the same rows. What
+        this pins is that ``auto_create_indexes`` reaches provisioning only:
+        neither the filter the store builds nor the hydration that follows
+        consults ``index_information()`` or degrades itself when an index is
+        missing. A store that fell back to a different query shape — or failed
+        closed — while an index was provisioned out of band would turn a
+        performance valve into an outage.
+
+        **This does NOT demonstrate real index-independence, and must not be
+        read as evidence for it.** ``mongomock`` never consults an index when
+        answering a query: ``_iter_documents`` linearly scans every document
+        and applies the filter to each, so dropping an index cannot change its
+        results by construction and the row comparison below would hold even
+        for an implementation that genuinely depended on the index. The real
+        property — that a live MongoDB returns identical rows unindexed and
+        merely pays a collection scan for them — is not verifiable in this
+        package, which has no real-server test harness. It rests on MongoDB's
+        own guarantee that an index is an access path and never a filter.
+        """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
+        indexed_db = mongo_client["indexed"]
+        bare_db = mongo_client["bare"]
+        indexed = MongoEventStore(indexed_db)
+        bare = MongoEventStore(bare_db, auto_create_indexes=False)
+        fixtures = _metadata_fixtures()
+        for process in fixtures:
+            indexed.save_team(process)
+            bare.save_team(process)
+
+        assert "teams_metadata_indexes_idx" not in bare_db["teams"].index_information()
+        assert indexed_db["teams"].index_information()["teams_metadata_indexes_idx"][
+            "key"
+        ] == [("metadata_indexes", 1)]
+
+        # The load-bearing half: the query is built the same way either side of
+        # the opt-out. This is a construction-level assertion, which is the
+        # class of claim mongomock can actually support.
+        filters = {"tenant": "acme"}
+        with patch.object(bare._teams, "find", wraps=bare._teams.find) as bare_find:
+            from_bare = {p.team_id for p in bare.list_teams(metadata=filters)}
+        with patch.object(
+            indexed._teams, "find", wraps=indexed._teams.find
+        ) as indexed_find:
+            from_indexed = {p.team_id for p in indexed.list_teams(metadata=filters)}
+
+        bare_find.assert_called_once()
+        indexed_find.assert_called_once()
+        assert bare_find.call_args.args[0] == indexed_find.call_args.args[0]
+        assert bare_find.call_args.args[0] == {
+            "metadata_indexes": {"$all": ["tenant|acme"]}
+        }
+        assert from_bare == from_indexed
+        # Pinned absolutely too, so two equally broken stores cannot pass by
+        # agreeing on the empty set.
+        assert from_bare == {fixtures[i].team_id for i in (0, 1, 2)}
+        # Pinned absolutely too, so two equally broken stores cannot pass by
+        # agreeing on the empty set.
+        assert from_bare == {fixtures[i].team_id for i in (0, 1, 2)}
+
+    # --- cross-backend parity ------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "user_id,metadata,expected_indices",
+        [
+            (None, {"tenant": "acme"}, {0, 1, 2}),
+            (None, {"tenant": "acme", "case_ref": "C-1"}, {0}),
+            (None, {"tenant": "nobody-has-this"}, set()),
+            (None, {"case_ref": "C|1234"}, {1}),
+            (None, None, {0, 1, 2, 3, 4, 5}),
+            ("u1", {"tenant": "acme"}, {0, 1}),
+        ],
+        ids=["one-key", "two-keys", "no-such-value", "literal-pipe", "no-filter", "with-user-id"],
+    )
+    def test_mongo_and_yaml_agree_for_the_same_fixtures(
+        self,
+        mongo_store: MongoEventStore,
+        tmp_path: Path,
+        user_id: str | None,
+        metadata: dict[str, str] | None,
+        expected_indices: set[int],
+    ) -> None:
+        """The two backends return the same teams for the same filters.
+
+        Compared as sets of ``team_id`` — neither backend promises an ordering
+        — and both are additionally pinned against an absolute expectation, so
+        the two agreeing on a wrong answer (or on nothing, for the
+        no-such-value case) is not a pass.
+        """
+        from akgentic.team.repositories.yaml import YamlEventStore
+
+        yaml_store = YamlEventStore(tmp_path)
+        fixtures = _metadata_fixtures()
+        for process in fixtures:
+            mongo_store.save_team(process)
+            yaml_store.save_team(process)
+
+        expected = {fixtures[i].team_id for i in expected_indices}
+        from_mongo = {p.team_id for p in mongo_store.list_teams(user_id=user_id, metadata=metadata)}
+        from_yaml = {p.team_id for p in yaml_store.list_teams(user_id=user_id, metadata=metadata)}
+
+        assert from_mongo == expected
+        assert from_yaml == expected
 
     # --- Import guards ------------------------------------------------------
 

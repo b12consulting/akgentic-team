@@ -12,7 +12,10 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message, UserMessage
+from akgentic.core.utils.serializer import SerializableBaseModel
+from pydantic import Field
 
+from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -163,12 +166,28 @@ class SampleAgentState(BaseState):
     task_count: int = 0
 
 
+class AcmeTeamMetadata(TeamMetadata):
+    """Sample deployment metadata: two indexed fields plus an unindexed one."""
+
+    tenant: str = Field(default="acme", json_schema_extra={"indexed": True})
+    case_ref: str | None = Field(default=None, json_schema_extra={"indexed": True})
+    department: str = Field(default="")
+
+
+class PlainCardMetadata(SerializableBaseModel):
+    """A plain model a card may legally declare -- it carries no index contract."""
+
+    tenant: str = ""
+
+
 def make_process(
     team_id: uuid.UUID | None = None,
     team_card: TeamCard | None = None,
     status: TeamStatus = TeamStatus.RUNNING,
     user_id: str | None = None,
     catalog_namespace: str | None = None,
+    metadata: SerializableBaseModel | None = None,
+    metadata_indexes: list[str] | None = None,
 ) -> Process:
     """Create a Process with sensible defaults for testing.
 
@@ -181,6 +200,9 @@ def make_process(
             the underlying field falls back to its model default (``"cli"``
             per ``Process.user_id``). When a string, it is passed through.
         catalog_namespace: Optional catalog-namespace tag.
+        metadata: Optional business metadata value.
+        metadata_indexes: Optional pre-derived index entries. Passed through
+            verbatim -- the helper never derives them, matching Process itself.
 
     Returns:
         A Process with the specified or default configuration.
@@ -195,6 +217,8 @@ def make_process(
             created_at=now,
             updated_at=now,
             catalog_namespace=catalog_namespace,
+            metadata=metadata,
+            metadata_indexes=metadata_indexes or [],
         )
     return Process(
         team_id=team_id or uuid.uuid4(),
@@ -204,6 +228,40 @@ def make_process(
         created_at=now,
         updated_at=now,
         catalog_namespace=catalog_namespace,
+        metadata=metadata,
+        metadata_indexes=metadata_indexes or [],
+    )
+
+
+def make_indexed_process(
+    metadata: SerializableBaseModel | None,
+    team_id: uuid.UUID | None = None,
+    status: TeamStatus = TeamStatus.RUNNING,
+    user_id: str | None = None,
+) -> Process:
+    """Create a Process whose index is derived exactly as a write path derives it.
+
+    ``make_process`` passes ``metadata_indexes`` through verbatim and never
+    derives it -- matching ``Process`` itself, which accepts the index rather
+    than computing it. Filter tests need a team that looks the way the real
+    create/update paths leave one, so this composes the two: the value and its
+    index are seeded together, through the one derivation function.
+
+    Args:
+        metadata: The team's business metadata value, or ``None``.
+        team_id: Optional team identifier.
+        status: Lifecycle status.
+        user_id: Optional owning user id, defaulting as in ``make_process``.
+
+    Returns:
+        A Process carrying ``metadata`` and its derived index entries.
+    """
+    return make_process(
+        team_id=team_id,
+        status=status,
+        user_id=user_id,
+        metadata=metadata,
+        metadata_indexes=derive_metadata_indexes(metadata),
     )
 
 

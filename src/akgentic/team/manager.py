@@ -8,7 +8,9 @@ from datetime import UTC, datetime
 
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.orchestrator import STOP_TIMEOUT, EventSubscriber, Orchestrator
+from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.team.factory import TeamFactory
+from akgentic.team.metadata import derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
 from akgentic.team.restorer import TeamRestorer
@@ -66,6 +68,77 @@ class TeamManager:
         self._instance_id = instance_id or uuid.uuid4()
         self._runtimes: dict[uuid.UUID, TeamRuntime] = {}
 
+    @staticmethod
+    def _validate_metadata(
+        team_card: TeamCard,
+        metadata: SerializableBaseModel | None,
+    ) -> SerializableBaseModel | None:
+        """Validate a metadata value against the card's declared ``metadata_type``.
+
+        The single validation site for both write paths, so create and update can
+        never diverge on what a team's metadata is allowed to be (ADR-24 §D7).
+
+        ``None`` is always accepted, including on a card that declares a type:
+        metadata is optional, and a declared type constrains its shape, not its
+        presence.
+
+        Args:
+            team_card: The card whose ``metadata_type`` is the contract. On the
+                update path this is the card read back off the persisted
+                ``Process`` — the type declared at creation, never an argument,
+                so ``metadata_type`` cannot change for a live team.
+            metadata: The candidate value, or ``None``.
+
+        Returns:
+            The validated value as an instance of the declared type, or ``None``.
+
+        Raises:
+            ValueError: If a value is supplied but the card declares no
+                ``metadata_type``.
+            pydantic.ValidationError: If the value does not validate against the
+                declared type — propagates unchanged.
+        """
+        if metadata is None:
+            return None
+        if team_card.metadata_type is None:
+            msg = (
+                f"Team card '{team_card.name}' declares no metadata_type; "
+                f"metadata cannot be supplied"
+            )
+            raise ValueError(msg)
+        return team_card.metadata_type.model_validate(metadata)
+
+    def _push_metadata(
+        self,
+        team_id: uuid.UUID,
+        runtime: TeamRuntime,
+        metadata: SerializableBaseModel | None,
+    ) -> None:
+        """Push a validated metadata value to the live orchestrator, best-effort.
+
+        Called only AFTER the value and its re-derived index are persisted. A
+        failure here is logged and swallowed: the database — which is what team
+        listing filters on — stays truthful, and the orchestrator repopulates
+        from the ``Process`` on the next resume. Raising instead would let a
+        transient actor problem fail an operation that already succeeded.
+
+        Args:
+            team_id: The team whose metadata is being pushed.
+            runtime: The tracked runtime holding the orchestrator address.
+            metadata: The validated value, or ``None`` to clear it.
+        """
+        try:
+            orchestrator_proxy: Orchestrator = self._actor_system.proxy_tell(
+                runtime.orchestrator_addr, Orchestrator
+            )
+            orchestrator_proxy.set_metadata(metadata)
+        except Exception:
+            logger.warning(
+                "Failed to push metadata to orchestrator for team %s",
+                team_id,
+                exc_info=True,
+            )
+
     def create_team(
         self,
         team_card: TeamCard,
@@ -73,6 +146,8 @@ class TeamManager:
         user_email: str = "",
         team_id: uuid.UUID | None = None,
         catalog_namespace: str | None = None,
+        *,
+        metadata: SerializableBaseModel | None = None,
     ) -> TeamRuntime:
         """Create and start a new team from a TeamCard.
 
@@ -92,14 +167,25 @@ class TeamManager:
                 namespace this team was instantiated from. Stored verbatim on
                 the persisted ``Process``; ``akgentic-team`` does not interpret
                 it. Consumers read it back via ``get_team(team_id)``.
+            metadata: Optional business metadata, an instance of the card's
+                declared ``metadata_type``. Validated FIRST, before any actor is
+                started or any ``Process`` written, so a rejected value never
+                leaves a half-created team behind. Persisted alongside its
+                derived index, then pushed to the orchestrator best-effort.
 
         Returns:
             A TeamRuntime handle to the running team.
 
         Raises:
-            ValueError: If the TeamCard is invalid (e.g. entry_point headcount != 1).
+            ValueError: If the TeamCard is invalid (e.g. entry_point headcount != 1),
+                or if ``metadata`` is supplied for a card declaring no ``metadata_type``.
+            pydantic.ValidationError: If ``metadata`` does not validate against the
+                card's declared ``metadata_type``.
             Exception: Any exception from TeamFactory.build propagates unchanged.
         """
+        # Validate before anything is built or written — no half-created team.
+        validated_metadata = self._validate_metadata(team_card, metadata)
+
         if team_id is None:
             team_id = uuid.uuid4()
         logger.info("Creating team '%s' with id %s", team_card.name, team_id)
@@ -130,8 +216,14 @@ class TeamManager:
             created_at=now,
             updated_at=now,
             catalog_namespace=catalog_namespace,
+            metadata=validated_metadata,
+            metadata_indexes=derive_metadata_indexes(validated_metadata),
         )
         self._event_store.save_team(process)
+
+        # Database first, actor second — see _push_metadata
+        if validated_metadata is not None:
+            self._push_metadata(team_id, runtime, validated_metadata)
 
         # Register with service discovery
         self._service_registry.register_team(self._instance_id, team_id)
@@ -245,16 +337,14 @@ class TeamManager:
         # Track runtime for stop_team
         self._runtimes[team_id] = runtime
 
-        now = datetime.now(UTC)
-        updated_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.RUNNING,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=now,
-            catalog_namespace=process.catalog_namespace,
+        # Copy-with-override rather than a hand-listed rebuild: a lifecycle write
+        # changes the status and the timestamp and nothing else, so every other
+        # field — including the next one added to Process — is carried forward by
+        # construction instead of by remembering to list it. metadata_indexes
+        # travels verbatim and is NOT re-derived: this path does not change the
+        # value, and a second derivation site is how the index starts lying.
+        updated_process = process.model_copy(
+            update={"status": TeamStatus.RUNNING, "updated_at": datetime.now(UTC)}
         )
         self._event_store.save_team(updated_process)
 
@@ -346,17 +436,10 @@ class TeamManager:
                 team_id,
             )
 
-        # Persist STOPPED status
-        now = datetime.now(UTC)
-        updated_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.STOPPED,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=now,
-            catalog_namespace=process.catalog_namespace,
+        # Persist STOPPED status — copy-with-override for the same reason as
+        # resume_team: status and timestamp change, everything else rides along.
+        updated_process = process.model_copy(
+            update={"status": TeamStatus.STOPPED, "updated_at": datetime.now(UTC)}
         )
         self._event_store.save_team(updated_process)
 
@@ -367,3 +450,81 @@ class TeamManager:
         self._runtimes.pop(team_id, None)
 
         logger.info("Team %s stopped successfully", team_id)
+
+    def update_team_metadata(
+        self,
+        team_id: uuid.UUID,
+        metadata: SerializableBaseModel | None,
+    ) -> Process:
+        """Replace a team's business metadata (ADR-24 §D7).
+
+        Ordered validate -> single database write -> best-effort orchestrator
+        push. The database is written first on purpose: it is what team listing
+        filters on, so a failed push leaves the index truthful and self-heals on
+        the next resume, whereas an actor-first write would leave listing wrong
+        with no signal.
+
+        **Replace, never merge.** ``metadata`` is a complete document that must
+        validate on its own; a field set before and absent now is gone from both
+        the stored value and its index. ``None`` clears the metadata entirely.
+
+        The value is validated against the ``metadata_type`` the ``TeamCard``
+        declared at creation — read off the persisted ``Process``, so the type
+        cannot be changed for a live team.
+
+        Args:
+            team_id: The team whose metadata is being replaced.
+            metadata: The complete new value, or ``None`` to clear it.
+
+        Returns:
+            The persisted ``Process``, carrying the new value and its index.
+
+        Raises:
+            ValueError: If the team is not found, has been deleted, or the card
+                declares no ``metadata_type`` while a value is supplied.
+            pydantic.ValidationError: If the value does not validate against the
+                declared ``metadata_type``. Nothing is written in either case.
+        """
+        process = self._event_store.load_team(team_id)
+        if process is None:
+            logger.warning("Metadata update rejected: team %s not found", team_id)
+            msg = f"Team {team_id} not found"
+            raise ValueError(msg)
+        if process.status == TeamStatus.DELETED:
+            logger.warning("Metadata update rejected: team %s has been deleted", team_id)
+            msg = f"Cannot update metadata for team {team_id}: team has been deleted"
+            raise ValueError(msg)
+
+        validated_metadata = self._validate_metadata(process.team_card, metadata)
+
+        updated_process = Process(
+            team_id=process.team_id,
+            team_card=process.team_card,
+            status=process.status,
+            user_id=process.user_id,
+            user_email=process.user_email,
+            created_at=process.created_at,
+            updated_at=datetime.now(UTC),
+            catalog_namespace=process.catalog_namespace,
+            metadata=validated_metadata,
+            metadata_indexes=derive_metadata_indexes(validated_metadata),
+        )
+        self._event_store.save_team(updated_process)
+
+        # Database first, actor second — and only while the team is live
+        runtime = self._runtimes.get(team_id)
+        if process.status == TeamStatus.RUNNING and runtime is not None:
+            self._push_metadata(team_id, runtime, validated_metadata)
+        elif process.status == TeamStatus.RUNNING:
+            # RUNNING but untracked here: another worker owns it, or this worker
+            # restarted. Not an error — the write stands and the orchestrator
+            # repopulates from the Process on the next resume. Logged so a stale
+            # live value is explainable rather than mysterious.
+            logger.debug(
+                "Team %s is RUNNING but has no runtime tracked here — "
+                "metadata written, orchestrator push skipped",
+                team_id,
+            )
+
+        logger.info("Metadata updated for team %s", team_id)
+        return updated_process

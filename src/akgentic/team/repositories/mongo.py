@@ -27,6 +27,7 @@ except ImportError as exc:
 
 from pymongo.errors import PyMongoError
 
+from akgentic.team.metadata import make_index_entry
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -44,11 +45,12 @@ _AUTO_INDEX_ENV = "MONGO_TEAM_AUTO_INDEX"
 _AUTO_INDEX_DISABLING_VALUES = frozenset({"0", "false", "no"})
 
 # (key, index name) for the teams-collection indexes backing list_teams.
-# The name and key spec of teams_status_idx are load-bearing — see the
-# docstring of ensure_indexes.
+# Every name here is load-bearing, not cosmetic — see the docstring of
+# ensure_indexes.
 _TEAM_INDEX_SPECS: tuple[tuple[str, str], ...] = (
     ("user_id", "teams_user_id_idx"),
     ("status", "teams_status_idx"),
+    ("metadata_indexes", "teams_metadata_indexes_idx"),
 )
 
 
@@ -73,19 +75,29 @@ def ensure_indexes(
 ) -> None:
     """Create the teams-collection indexes backing the list_teams push-downs.
 
-    Creates ``teams_user_id_idx`` (``{"user_id": 1}``) and ``teams_status_idx``
-    (``{"status": 1}``) on the ``teams`` collection. The name and key spec of
-    ``teams_status_idx`` are load-bearing: the enterprise orphan reconciler
-    probes for exactly that name and stays fail-closed while it is absent, so a
-    rename leaves its sweeps silently suspended.
+    Creates ``teams_user_id_idx`` (``{"user_id": 1}``), ``teams_status_idx``
+    (``{"status": 1}``) and ``teams_metadata_indexes_idx``
+    (``{"metadata_indexes": 1}``) on the ``teams`` collection. Every name is
+    load-bearing: deployment tooling probes for literal index names — the
+    enterprise orphan reconciler waits on ``teams_status_idx`` and stays
+    fail-closed while it is absent — so a rename leaves those sweeps silently
+    suspended with no error anywhere.
+
+    ``teams_metadata_indexes_idx`` is a **multikey** index. That is not a
+    distinct index type to request: MongoDB derives it automatically from an
+    array-valued field, storing one entry per array element, which is exactly
+    what the ``$all`` containment query in :meth:`MongoEventStore.list_teams`
+    reads. Hence a plain single-field ascending spec here and no option to
+    pass (ADR-24 §D5).
 
     Idempotent — ``create_index`` returns silently when an index of the same
     name and key spec already exists, so this is safe across redeploys and safe
     to call from a constructor, an init container or a migration job alike. It
     is guarded per index: a backend that rejects a spec is logged at WARNING and
-    skipped, never raised, and a rejection of one index does not skip the other.
-    An index is an optimization; refusing to start is the worse outcome
-    (ADR-16 §5, ADR-23 §5).
+    skipped, never raised, and a rejection of one index does not skip the
+    others — which is why the ``try`` sits inside the loop rather than around
+    it. An index is an optimization; refusing to start is the worse outcome
+    (ADR-16 §5, ADR-23 §5, ADR-24 §D5).
 
     This covers the **teams** collection only. The ``events`` and
     ``agent_states`` indexes stay in :meth:`MongoEventStore.__init__` and are
@@ -221,20 +233,33 @@ class MongoEventStore:
         return process
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
         """Load team process snapshots from the teams collection.
 
-        Both filters are pushed into the same Mongo ``find`` filter dict —
-        ``{"user_id": ...}`` and ``{"status": ...}``. A parameter left at
+        All three filters are pushed into the same Mongo ``find`` filter dict
+        — ``{"user_id": ...}``, ``{"status": ...}`` and
+        ``{"metadata_indexes": {"$all": [...]}}``. A parameter left at
         ``None`` contributes no key, so ``list_teams()`` issues ``find({})``
-        and returns every team; supplying both yields one query whose terms
-        AND. The selection happens in MongoDB, never in Python after
-        hydration. The indexes (``teams_user_id_idx`` and
-        ``teams_status_idx``, both provisioned by :func:`ensure_indexes`)
-        only make the scan cheaper — an unindexed filter still returns the
-        right teams. Corrupted documents are skipped with a warning. See
-        ADR-16 §5 and ADR-23 §§5-6.
+        and returns every team; supplying several yields one query whose
+        terms AND. The selection happens in MongoDB, never in Python after
+        hydration, so a team that will not be returned is never transferred
+        or validated.
+
+        The indexes (``teams_user_id_idx``, ``teams_status_idx`` and the
+        multikey ``teams_metadata_indexes_idx``, all provisioned by
+        :func:`ensure_indexes`) only make the scan cheaper — an unindexed
+        filter still returns the right teams, which is what makes the
+        ``auto_create_indexes`` opt-out safe. Corrupted documents are skipped
+        with a warning. See ADR-16 §5, ADR-23 §§5-6 and ADR-24 §D5.
+
+        ``user_id`` is applied server-side unconditionally of the other two:
+        it is a trust boundary, not an optimization, and a metadata term is
+        caller-supplied and non-secret. Narrowing by metadata must never
+        become a way to reach another user's teams (ADR-24 §D5).
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -242,18 +267,34 @@ class MongoEventStore:
                 filter carries no ``user_id`` key. See ADR-16 §1.
             status: If provided, return only snapshots whose
                 ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. Combines
-                with ``user_id`` by AND. See ADR-23 §1.
+                lifecycle state is returned, including ``DELETED``. See
+                ADR-23 §1.
+            metadata: If provided, return only snapshots whose
+                ``metadata_indexes`` contains an entry for EVERY key/value
+                pair given. An empty dict matches everything, like ``None``.
+                See ADR-24 §D5.
 
         Returns:
-            List of loadable Process snapshots, filtered at the database
-            level by whichever of ``user_id`` and ``status`` were given.
+            List of loadable Process snapshots matching every filter given.
         """
-        query: dict[str, str] = {}
+        query: dict[str, object] = {}
         if user_id is not None:
             query["user_id"] = user_id
         if status is not None:
             query["status"] = status
+        # Truthiness, not `is not None`: `$all` over an EMPTY array matches
+        # zero documents in MongoDB, so an empty mapping arriving as "no
+        # filter" would leave as "no results" — a regression no result-level
+        # assertion over an empty store can see.
+        if metadata:
+            # Equality-only containment, one entry per key, AND-combined.
+            # Entries go through the same helper the write path derived with,
+            # so the `|` escaping cannot drift between the two sides and a
+            # value holding a literal `|` matches instead of forging a second
+            # entry.
+            query["metadata_indexes"] = {
+                "$all": [make_index_entry(key, value) for key, value in metadata.items()]
+            }
         teams: list[Process] = []
         for doc in self._teams.find(query):
             doc.pop("_id", None)

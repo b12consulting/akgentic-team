@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import Any
 
+from akgentic.team.metadata import make_index_entry
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -93,21 +94,32 @@ class InMemoryEventStore:
         self.agent_states[(snapshot.team_id, snapshot.agent_id)] = snapshot
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
-        """Load team process snapshots, honouring both Protocol filters.
+        """Load team process snapshots, honouring every Protocol filter.
 
         Kept at the full current Protocol shape so this fake cannot drift
-        from the real backends it stands in for: ``user_id`` and ``status``
-        are independent and combine with AND, and ``None`` on either means
-        "do not filter on that dimension" — so the no-arg call still returns
-        every team, ``DELETED`` ones included.
+        from the real backends it stands in for: ``user_id``, ``status`` and
+        ``metadata`` are independent and combine with AND, and ``None`` on
+        any of them means "do not filter on that dimension" — so the no-arg
+        call still returns every team, ``DELETED`` ones included. An empty
+        ``metadata`` dict is an empty conjunction and matches everything.
+
+        Metadata entries go through ``make_index_entry`` rather than being
+        formatted here, so the fake escapes ``|`` exactly as the derivation
+        path does and cannot pass a test the real backends would fail.
         """
         teams = list(self.teams.values())
         if user_id is not None:
             teams = [t for t in teams if t.user_id == user_id]
         if status is not None:
             teams = [t for t in teams if t.status == status]
+        if metadata:
+            entries = {make_index_entry(k, v) for k, v in metadata.items()}
+            teams = [t for t in teams if entries.issubset(set(t.metadata_indexes))]
         return teams
 
     def get_max_sequence(self, team_id: uuid.UUID) -> int:

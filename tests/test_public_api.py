@@ -30,6 +30,13 @@ def test_version_in_all() -> None:
     assert "__version__" in akgentic.team.__all__
 
 
+def test_metadata_contract_is_exported() -> None:
+    """The metadata base, the entry primitive and the derivation helper are public."""
+    for name in ("TeamMetadata", "make_index_entry", "derive_metadata_indexes"):
+        assert name in akgentic.team.__all__, f"{name} missing from __all__"
+        assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
+
+
 def test_module_is_importable() -> None:
     """akgentic.team is importable as a module."""
     mod = importlib.import_module("akgentic.team")

@@ -9,6 +9,11 @@ from __future__ import annotations
 from akgentic.team.factory import TeamFactory
 from akgentic.team.manager import TeamManager
 from akgentic.team.messages import WelcomeMessage
+from akgentic.team.metadata import (
+    TeamMetadata,
+    derive_metadata_indexes,
+    make_index_entry,
+)
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -44,11 +49,14 @@ __all__: list[str] = [
     "TeamCardMember",
     "TeamFactory",
     "TeamManager",
+    "TeamMetadata",
     "TeamRestorer",
     "TeamRuntime",
     "TeamStatus",
     "WelcomeMessage",
     "YamlEventStore",
+    "derive_metadata_indexes",
+    "make_index_entry",
 ]
 
 _mongo_available = False

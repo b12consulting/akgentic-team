@@ -22,8 +22,10 @@ from akgentic.core.messages.message import UserMessage
 from akgentic.team.models import TeamStatus
 from akgentic.team.ports import EventNotFoundError, EventStore
 from tests.models.conftest import (
+    AcmeTeamMetadata,
     SampleAgentState,
     make_agent_state_snapshot,
+    make_indexed_process,
     make_persisted_event,
     make_process,
 )
@@ -251,6 +253,222 @@ class TestEventStoreContract:
         event_store.save_team(make_process(user_id="u2", status=TeamStatus.STOPPED))
 
         assert event_store.list_teams(user_id="u2", status=TeamStatus.RUNNING) == []
+
+    def test_list_teams_metadata_and_combines_across_keys(
+        self, event_store: EventStore
+    ) -> None:
+        """A two-entry metadata filter requires BOTH entries, not either.
+
+        The partial team carries the ``tenant`` half, so an implementation
+        that ORed the entries — or honoured only the first — would return it
+        alongside the match.
+        """
+        both = make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1"))
+        tenant_only = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        other = make_indexed_process(AcmeTeamMetadata(tenant="contoso", case_ref="C-1"))
+        for process in (both, tenant_only, other):
+            event_store.save_team(process)
+
+        result = event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        assert {p.team_id for p in result} == {both.team_id}
+
+    def test_list_teams_metadata_and_combines_with_user_id(
+        self, event_store: EventStore
+    ) -> None:
+        """``metadata`` and ``user_id`` intersect: each term alone matches two teams."""
+        u1_acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u1")
+        u1_contoso = make_indexed_process(AcmeTeamMetadata(tenant="contoso"), user_id="u1")
+        u2_acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u2")
+        for process in (u1_acme, u1_contoso, u2_acme):
+            event_store.save_team(process)
+
+        result = event_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        assert {p.team_id for p in result} == {u1_acme.team_id}
+
+    def test_list_teams_metadata_and_combines_with_status(
+        self, event_store: EventStore
+    ) -> None:
+        """``metadata`` and ``status`` intersect, and ``DELETED`` is reachable."""
+        running = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.RUNNING
+        )
+        deleted = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.DELETED
+        )
+        running_contoso = make_indexed_process(
+            AcmeTeamMetadata(tenant="contoso"), status=TeamStatus.RUNNING
+        )
+        for process in (running, deleted, running_contoso):
+            event_store.save_team(process)
+
+        result = event_store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": "acme"})
+        assert {p.team_id for p in result} == {running.team_id}
+
+        # metadata alone does not implicitly constrain status.
+        unconstrained = event_store.list_teams(metadata={"tenant": "acme"})
+        assert {p.team_id for p in unconstrained} == {running.team_id, deleted.team_id}
+
+    def test_list_teams_all_three_filters_combine_with_and(
+        self, event_store: EventStore
+    ) -> None:
+        """Every filter is an independent conjunct; only the full match survives.
+
+        Each of the three decoys differs from the wanted team in exactly one
+        dimension, so every single term still matches three of the four teams
+        and only the conjunction narrows to one.
+        """
+        wanted = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.RUNNING
+        )
+        wrong_metadata = make_indexed_process(
+            AcmeTeamMetadata(tenant="contoso"), user_id="u1", status=TeamStatus.RUNNING
+        )
+        wrong_status = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.STOPPED
+        )
+        wrong_user = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u2", status=TeamStatus.RUNNING
+        )
+        for process in (wanted, wrong_metadata, wrong_status, wrong_user):
+            event_store.save_team(process)
+
+        result = event_store.list_teams(
+            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+        )
+        assert {p.team_id for p in result} == {wanted.team_id}
+
+    def test_list_teams_metadata_combination_no_team_satisfies_returns_empty(
+        self, event_store: EventStore
+    ) -> None:
+        """A combination no single team satisfies returns ``[]``, never a union.
+
+        Both entries match something on their own — they just never match the
+        same team. AND yields ``[]``; OR would yield two.
+        """
+        event_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+        event_store.save_team(
+            make_indexed_process(AcmeTeamMetadata(tenant="contoso", case_ref="C-9"))
+        )
+
+        assert event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-9"}) == []
+
+    def test_list_teams_metadata_unknown_key_returns_empty(
+        self, event_store: EventStore
+    ) -> None:
+        """A key no team carries matches nothing — including an unindexed field.
+
+        ``department`` is declared on the metadata model but not marked
+        indexed, so it never reaches the derived index. Filtering on it
+        matching nothing is what proves the filter reads the index rather
+        than the stored value.
+        """
+        event_store.save_team(
+            make_indexed_process(AcmeTeamMetadata(tenant="acme", department="ops"))
+        )
+
+        assert event_store.list_teams(metadata={"unknown_key": "acme"}) == []
+        assert event_store.list_teams(metadata={"department": "ops"}) == []
+
+    def test_list_teams_empty_metadata_dict_equals_no_metadata_filter(
+        self, event_store: EventStore
+    ) -> None:
+        """``metadata={}`` is an empty conjunction and matches everything.
+
+        Pinned explicitly so the behaviour is a decision rather than an
+        accident: the alternative reading — "only teams with no metadata" —
+        is defensible but inconsistent with how ``user_id=None`` and
+        ``status=None`` behave.
+        """
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        bare = make_process()
+        event_store.save_team(acme)
+        event_store.save_team(bare)
+
+        expected = {acme.team_id, bare.team_id}
+        assert {p.team_id for p in event_store.list_teams(metadata={})} == expected
+        assert {p.team_id for p in event_store.list_teams(metadata=None)} == expected
+        assert {p.team_id for p in event_store.list_teams()} == expected
+
+    def test_list_teams_metadata_does_not_widen_user_id_scope(
+        self, event_store: EventStore
+    ) -> None:
+        """SECURITY: a metadata filter can only narrow, never reach past ``user_id``.
+
+        Both users own a team carrying byte-identical metadata. Metadata is
+        caller-supplied and non-secret, so it must never become a way to
+        enumerate another owner's teams — the ``user_id`` scope is applied
+        server-side and stands regardless of what metadata is asked for.
+        """
+        u1 = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u1")
+        u2 = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u2")
+        event_store.save_team(u1)
+        event_store.save_team(u2)
+
+        result = event_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        assert [p.team_id for p in result] == [u1.team_id]
+
+        # And the unfiltered-by-metadata call is scoped identically, so the
+        # metadata term is what changed nothing about visibility.
+        assert [p.team_id for p in event_store.list_teams(user_id="u1")] == [u1.team_id]
+
+    def test_list_teams_teams_without_metadata_are_unaffected(
+        self, event_store: EventStore
+    ) -> None:
+        """A team carrying no metadata is returned by any call that does not filter on it.
+
+        This is the backwards-compatibility case: teams persisted before the
+        metadata contract existed carry no index and must keep listing
+        exactly as they did.
+        """
+        bare = make_process(user_id="u1", status=TeamStatus.RUNNING)
+        event_store.save_team(bare)
+
+        assert [p.team_id for p in event_store.list_teams()] == [bare.team_id]
+        assert [p.team_id for p in event_store.list_teams(user_id="u1")] == [bare.team_id]
+        assert [p.team_id for p in event_store.list_teams(status=TeamStatus.RUNNING)] == [
+            bare.team_id
+        ]
+        assert event_store.list_teams(metadata={"tenant": "acme"}) == []
+
+    def test_list_teams_metadata_value_containing_the_separator_matches_itself(
+        self, event_store: EventStore
+    ) -> None:
+        """Escaping is symmetric: a ``|`` in a value matches, and cannot forge an entry.
+
+        Query entries are built with the same ``make_index_entry`` the
+        derivation uses. A second, hand-rolled implementation in the query
+        path would drift on exactly this input — the value would stop
+        matching itself — and a crafted value could otherwise span two
+        separate entries.
+        """
+        piped = make_indexed_process(AcmeTeamMetadata(tenant="acme|corp"))
+        plain = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        event_store.save_team(piped)
+        event_store.save_team(plain)
+
+        assert [p.team_id for p in event_store.list_teams(metadata={"tenant": "acme|corp"})] == [
+            piped.team_id
+        ]
+        assert [p.team_id for p in event_store.list_teams(metadata={"tenant": "acme"})] == [
+            plain.team_id
+        ]
+
+    def test_list_teams_metadata_cannot_match_across_two_entries(
+        self, event_store: EventStore
+    ) -> None:
+        """A crafted value cannot span the boundary between two index entries.
+
+        The team stores ``tenant|acme`` and ``case_ref|C-1`` as two separate
+        entries. A query for a tenant literally named ``acme|case_ref|C-1``
+        must not match by concatenation — entries are compared whole.
+        """
+        team = make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1"))
+        event_store.save_team(team)
+
+        assert event_store.list_teams(metadata={"tenant": "acme|case_ref|C-1"}) == []
+        # The honest query for the same team still works.
+        result = event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        assert [p.team_id for p in result] == [team.team_id]
 
     # --- save_event / load_events ordering --------------------------------
 

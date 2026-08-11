@@ -8,7 +8,7 @@ from akgentic.core.messages import UserMessage
 
 from akgentic.team.models import TeamCard, TeamCardMember
 
-from .conftest import make_agent_card, make_team_card
+from .conftest import AcmeTeamMetadata, make_agent_card, make_team_card
 
 
 class TestTeamCardMember:
@@ -342,6 +342,45 @@ class TestTeamCardSerialization:
         restored = TeamCard.model_validate(dumped)
         assert restored.name == "singleton"
         assert set(restored.agent_cards.keys()) == {"only"}
+
+    def test_metadata_type_defaults_to_none(self) -> None:
+        """A card that declares no metadata schema has metadata_type None."""
+        assert make_team_card().metadata_type is None
+
+    def test_metadata_type_default_round_trips_unchanged(self) -> None:
+        """A card without metadata_type survives the round-trip still None."""
+        restored = TeamCard.model_validate(make_team_card().model_dump())
+        assert restored.metadata_type is None
+
+    def test_metadata_type_reloads_as_the_concrete_class(self) -> None:
+        """The declared schema reloads as the class object, not a dict or a path."""
+        team = TeamCard(
+            entry_point=TeamCardMember(card=make_agent_card(name="entry", role="Entry")),
+            metadata_type=AcmeTeamMetadata,
+        )
+        restored = TeamCard.model_validate(team.model_dump())
+        assert restored.metadata_type is AcmeTeamMetadata
+
+    def test_reloaded_metadata_type_can_validate_a_payload(self) -> None:
+        """The point of reloading the class: the caller can validate against it."""
+        team = TeamCard(
+            entry_point=TeamCardMember(card=make_agent_card(name="entry", role="Entry")),
+            metadata_type=AcmeTeamMetadata,
+        )
+        restored = TeamCard.model_validate(team.model_dump())
+        assert restored.metadata_type is not None
+        value = restored.metadata_type.model_validate({"tenant": "contoso"})
+        assert value.tenant == "contoso"
+
+    def test_team_card_takes_no_type_parameters(self) -> None:
+        """TeamCard is a plain model, never Generic[...].
+
+        A parameterised TeamCard[X] is a Pydantic-generated class with no stable
+        importable dotted path, which breaks the tagged-dict round-trip that
+        Process.team_card depends on to rebuild a team on resume.
+        """
+        assert TeamCard.__pydantic_generic_metadata__["parameters"] == ()
+        assert TeamCard.__pydantic_generic_metadata__["origin"] is None
 
     def test_message_types_round_trip(self) -> None:
         """message_types with actual type references survive round-trip."""
