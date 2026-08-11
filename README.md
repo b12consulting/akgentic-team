@@ -261,9 +261,10 @@ than in production:
 
 ```python
 class Broken(TeamMetadata):
-    owner: Contact = Field(json_schema_extra={"indexed": True})
-# TypeError: Broken.owner is marked indexed but is annotated ...
+    tags: list[str] = Field(default_factory=list, json_schema_extra={"indexed": True})
+# TypeError: Broken.tags is marked indexed but is annotated list[str].
 #            Indexed fields must be str, bool, int, UUID, Enum, date or datetime
+#            (optionally '| None').
 ```
 
 ### Declaring it on the TeamCard
@@ -369,7 +370,10 @@ Three properties are worth knowing:
 
 - **Derived on every write, never client-supplied.** `metadata_indexes` is
   recomputed from `metadata` each time the value is persisted, and the two are
-  never written independently. Nothing you pass in can set it.
+  never written independently. No metadata API accepts it: neither `create_team`
+  nor `update_team_metadata` takes an index argument, and both re-derive the
+  array from the value they were given. If you build a service on top of this,
+  keep it that way — a caller-supplied index is a lie the store cannot detect.
 - **An unset optional indexed field emits no entry.** Absent is not the empty
   string — a `channel=None` contributes nothing, where `channel=""` would
   contribute `"channel|"`.
@@ -390,7 +394,9 @@ Correctness never depends on the index. A missing or un-created index makes a
 query more expensive; it never changes which teams come back. That is what makes
 the MongoDB opt-out safe: pass `auto_create_indexes=False` (or set
 `MONGO_TEAM_AUTO_INDEX=0`) where the teams collection is too large to absorb a
-foreground index build at boot, and provision out of band instead:
+foreground index build at boot, and provision out of band instead. The opt-out
+covers the `teams` collection only — the `events` and `agent_states` indexes are
+always created:
 
 ```bash
 python -m akgentic.team.scripts.init_mongo
