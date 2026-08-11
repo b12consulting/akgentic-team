@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-team"
-version = "1.5.1"
+version = "1.5.2"
 description = "Team lifecycle management — create, resume, stop, delete teams with event-sourced persistence"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,7 +22,7 @@ keywords = ["agents", "ai", "akgentic", "teams", "lifecycle"]
 dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
-    "akgentic-core>=1.5.0",
+    "akgentic-core>=1.5.2",
 ]
 
 [project.optional-dependencies]
