@@ -15,6 +15,7 @@ with event-sourced persistence and crash recovery.
 - [Architecture](#architecture)
 - [Team Definitions](#team-definitions)
 - [Lifecycle Management](#lifecycle-management)
+- [Team Metadata](#team-metadata)
 - [Persistence](#persistence)
 - [CLI](#cli)
 - [Examples](#examples)
@@ -218,6 +219,190 @@ runtime.send_to("@Reviewer", message)    # directed messaging
 runtime.id                                # team UUID
 runtime.addrs                             # agent name → ActorAddress
 ```
+
+## Team Metadata
+
+A team can carry typed business metadata — the tenant it belongs to, the case
+it was opened for, the channel it came in on — and teams can be listed by it.
+The schema is yours: you declare a model, mark the fields you want to filter
+on, and hand the class to the `TeamCard`.
+
+### Defining a metadata schema
+
+Subclass `TeamMetadata` and mark each filterable field with
+`Field(json_schema_extra={"indexed": True})`:
+
+```python
+from pydantic import Field
+
+from akgentic.team import TeamMetadata
+
+
+class SupportCaseMetadata(TeamMetadata):
+    """Business context carried by each support-desk team instance."""
+
+    tenant: str = Field(json_schema_extra={"indexed": True})
+    case_ref: str = Field(json_schema_extra={"indexed": True})
+    channel: str | None = Field(default=None, json_schema_extra={"indexed": True})
+    notes: str = ""  # not marked — stored and returned, never filterable
+```
+
+Unmarked fields are ordinary model fields: they are persisted with the team and
+come back on every read, they are simply not something you can filter on. A
+subclass with no marked field at all is legal — it is just not filterable.
+
+**Only indexed fields are restricted to scalars.** A marked field must be
+annotated `str`, `bool`, `int`, `UUID`, `Enum`, `date` or `datetime` (optionally
+`| None`); `float` is excluded, because float equality is not a sound index key.
+The model *itself* may nest freely — sub-models, lists and dicts are all fine as
+unmarked fields. Marking a non-scalar raises `TypeError` **when the class is
+defined**, not when a write happens, so a bad declaration fails at import rather
+than in production:
+
+```python
+class Broken(TeamMetadata):
+    owner: Contact = Field(json_schema_extra={"indexed": True})
+# TypeError: Broken.owner is marked indexed but is annotated ...
+#            Indexed fields must be str, bool, int, UUID, Enum, date or datetime
+```
+
+### Declaring it on the TeamCard
+
+`TeamCard.metadata_type` declares which model this team's metadata must be:
+
+```python
+team_card = TeamCard(
+    name="support-desk",
+    description="Handles inbound support cases",
+    entry_point=TeamCardMember(card=triage_card),
+    members=[TeamCardMember(card=agent_card)],
+    metadata_type=SupportCaseMetadata,
+)
+```
+
+`metadata_type` is a declared type field, not a generic parameter — there is no
+`TeamCard[SupportCaseMetadata]`. A card that leaves it `None` **rejects**
+metadata rather than ignoring it: supplying a value raises `ValueError`, so a
+value can never be silently dropped.
+
+### Setting and updating the value
+
+Pass the value at creation, and replace it afterwards through
+`TeamManager.update_team_metadata`:
+
+```python
+runtime = manager.create_team(
+    team_card,
+    metadata=SupportCaseMetadata(tenant="acme", case_ref="C-1234", channel="email"),
+)
+
+# Later — a complete replacement, returning the persisted Process
+process = manager.update_team_metadata(
+    runtime.id,
+    SupportCaseMetadata(tenant="acme", case_ref="C-1234", channel="phone"),
+)
+
+manager.update_team_metadata(runtime.id, None)  # clears the metadata entirely
+```
+
+**Replace, never merge.** The value you pass is the complete document and must
+validate on its own; a field that was set before and is absent now is gone from
+both the stored value and its index. `None` clears the metadata.
+
+The value is validated against the `metadata_type` the card declared *at
+creation* — read back off the persisted team — so `metadata_type` cannot be
+changed for a live team. A value that fails validation raises
+`pydantic.ValidationError` and nothing is written.
+
+### Filtering teams
+
+`EventStore.list_teams` takes a plain `dict[str, str]` of key/value pairs:
+
+```python
+from akgentic.team import TeamStatus
+
+teams = event_store.list_teams(
+    user_id="alice",
+    status=TeamStatus.RUNNING,
+    metadata={"tenant": "acme", "channel": "email"},
+)
+```
+
+Every key AND-combines with every other key, and the whole metadata filter
+AND-combines with `user_id` and `status`. A filter left at `None` constrains
+nothing; adding one can only narrow the result set, never widen it. An empty
+dict is an empty conjunction and behaves exactly like `None`. Values are matched
+against the *rendered* form of the stored field, so a typed field is filtered by
+passing its rendered string (`"true"` for a `bool`, the ISO form for a `date`).
+
+`user_id` scoping is applied server-side in every backend and is never weakened
+by a metadata term — metadata is caller-supplied and non-secret, so narrowing by
+it must not become a way to reach another owner's teams.
+
+### The limits — read this before designing around metadata
+
+> **Equality only.** A metadata filter matches a key to an exact value and
+> nothing else. There are **no range queries, no prefix matching, no substring
+> matching, and no sort-by-metadata**. `priority > 3` cannot be expressed
+> through this mechanism at all; it would need a different index and a separate
+> design decision. Filtering by creation time is *not* an example of this limit
+> — `Process.created_at` is a first-class typed field, unrelated to metadata.
+
+> **Filtering narrows, it does not paginate.** `list_teams` returns *every*
+> matching team, and callers slice afterwards. A filter selecting 20 teams out
+> of 5,000 still hydrates all 20 matches and still hands the caller all 20 —
+> metadata filtering reduces the size of the result set, not the cost of a page.
+> Store-side pagination push-down is a separate decision and does not ship here.
+
+### How the index works
+
+Indexed fields are flattened into a `Process.metadata_indexes` array of
+`"key|value"` strings. For
+`SupportCaseMetadata(tenant="acme", case_ref="C-1234", channel="email")` the
+derived entries are:
+
+```
+["tenant|acme", "case_ref|C-1234", "channel|email"]
+```
+
+Three properties are worth knowing:
+
+- **Derived on every write, never client-supplied.** `metadata_indexes` is
+  recomputed from `metadata` each time the value is persisted, and the two are
+  never written independently. Nothing you pass in can set it.
+- **An unset optional indexed field emits no entry.** Absent is not the empty
+  string — a `channel=None` contributes nothing, where `channel=""` would
+  contribute `"channel|"`.
+- **`|` is the separator and is escaped inside values.** `tenant="acme|contoso"`
+  derives the single entry `tenant|acme\|contoso`, not two entries, so a value
+  containing a pipe cannot forge a second index entry. Queries are built through
+  the same helper as the derivation, so the two sides can never disagree.
+
+### Backend support
+
+| Backend | How the filter runs | Index |
+|---|---|---|
+| YAML | in-memory containment, applied to the raw parsed mapping before validation | none — the backend is here for parity, not throughput |
+| MongoDB | pushed down into the same `find` filter as `user_id` and `status` | multikey `teams_metadata_indexes_idx`, provisioned by `ensure_indexes()` |
+| PostgreSQL | interim in-memory filter after hydration — **push-down deferred** | none yet |
+
+Correctness never depends on the index. A missing or un-created index makes a
+query more expensive; it never changes which teams come back. That is what makes
+the MongoDB opt-out safe: pass `auto_create_indexes=False` (or set
+`MONGO_TEAM_AUTO_INDEX=0`) where the teams collection is too large to absorb a
+foreground index build at boot, and provision out of band instead:
+
+```bash
+python -m akgentic.team.scripts.init_mongo
+```
+
+The PostgreSQL backend returns correct results today, but selects them in Python
+after loading the rows — the database-side push-down is deferred. Do not
+provision an index for a query that does not yet exist.
+
+> **Not to be confused with `AgentCard.metadata`**, which is a free-form
+> annotation bag on an individual agent. `Process.metadata` is the team's typed,
+> filterable value described here; the two share a word and nothing else.
 
 ## Persistence
 
