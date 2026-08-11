@@ -500,7 +500,7 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
 
     def test_metadata_index_rejection_is_logged_and_construction_still_succeeds(
-        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Rejecting only the metadata spec warns by name and does not raise.
 
@@ -509,7 +509,13 @@ class TestMongoEventStoreMongoSpecific:
         refused to construct because one index was unavailable would turn a
         capability gap into a server that will not boot, while ``list_teams``
         would have returned correct results the whole time.
+
+        The environment is normalised first: this test asserts on a warning
+        that is only reachable when the build is actually attempted, so an
+        ambient ``MONGO_TEAM_AUTO_INDEX=0`` would skip provisioning entirely
+        and fail it for a reason that has nothing to do with the guard.
         """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
         real_create_index = type(mongo_db["teams"]).create_index
 
         def _reject_metadata(self: Any, keys: Any, **kwargs: Any) -> Any:
@@ -535,16 +541,21 @@ class TestMongoEventStoreMongoSpecific:
         ]
 
     def test_teams_index_rejection_does_not_block_construction(
-        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A backend that rejects the teams specs must not stop the process.
 
-        The wrapper refuses only the two teams indexes and delegates every
+        The wrapper refuses only the three teams indexes and delegates every
         other key: a patch that rejected everything would take construction
         down on the ungated ``(team_id, sequence)`` index and prove nothing
         about the teams guard. ``mongomock`` shares one ``Collection`` class
         across collections, so the patch is seen by all of them.
+
+        The environment is normalised first for the same reason as the
+        metadata-only rejection test above: an ambient opt-out would skip the
+        build and leave nothing to warn about.
         """
+        monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
         real_create_index = type(mongo_db["teams"]).create_index
         rejected = {"teams_user_id_idx", "teams_status_idx", "teams_metadata_indexes_idx"}
 
@@ -845,21 +856,36 @@ class TestMongoEventStoreMongoSpecific:
         ) as spy_find:
             result = mongo_store.list_teams(metadata={"tenant": "acme|corp"})
 
+        spy_find.assert_called_once()
         assert spy_find.call_args.args[0] == {
             "metadata_indexes": {"$all": ["tenant|acme\\|corp"]}
         }
         assert [p.team_id for p in result] == [piped.team_id]
 
-    def test_metadata_filter_results_are_identical_without_the_index(
+    def test_list_teams_does_not_branch_on_whether_the_index_exists(
         self, mongo_client: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Correctness never depends on the index — only speed does.
+        """The read path is identical with and without ``ensure_indexes()``.
 
         Two stores over the same fixtures, one indexed and one built with the
-        opt-out, must answer the same filter identically. This is the invariant
-        that makes ``auto_create_indexes=False`` safe to hand an operator: a
-        store that failed closed while an index was provisioned out of band
-        would turn a performance valve into an outage.
+        opt-out, issue the **same query dict** and return the same rows. What
+        this pins is that ``auto_create_indexes`` reaches provisioning only:
+        neither the filter the store builds nor the hydration that follows
+        consults ``index_information()`` or degrades itself when an index is
+        missing. A store that fell back to a different query shape — or failed
+        closed — while an index was provisioned out of band would turn a
+        performance valve into an outage.
+
+        **This does NOT demonstrate real index-independence, and must not be
+        read as evidence for it.** ``mongomock`` never consults an index when
+        answering a query: ``_iter_documents`` linearly scans every document
+        and applies the filter to each, so dropping an index cannot change its
+        results by construction and the row comparison below would hold even
+        for an implementation that genuinely depended on the index. The real
+        property — that a live MongoDB returns identical rows unindexed and
+        merely pays a collection scan for them — is not verifiable in this
+        package, which has no real-server test harness. It rests on MongoDB's
+        own guarantee that an index is an access path and never a filter.
         """
         monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
         indexed_db = mongo_client["indexed"]
@@ -876,9 +902,27 @@ class TestMongoEventStoreMongoSpecific:
             "key"
         ] == [("metadata_indexes", 1)]
 
+        # The load-bearing half: the query is built the same way either side of
+        # the opt-out. This is a construction-level assertion, which is the
+        # class of claim mongomock can actually support.
         filters = {"tenant": "acme"}
-        from_bare = {p.team_id for p in bare.list_teams(metadata=filters)}
-        assert from_bare == {p.team_id for p in indexed.list_teams(metadata=filters)}
+        with patch.object(bare._teams, "find", wraps=bare._teams.find) as bare_find:
+            from_bare = {p.team_id for p in bare.list_teams(metadata=filters)}
+        with patch.object(
+            indexed._teams, "find", wraps=indexed._teams.find
+        ) as indexed_find:
+            from_indexed = {p.team_id for p in indexed.list_teams(metadata=filters)}
+
+        bare_find.assert_called_once()
+        indexed_find.assert_called_once()
+        assert bare_find.call_args.args[0] == indexed_find.call_args.args[0]
+        assert bare_find.call_args.args[0] == {
+            "metadata_indexes": {"$all": ["tenant|acme"]}
+        }
+        assert from_bare == from_indexed
+        # Pinned absolutely too, so two equally broken stores cannot pass by
+        # agreeing on the empty set.
+        assert from_bare == {fixtures[i].team_id for i in (0, 1, 2)}
         # Pinned absolutely too, so two equally broken stores cannot pass by
         # agreeing on the empty set.
         assert from_bare == {fixtures[i].team_id for i in (0, 1, 2)}
