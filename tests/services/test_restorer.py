@@ -2255,9 +2255,11 @@ class TestRestoreRepopulatesMetadata:
     ) -> None:
         """AC1: the value comes back equal AND as the concrete subclass.
 
-        The type assertion is not a nicety: a value that returned equal but
-        base-typed would mean the tagged-dict round trip had collapsed the
-        subclass, and every caller reading its own fields would break.
+        The type assertion pins the push itself: what reaches the orchestrator
+        is the value, not a base-typed copy of it. It does NOT exercise the
+        ``__model__`` tagged-dict round trip -- the fake store holds the
+        ``Process`` by reference, so nothing here is ever serialized. That
+        round trip is pinned in ``tests/models/test_process.py``.
         """
         metadata = AcmeSupportMetadata(tenant="acme", channel="email", note="n")
         team_id, process = _stopped_team_with_metadata(event_store, metadata)
@@ -2329,9 +2331,11 @@ class TestRestoreRepopulatesMetadata:
         restorer = TeamRestorer(actor_system, event_store)
         runtime = restorer.restore(process)
 
+        # Pin what the snapshot store actually holds: one unrelated state and
+        # nothing carrying metadata. An `isinstance(..., BaseState)` check here
+        # would pass for any implementation -- the field is typed BaseState.
         snapshots = event_store.load_agent_states(team_id)
-        assert snapshots != []
-        assert all(isinstance(snap.state, BaseState) for snap in snapshots)
+        assert [snap.state for snap in snapshots] == [_MarkerState(marker="unrelated")]
         assert _read_orchestrator_metadata(actor_system, runtime) == metadata
 
     def test_agent_spawned_during_restore_observes_the_metadata(
