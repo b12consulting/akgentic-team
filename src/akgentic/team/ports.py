@@ -123,10 +123,16 @@ class EventStore(Protocol):
         is caller-supplied and non-secret, so it must not become a way to reach
         another owner's teams.
 
-        Implementations MUST push every filter down to the backend (SQL WHERE,
-        Mongo find filter, directory-walk skip) rather than load-all-then-filter
-        in Python — the infra boot path lists RUNNING teams across the whole
-        store.
+        Results MUST be identical whatever strategy an implementation uses;
+        where the filter runs is a performance property, not a semantic one.
+        Beyond that, implementations MUST push each filter down to the backend
+        (SQL WHERE, Mongo find filter, directory-walk skip) wherever the backend
+        allows it, rather than load-all-then-filter in Python — the infra boot
+        path lists RUNNING teams across the whole store. A backend that cannot
+        yet express a term says so at the filter and keeps the terms it can
+        express pushed down; ``user_id`` scoping is the one term that is always
+        applied server-side, because it is a trust boundary rather than an
+        optimisation.
 
         See ADR-23 §1 and ADR-24 §D5 for the additive, backwards-compatible
         Protocol changes.

@@ -39,6 +39,14 @@ from tests.models.conftest import (
     make_process,
 )
 
+_DELETE_KEY = object()
+"""Parametrize control token meaning "remove the key" rather than "store this value".
+
+A dedicated object rather than a string: the cases it sits beside ARE arbitrary
+values, one of them already a bare string, so a string token would share their
+value space and a future case could silently mean deletion instead.
+"""
+
 
 @pytest.fixture
 def yaml_store(tmp_path: Path) -> YamlEventStore:
@@ -206,7 +214,7 @@ class TestYamlEventStoreYamlSpecific:
     @pytest.mark.parametrize(
         "corrupt",
         [
-            pytest.param("delete", id="key-missing"),
+            pytest.param(_DELETE_KEY, id="key-missing"),
             pytest.param(None, id="null-value"),
             pytest.param({"not": "a list"}, id="mapping-not-a-list"),
             pytest.param("tenant|acme", id="bare-string-not-a-list"),
@@ -228,7 +236,7 @@ class TestYamlEventStoreYamlSpecific:
         yaml_store.save_team(bad)
         team_path = tmp_path / str(bad.team_id) / "team.yaml"
         data = yaml.safe_load(team_path.read_text())
-        if corrupt == "delete":
+        if corrupt is _DELETE_KEY:
             del data["metadata_indexes"]
         else:
             data["metadata_indexes"] = corrupt
