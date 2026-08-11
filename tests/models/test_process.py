@@ -16,6 +16,7 @@ from akgentic.team.models import (
 )
 
 from .conftest import (
+    AcmeTeamMetadata,
     SampleAgentState,
     make_agent_state_snapshot,
     make_persisted_event,
@@ -127,6 +128,58 @@ class TestProcess:
         data.pop("catalog_namespace", None)
         restored = Process.model_validate(data)
         assert restored.catalog_namespace is None
+
+
+class TestProcessMetadata:
+    """Tests for Process.metadata and Process.metadata_indexes."""
+
+    def test_metadata_and_indexes_default_to_none_and_empty(self) -> None:
+        process = make_process()
+        assert process.metadata is None
+        assert process.metadata_indexes == []
+
+    def test_metadata_reloads_as_the_concrete_subclass(self) -> None:
+        """Polymorphic reload: the value comes back typed, not as the base or a dict."""
+        process = make_process(metadata=AcmeTeamMetadata(tenant="acme", case_ref="c-1"))
+        restored = Process.model_validate(process.model_dump())
+        assert type(restored.metadata) is AcmeTeamMetadata
+        assert restored.metadata.tenant == "acme"
+        assert restored.metadata.case_ref == "c-1"
+
+    def test_metadata_indexes_round_trip_verbatim(self) -> None:
+        process = make_process(
+            metadata=AcmeTeamMetadata(tenant="acme"),
+            metadata_indexes=["tenant|acme"],
+        )
+        restored = Process.model_validate(process.model_dump())
+        assert restored.metadata_indexes == ["tenant|acme"]
+
+    def test_metadata_indexes_are_never_derived_on_construction(self) -> None:
+        """Setting metadata alone does not populate the index -- write paths do that.
+
+        Deriving here would fire on every read of a persisted document and mask a
+        write path that forgot to update the index alongside the value.
+        """
+        process = make_process(metadata=AcmeTeamMetadata(tenant="acme"))
+        assert process.metadata_indexes == []
+
+    def test_metadata_indexes_are_never_derived_on_read(self) -> None:
+        """A persisted document with a value but a stale-empty index stays empty."""
+        process = make_process(metadata=AcmeTeamMetadata(tenant="acme"))
+        restored = Process.model_validate(process.model_dump())
+        assert restored.metadata_indexes == []
+
+    def test_legacy_payload_without_any_metadata_key_loads(self) -> None:
+        """A document persisted before this change loads with no migration."""
+        process = make_process()
+        data = process.model_dump()
+        data.pop("metadata", None)
+        data.pop("metadata_indexes", None)
+        data["team_card"].pop("metadata_type", None)
+        restored = Process.model_validate(data)
+        assert restored.metadata is None
+        assert restored.metadata_indexes == []
+        assert restored.team_card.metadata_type is None
 
 
 class TestPersistedEvent:
