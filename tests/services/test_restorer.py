@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -25,7 +25,10 @@ from akgentic.core.messages.orchestrator import (
     StopMessage,
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
+from akgentic.core.utils.serializer import SerializableBaseModel
+from pydantic import Field
 
+from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import (
     PersistedEvent,
     Process,
@@ -2160,3 +2163,207 @@ class TestRestorerReemitStateOnRestore:
 
         assert events_after == events_before, "Re-emit must not append to the event log"
         assert states_after == states_before, "Re-emit must not write the snapshot store"
+
+
+# ---------------------------------------------------------------------------
+# Tests: restore repopulates the orchestrator's team metadata (Story 27-6)
+# ---------------------------------------------------------------------------
+
+
+class AcmeSupportMetadata(TeamMetadata):
+    """Business metadata for the acme deployment used by the restore tests."""
+
+    tenant: str = Field(json_schema_extra={"indexed": True})
+    channel: str = Field(json_schema_extra={"indexed": True})
+    note: str = ""
+
+
+class MetadataProbeAgent(Akgent[BaseConfig, BaseState]):
+    """Agent that reads the orchestrator's metadata from its own ``on_start``.
+
+    This is how the placement of the push is pinned as behaviour rather than as
+    call ordering: the probe is spawned at step 2c, so it can only observe a
+    value that was already set at 2b-bis. A push moved to the end of phase 2 --
+    or dropped -- leaves it recording ``None``.
+
+    ``actor_system`` is injected by the test because an agent has no handle on
+    one; ``observed`` collects what each spawned instance saw.
+    """
+
+    actor_system: ClassVar[ActorSystem | None] = None
+    observed: ClassVar[list[SerializableBaseModel | None]] = []
+
+    def on_start(self) -> None:
+        """Record the orchestrator's metadata as seen at spawn time."""
+        super().on_start()
+        system = MetadataProbeAgent.actor_system
+        orchestrator = self.orchestrator
+        if system is None or orchestrator is None:  # pragma: no cover - guard only
+            return
+        # A timeout rather than an unbounded wait: a regression that deadlocked
+        # the spawn path should fail the test, not hang the suite.
+        proxy: Orchestrator = system.proxy_ask(orchestrator, Orchestrator, timeout=10.0)
+        MetadataProbeAgent.observed.append(proxy.get_metadata())
+
+
+def _stopped_team_with_metadata(
+    event_store: InMemoryEventStore,
+    metadata: SerializableBaseModel | None,
+    team_card: TeamCard | None = None,
+) -> tuple[uuid.UUID, Process]:
+    """Build a stopped team whose persisted ``Process`` carries *metadata*.
+
+    Reuses ``_populate_stopped_team`` and overrides only the metadata pair, so
+    the fixture differs from every other restore fixture in this file by exactly
+    the value under test -- including in having no agent-state snapshots.
+
+    Returns:
+        Tuple of (team_id, the re-persisted STOPPED Process).
+    """
+    tc = team_card or _make_team_card()
+    tc.metadata_type = type(metadata) if metadata is not None else None
+    team_id, process = _populate_stopped_team(event_store, tc)
+    process = process.model_copy(
+        update={
+            "metadata": metadata,
+            "metadata_indexes": derive_metadata_indexes(metadata),
+        }
+    )
+    event_store.save_team(process)
+    return team_id, process
+
+
+def _read_orchestrator_metadata(
+    actor_system: ActorSystem, runtime: TeamRuntime
+) -> SerializableBaseModel | None:
+    """Read the restored orchestrator's metadata over the public proxy API."""
+    proxy: Orchestrator = actor_system.proxy_ask(runtime.orchestrator_addr, Orchestrator)
+    return proxy.get_metadata()
+
+
+class TestRestoreRepopulatesMetadata:
+    """AC 1-4, 6: restore pushes ``Process.metadata`` onto the rebuilt orchestrator.
+
+    Every read here goes through ``ActorSystem.proxy_ask`` (AC6); nothing reaches
+    into actor internals to observe or set the value.
+    """
+
+    def test_restore_repopulates_metadata_with_its_concrete_type(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC1: the value comes back equal AND as the concrete subclass.
+
+        The type assertion is not a nicety: a value that returned equal but
+        base-typed would mean the tagged-dict round trip had collapsed the
+        subclass, and every caller reading its own fields would break.
+        """
+        metadata = AcmeSupportMetadata(tenant="acme", channel="email", note="n")
+        team_id, process = _stopped_team_with_metadata(event_store, metadata)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        restored = _read_orchestrator_metadata(actor_system, runtime)
+        assert type(restored) is AcmeSupportMetadata
+        assert restored == metadata
+
+    def test_restore_without_metadata_leaves_it_none(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC3: no metadata is not an error -- restore completes, value stays None."""
+        team_id, process = _stopped_team_with_metadata(event_store, None)
+        assert process.metadata is None
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert _read_orchestrator_metadata(actor_system, runtime) is None
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_metadata_restored_with_an_empty_snapshot_store(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC4: nothing in the snapshot store, yet the value is back.
+
+        This is the whole reason the story exists -- metadata is deliberately
+        not a ``BaseState`` field, so the replay path that recovers agent state
+        recovers nothing here.
+        """
+        metadata = AcmeSupportMetadata(tenant="acme", channel="chat")
+        team_id, process = _stopped_team_with_metadata(event_store, metadata)
+        assert event_store.load_agent_states(team_id) == []
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert _read_orchestrator_metadata(actor_system, runtime) == metadata
+
+    def test_metadata_restored_when_snapshots_carry_unrelated_state(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC4: snapshots exist but none carries metadata -- it is still restored."""
+        from akgentic.team.models import AgentStateSnapshot
+
+        metadata = AcmeSupportMetadata(tenant="contoso", channel="voice")
+        team_id, process = _stopped_team_with_metadata(event_store, metadata)
+
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+        event_store.save_agent_state(
+            AgentStateSnapshot(
+                team_id=team_id,
+                agent_id=str(lead_agent_id),
+                name="lead",
+                state=_MarkerState(marker="unrelated"),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        snapshots = event_store.load_agent_states(team_id)
+        assert snapshots != []
+        assert all(isinstance(snap.state, BaseState) for snap in snapshots)
+        assert _read_orchestrator_metadata(actor_system, runtime) == metadata
+
+    def test_agent_spawned_during_restore_observes_the_metadata(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC2: the push lands before the remaining agents are spawned.
+
+        Asserted as behaviour -- what a restored agent actually sees at start-up
+        -- rather than by inspecting the order of calls the restorer makes.
+        """
+        MetadataProbeAgent.actor_system = actor_system
+        MetadataProbeAgent.observed = []
+        try:
+            metadata = AcmeSupportMetadata(tenant="acme", channel="email")
+            tc = _make_team_card(
+                entry_point=_make_member("lead", "Lead", agent_class=MetadataProbeAgent)
+            )
+            team_id, process = _stopped_team_with_metadata(event_store, metadata, tc)
+
+            restorer = TeamRestorer(actor_system, event_store)
+            runtime = restorer.restore(process)
+            assert runtime.addrs["lead"].is_alive()
+
+            # on_start runs on the probe's own thread, so wait for it to record
+            # rather than assuming restore() outran it.
+            deadline = time.monotonic() + 5.0
+            while not MetadataProbeAgent.observed and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            assert MetadataProbeAgent.observed == [metadata]
+        finally:
+            MetadataProbeAgent.actor_system = None
+            MetadataProbeAgent.observed = []

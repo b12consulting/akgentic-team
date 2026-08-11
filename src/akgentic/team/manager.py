@@ -337,18 +337,14 @@ class TeamManager:
         # Track runtime for stop_team
         self._runtimes[team_id] = runtime
 
-        now = datetime.now(UTC)
-        updated_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.RUNNING,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=now,
-            catalog_namespace=process.catalog_namespace,
-            metadata=process.metadata,
-            metadata_indexes=process.metadata_indexes,
+        # Copy-with-override rather than a hand-listed rebuild: a lifecycle write
+        # changes the status and the timestamp and nothing else, so every other
+        # field — including the next one added to Process — is carried forward by
+        # construction instead of by remembering to list it. metadata_indexes
+        # travels verbatim and is NOT re-derived: this path does not change the
+        # value, and a second derivation site is how the index starts lying.
+        updated_process = process.model_copy(
+            update={"status": TeamStatus.RUNNING, "updated_at": datetime.now(UTC)}
         )
         self._event_store.save_team(updated_process)
 
@@ -440,19 +436,10 @@ class TeamManager:
                 team_id,
             )
 
-        # Persist STOPPED status
-        now = datetime.now(UTC)
-        updated_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.STOPPED,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=now,
-            catalog_namespace=process.catalog_namespace,
-            metadata=process.metadata,
-            metadata_indexes=process.metadata_indexes,
+        # Persist STOPPED status — copy-with-override for the same reason as
+        # resume_team: status and timestamp change, everything else rides along.
+        updated_process = process.model_copy(
+            update={"status": TeamStatus.STOPPED, "updated_at": datetime.now(UTC)}
         )
         self._event_store.save_team(updated_process)
 

@@ -26,7 +26,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import Field, ValidationError
 
 from akgentic.team.manager import TeamManager
-from akgentic.team.metadata import TeamMetadata
+from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamCardMember, TeamRuntime, TeamStatus
 from akgentic.team.ports import NullServiceRegistry
 from tests.services.conftest import InMemoryEventStore
@@ -647,3 +647,69 @@ class TestLifecycleCarriesMetadata:
         assert resumed is not None
         assert resumed.metadata == metadata
         assert resumed.metadata_indexes == expected_indexes
+
+
+# ---------------------------------------------------------------------------
+# Resume repopulates the orchestrator from the persisted Process
+# ---------------------------------------------------------------------------
+
+
+class TestResumeRepopulatesOrchestrator:
+    """AC 1, 3, 5: a resumed team's orchestrator carries the persisted metadata."""
+
+    def test_resume_repopulates_the_orchestrator_after_a_divergent_write(
+        self,
+        manager: TeamManager,
+        event_store: CountingEventStore,
+        actor_system: ActorSystem,
+    ) -> None:
+        """AC 5: the database is the source of truth, not the last live actor.
+
+        The persisted value is changed while the team is DOWN, so no orchestrator
+        existed to receive a push and no agent-state snapshot can carry it. A
+        resume that read anything other than the ``Process`` -- or that skipped
+        the repopulation entirely -- would hand back the creation-time value or
+        ``None``. This is also what makes the database-first write ordering
+        self-healing: a push that failed against a live orchestrator is corrected
+        here, on the next resume.
+        """
+        created = AcmeCaseMetadata(tenant="acme", channel="email")
+        runtime = manager.create_team(_make_team_card(), metadata=created)
+        manager.stop_team(runtime.id)
+
+        stopped = event_store.load_team(runtime.id)
+        assert stopped is not None
+        diverged = AcmeCaseMetadata(tenant="acme", channel="voice", case_ref="c-9")
+        event_store.save_team(
+            stopped.model_copy(
+                update={
+                    "metadata": diverged,
+                    "metadata_indexes": derive_metadata_indexes(diverged),
+                }
+            )
+        )
+
+        resumed_runtime = manager.resume_team(runtime.id)
+
+        live = _read_orchestrator_metadata(actor_system, resumed_runtime)
+        assert type(live) is AcmeCaseMetadata
+        assert live == diverged
+        assert live != created
+
+        # The resume's own Process write must not undo the divergent value.
+        after = event_store.load_team(runtime.id)
+        assert after is not None
+        assert after.metadata == diverged
+        assert after.metadata_indexes == ["tenant|acme", "channel|voice", "case_ref|c-9"]
+        assert after.status == TeamStatus.RUNNING
+
+    def test_resume_without_metadata_leaves_the_orchestrator_empty(
+        self, manager: TeamManager, actor_system: ActorSystem
+    ) -> None:
+        """AC 3: a team that carries no metadata resumes with none, and no error."""
+        runtime = manager.create_team(_make_team_card())
+        manager.stop_team(runtime.id)
+
+        resumed_runtime = manager.resume_team(runtime.id)
+
+        assert _read_orchestrator_metadata(actor_system, resumed_runtime) is None
