@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from akgentic.team.metadata import make_index_entry
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -140,7 +141,12 @@ class YamlEventStore:
             return None
 
     @staticmethod
-    def _matches(data: Any, user_id: str | None, status: TeamStatus | None) -> bool:
+    def _matches(
+        data: Any,
+        user_id: str | None,
+        status: TeamStatus | None,
+        entries: set[str] | None,
+    ) -> bool:
         """Test a RAW parsed team.yaml mapping against the requested filters.
 
         ``TeamStatus`` is a ``StrEnum`` and ``save_team`` persists
@@ -152,15 +158,24 @@ class YamlEventStore:
         the unfiltered result set — corrupted-document log line included —
         does not move (ADR-23 §3).
 
+        Each filter is an independent guard, so a further one is another two
+        lines and never disturbs the ones already here.
+
         Args:
             data: Raw parsed document as returned by ``_load_team_data``.
             user_id: Owning-user filter, or None for no user filter.
             status: Lifecycle-state filter, or None for no status filter.
+            entries: Flattened ``"key|value"`` metadata entries that the
+                stored index must contain ALL of, or None/empty for no
+                metadata filter. A stored ``metadata_indexes`` that is
+                missing or not a list is a non-match, never a raise: a team
+                written before the metadata contract existed simply carries
+                nothing to match (ADR-24 §D5).
 
         Returns:
             True if the document should be hydrated and returned.
         """
-        if user_id is None and status is None:
+        if user_id is None and status is None and not entries:
             return True
         if not isinstance(data, dict):
             return False
@@ -168,6 +183,12 @@ class YamlEventStore:
             return False
         if status is not None and data.get("status") != status:
             return False
+        if entries:
+            stored = data.get("metadata_indexes")
+            if not isinstance(stored, list):
+                return False
+            if not entries.issubset({e for e in stored if isinstance(e, str)}):
+                return False
         return True
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
@@ -194,7 +215,10 @@ class YamlEventStore:
         return process
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
         """Load matching team process snapshots from the data directory.
 
@@ -202,13 +226,14 @@ class YamlEventStore:
         directory name as a UUID, and reads the team snapshot for valid
         team directories. Non-UUID directories are skipped with a warning.
 
-        BOTH filters are evaluated on the raw parsed mapping, ahead of
+        ALL filters are evaluated on the raw parsed mapping, ahead of
         ``Process.model_validate``, so a team that will not be returned is
-        never hydrated into a full ``TeamCard`` object graph (ADR-23 §3).
-        That is why this reads through ``_load_team_data`` instead of
-        calling ``load_team``: going back through ``load_team`` for the
-        survivors would re-read and re-parse each file. The walk itself is
-        still O(total teams) — this is a constant-factor win, nothing more.
+        never hydrated into a full ``TeamCard`` object graph (ADR-23 §3,
+        ADR-24 §D5). That is why this reads through ``_load_team_data``
+        instead of calling ``load_team``: going back through ``load_team``
+        for the survivors would re-read and re-parse each file. The walk
+        itself is still O(total teams) — this is a constant-factor win,
+        nothing more.
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -216,15 +241,25 @@ class YamlEventStore:
                 snapshots. See ADR-16 §1.
             status: If provided, return only snapshots whose
                 ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. Combines
-                with ``user_id`` by AND. See ADR-23 §1.
+                lifecycle state is returned, including ``DELETED``. See
+                ADR-23 §1.
+            metadata: If provided, return only snapshots whose stored
+                ``metadata_indexes`` contains an entry for EVERY key/value
+                pair given. An empty dict is an empty conjunction and matches
+                everything, exactly like ``None``. See ADR-24 §D5.
+
+        The three filters are independent terms combining as a conjunction;
+        one left at ``None`` constrains nothing.
 
         Returns:
-            List of all loadable Process snapshots (filtered by ``user_id``
-            and ``status`` when provided).
+            List of all loadable Process snapshots matching every filter
+            that was provided.
         """
         if not self._data_dir.exists():
             return []
+        # Translated once, before the walk — never per team. `if metadata`
+        # collapses both None and {} to "no metadata filter".
+        entries = {make_index_entry(k, v) for k, v in metadata.items()} if metadata else None
         teams: list[Process] = []
         for child in sorted(self._data_dir.iterdir()):
             if not child.is_dir():
@@ -235,7 +270,7 @@ class YamlEventStore:
                 logger.warning("Skipping non-team directory: %s", child.name)
                 continue
             data = self._load_team_data(team_id)
-            if data is None or not self._matches(data, user_id, status):
+            if data is None or not self._matches(data, user_id, status, entries):
                 continue
             # A survivor that fails validation is still dropped rather than
             # raised on, exactly as it was when load_team returned None.

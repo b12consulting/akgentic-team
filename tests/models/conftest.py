@@ -15,7 +15,7 @@ from akgentic.core.messages.message import Message, UserMessage
 from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import Field
 
-from akgentic.team.metadata import TeamMetadata
+from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -230,6 +230,38 @@ def make_process(
         catalog_namespace=catalog_namespace,
         metadata=metadata,
         metadata_indexes=metadata_indexes or [],
+    )
+
+
+def make_indexed_process(
+    metadata: SerializableBaseModel | None,
+    team_id: uuid.UUID | None = None,
+    status: TeamStatus = TeamStatus.RUNNING,
+    user_id: str | None = None,
+) -> Process:
+    """Create a Process whose index is derived exactly as a write path derives it.
+
+    ``make_process`` passes ``metadata_indexes`` through verbatim and never
+    derives it -- matching ``Process`` itself, which accepts the index rather
+    than computing it. Filter tests need a team that looks the way the real
+    create/update paths leave one, so this composes the two: the value and its
+    index are seeded together, through the one derivation function.
+
+    Args:
+        metadata: The team's business metadata value, or ``None``.
+        team_id: Optional team identifier.
+        status: Lifecycle status.
+        user_id: Optional owning user id, defaulting as in ``make_process``.
+
+    Returns:
+        A Process carrying ``metadata`` and its derived index entries.
+    """
+    return make_process(
+        team_id=team_id,
+        status=status,
+        user_id=user_id,
+        metadata=metadata,
+        metadata_indexes=derive_metadata_indexes(metadata),
     )
 
 

@@ -27,6 +27,7 @@ except ImportError as exc:
 
 from pymongo.errors import PyMongoError
 
+from akgentic.team.metadata import make_index_entry
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -221,20 +222,26 @@ class MongoEventStore:
         return process
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
         """Load team process snapshots from the teams collection.
 
-        Both filters are pushed into the same Mongo ``find`` filter dict —
-        ``{"user_id": ...}`` and ``{"status": ...}``. A parameter left at
-        ``None`` contributes no key, so ``list_teams()`` issues ``find({})``
-        and returns every team; supplying both yields one query whose terms
-        AND. The selection happens in MongoDB, never in Python after
-        hydration. The indexes (``teams_user_id_idx`` and
+        ``user_id`` and ``status`` are pushed into the same Mongo ``find``
+        filter dict — ``{"user_id": ...}`` and ``{"status": ...}``. A
+        parameter left at ``None`` contributes no key, so ``list_teams()``
+        issues ``find({})`` and returns every team; supplying both yields
+        one query whose terms AND. The selection happens in MongoDB, never
+        in Python after hydration. The indexes (``teams_user_id_idx`` and
         ``teams_status_idx``, both provisioned by :func:`ensure_indexes`)
         only make the scan cheaper — an unindexed filter still returns the
         right teams. Corrupted documents are skipped with a warning. See
         ADR-16 §5 and ADR-23 §§5-6.
+
+        ``metadata`` is filtered on the hydrated results instead; see the
+        comment at the filter for why.
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -242,12 +249,15 @@ class MongoEventStore:
                 filter carries no ``user_id`` key. See ADR-16 §1.
             status: If provided, return only snapshots whose
                 ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. Combines
-                with ``user_id`` by AND. See ADR-23 §1.
+                lifecycle state is returned, including ``DELETED``. See
+                ADR-23 §1.
+            metadata: If provided, return only snapshots whose
+                ``metadata_indexes`` contains an entry for EVERY key/value
+                pair given. An empty dict matches everything, like ``None``.
+                See ADR-24 §D5.
 
         Returns:
-            List of loadable Process snapshots, filtered at the database
-            level by whichever of ``user_id`` and ``status`` were given.
+            List of loadable Process snapshots matching every filter given.
         """
         query: dict[str, str] = {}
         if user_id is not None:
@@ -261,6 +271,17 @@ class MongoEventStore:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
                 logger.warning("Skipping corrupted team document: %s", exc)
+        # Interim in-memory metadata filter, applied after hydration and
+        # deliberately NOT as a key in the `query` dict above: a plain
+        # equality on an array field does not mean containment, so folding it
+        # into the find filter would silently change the semantics. The real
+        # push-down — an `$all` term plus the multikey index on
+        # `metadata_indexes` via ensure_indexes() — lands in story 27-4.
+        # Results are already correct here; what is missing is only the
+        # document-count reduction at the database.
+        if metadata:
+            entries = {make_index_entry(k, v) for k, v in metadata.items()}
+            teams = [t for t in teams if entries.issubset(set(t.metadata_indexes))]
         logger.debug("Listed %d teams", len(teams))
         return teams
 

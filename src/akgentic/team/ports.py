@@ -92,7 +92,10 @@ class EventStore(Protocol):
         ...
 
     def list_teams(
-        self, user_id: str | None = None, status: TeamStatus | None = None
+        self,
+        user_id: str | None = None,
+        status: TeamStatus | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> list[Process]:
         """Load team process snapshots.
 
@@ -102,13 +105,31 @@ class EventStore(Protocol):
             status: If provided, return only snapshots whose ``Process.status``
                 matches. If ``None`` (default), do not filter on the lifecycle
                 state — every status is returned, including ``DELETED``.
+            metadata: If provided, return only snapshots whose business metadata
+                carries EVERY given key/value pair. Each pair is translated to a
+                flattened ``"key|value"`` entry via
+                :func:`akgentic.team.metadata.make_index_entry` and matched
+                against ``Process.metadata_indexes`` by containment, so query
+                construction and derivation escape ``|`` the same way. Only
+                fields the metadata model marks indexed are matchable, and
+                matching is equality on the rendered string — a caller filtering
+                a typed field passes its rendered form. An empty dict is an empty
+                conjunction and therefore behaves exactly like ``None``.
 
-        Both filters are independent and combine with AND. Implementations MUST
-        push BOTH filters down to the backend (SQL WHERE, Mongo find filter,
-        directory-walk skip) rather than load-all-then-filter in Python — the
-        infra boot path lists RUNNING teams across the whole store.
+        Every filter is an independent term and they combine as a conjunction:
+        a filter left at ``None`` constrains nothing, and adding one can only
+        narrow the result set, never widen it. In particular ``user_id`` scoping
+        is applied server-side and is NEVER weakened by ``metadata`` — metadata
+        is caller-supplied and non-secret, so it must not become a way to reach
+        another owner's teams.
 
-        See ADR-23 §1 for the additive, backwards-compatible Protocol change.
+        Implementations MUST push every filter down to the backend (SQL WHERE,
+        Mongo find filter, directory-walk skip) rather than load-all-then-filter
+        in Python — the infra boot path lists RUNNING teams across the whole
+        store.
+
+        See ADR-23 §1 and ADR-24 §D5 for the additive, backwards-compatible
+        Protocol changes.
         """
         ...
 

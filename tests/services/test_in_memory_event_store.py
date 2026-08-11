@@ -11,7 +11,7 @@ drift fails a test instead of going unnoticed.
 from __future__ import annotations
 
 from akgentic.team.models import TeamStatus
-from tests.models.conftest import make_process
+from tests.models.conftest import AcmeTeamMetadata, make_indexed_process, make_process
 from tests.services.conftest import InMemoryEventStore
 
 
@@ -75,3 +75,104 @@ class TestInMemoryEventStoreListTeams:
         store.save_team(make_process(user_id="u2"))
 
         assert {p.team_id for p in store.list_teams("u1")} == {mine.team_id}
+
+    def test_filters_by_metadata(self) -> None:
+        """``metadata`` selects only teams carrying that key/value pair."""
+        store = InMemoryEventStore()
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        contoso = make_indexed_process(AcmeTeamMetadata(tenant="contoso"))
+        store.save_team(acme)
+        store.save_team(contoso)
+
+        result = store.list_teams(metadata={"tenant": "acme"})
+        assert {p.team_id for p in result} == {acme.team_id}
+
+    def test_metadata_and_combines_across_keys(self) -> None:
+        """Two entries mean BOTH must be present — a team with one is excluded."""
+        store = InMemoryEventStore()
+        both = make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1"))
+        tenant_only = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        store.save_team(both)
+        store.save_team(tenant_only)
+
+        result = store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        assert {p.team_id for p in result} == {both.team_id}
+
+    def test_metadata_combines_with_user_id(self) -> None:
+        """Identical metadata under two owners stays scoped to the asked-for owner."""
+        store = InMemoryEventStore()
+        mine = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u1")
+        theirs = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u2")
+        store.save_team(mine)
+        store.save_team(theirs)
+
+        result = store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        assert {p.team_id for p in result} == {mine.team_id}
+
+    def test_metadata_combines_with_status(self) -> None:
+        """``metadata`` and ``status`` intersect rather than union."""
+        store = InMemoryEventStore()
+        running = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.RUNNING
+        )
+        stopped = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.STOPPED
+        )
+        store.save_team(running)
+        store.save_team(stopped)
+
+        result = store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": "acme"})
+        assert {p.team_id for p in result} == {running.team_id}
+
+    def test_all_three_filters_combine_with_and(self) -> None:
+        """Every term narrows; only the team satisfying all three survives.
+
+        Each single term matches more than one team here, so a fake that
+        honoured just one of them — or ORed them — returns the wrong set.
+        """
+        store = InMemoryEventStore()
+        wanted = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.RUNNING
+        )
+        wrong_metadata = make_indexed_process(
+            AcmeTeamMetadata(tenant="contoso"), user_id="u1", status=TeamStatus.RUNNING
+        )
+        wrong_status = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u1", status=TeamStatus.STOPPED
+        )
+        wrong_user = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), user_id="u2", status=TeamStatus.RUNNING
+        )
+        for process in (wanted, wrong_metadata, wrong_status, wrong_user):
+            store.save_team(process)
+
+        result = store.list_teams(
+            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+        )
+        assert {p.team_id for p in result} == {wanted.team_id}
+
+    def test_empty_metadata_dict_matches_everything(self) -> None:
+        """``metadata={}`` is an empty conjunction — identical to ``metadata=None``."""
+        store = InMemoryEventStore()
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        bare = make_process()
+        store.save_team(acme)
+        store.save_team(bare)
+
+        assert {p.team_id for p in store.list_teams(metadata={})} == {
+            acme.team_id,
+            bare.team_id,
+        }
+        assert {p.team_id for p in store.list_teams(metadata=None)} == {
+            acme.team_id,
+            bare.team_id,
+        }
+
+    def test_metadata_on_unknown_key_returns_empty(self) -> None:
+        """A key no team carries — including an unindexed field — matches nothing."""
+        store = InMemoryEventStore()
+        store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme", department="ops")))
+
+        assert store.list_teams(metadata={"nope": "acme"}) == []
+        # `department` is declared but NOT indexed, so it is not matchable.
+        assert store.list_teams(metadata={"department": "ops"}) == []
