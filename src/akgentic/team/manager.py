@@ -528,6 +528,16 @@ class TeamManager:
         runtime = self._runtimes.get(team_id)
         if process.status == TeamStatus.RUNNING and runtime is not None:
             self._push_metadata(team_id, runtime, validated_metadata)
+        elif process.status == TeamStatus.RUNNING:
+            # RUNNING but untracked here: another worker owns it, or this worker
+            # restarted. Not an error — the write stands and the orchestrator
+            # repopulates from the Process on the next resume. Logged so a stale
+            # live value is explainable rather than mysterious.
+            logger.debug(
+                "Team %s is RUNNING but has no runtime tracked here — "
+                "metadata written, orchestrator push skipped",
+                team_id,
+            )
 
         logger.info("Metadata updated for team %s", team_id)
         return updated_process

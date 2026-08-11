@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -80,14 +81,23 @@ class FailingOrchestratorTell:
     Every other attribute delegates to the real proxy, so a team built while
     this wrapper is installed still behaves normally — only the metadata push
     fails, which is exactly the fault the ordering is designed to survive.
+
+    ``on_push`` fires immediately before the failure, giving a test a window to
+    observe the database *at the moment the push is attempted*. That window is
+    what separates database-first from actor-first: a swallowed push failure
+    leaves the same final state either way, so the final state alone cannot
+    tell the two orderings apart.
     """
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, on_push: Callable[[], None] | None = None) -> None:
         self._inner = inner
+        self._on_push = on_push
 
     def set_metadata(self, metadata: Any) -> None:
-        """Simulate an unreachable orchestrator."""
+        """Observe the database, then simulate an unreachable orchestrator."""
         del metadata
+        if self._on_push is not None:
+            self._on_push()
         msg = "orchestrator unreachable"
         raise RuntimeError(msg)
 
@@ -95,17 +105,43 @@ class FailingOrchestratorTell:
         return getattr(self._inner, name)
 
 
-def _break_metadata_push(actor_system: ActorSystem, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make every orchestrator ``set_metadata`` tell raise, leaving all else live."""
+def _break_metadata_push(
+    actor_system: ActorSystem,
+    monkeypatch: pytest.MonkeyPatch,
+    on_push: Callable[[], None] | None = None,
+) -> None:
+    """Make every orchestrator ``set_metadata`` tell raise, leaving all else live.
+
+    Args:
+        actor_system: The system whose ``proxy_tell`` is wrapped.
+        monkeypatch: Fixture used to restore ``proxy_tell`` after the test.
+        on_push: Optional callback fired at push time, before the failure.
+    """
     real_proxy_tell = actor_system.proxy_tell
 
     def failing_proxy_tell(addr: Any, agent_class: Any) -> Any:
         proxy = real_proxy_tell(addr, agent_class)
         if agent_class is Orchestrator:
-            return FailingOrchestratorTell(proxy)
+            return FailingOrchestratorTell(proxy, on_push)
         return proxy
 
     monkeypatch.setattr(actor_system, "proxy_tell", failing_proxy_tell)
+
+
+def _index_recorder(
+    event_store: InMemoryEventStore, team_id: uuid.UUID, sink: list[list[str] | None]
+) -> Callable[[], None]:
+    """Build a push-time callback that snapshots the persisted index.
+
+    ``None`` is recorded when no ``Process`` is stored yet — which is exactly
+    what an actor-first create would produce.
+    """
+
+    def record() -> None:
+        stored = event_store.load_team(team_id)
+        sink.append(None if stored is None else list(stored.metadata_indexes))
+
+    return record
 
 
 def _make_member(name: str, role: str = "TestRole") -> TeamCardMember:
@@ -272,13 +308,24 @@ class TestCreateTeamMetadata:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """AC 6: the push is best-effort — the persisted Process is unaffected."""
-        _break_metadata_push(actor_system, monkeypatch)
+        """AC 6: the push is best-effort — the persisted Process is unaffected.
+
+        ``pushed_indexes`` is the ordering assertion: the Process must already
+        be on disk, index and all, when the push is attempted. Asserting only on
+        the final state would pass for an actor-first create too, since the
+        swallowed failure leaves the same end state either way.
+        """
+        team_id = uuid.uuid4()
+        pushed_indexes: list[list[str] | None] = []
+        _break_metadata_push(
+            actor_system, monkeypatch, _index_recorder(event_store, team_id, pushed_indexes)
+        )
         metadata = AcmeCaseMetadata(tenant="acme", channel="email")
 
         with caplog.at_level(logging.WARNING, logger="akgentic.team.manager"):
-            runtime = manager.create_team(_make_team_card(), metadata=metadata)
+            runtime = manager.create_team(_make_team_card(), team_id=team_id, metadata=metadata)
 
+        assert pushed_indexes == [["tenant|acme", "channel|email"]]
         assert "Failed to push metadata" in caplog.text
         assert isinstance(runtime, TeamRuntime)
         process = event_store.load_team(runtime.id)
@@ -424,20 +471,29 @@ class TestUpdateTeamMetadata:
     ) -> None:
         """AC 14: the database-first ordering test.
 
-        A push that raises must not roll back, mask or fail the write that
-        already succeeded — team listing filters on the persisted index, so it
-        stays truthful and the orchestrator repopulates on the next resume. An
-        actor-first implementation cannot pass this.
+        Two things are asserted, and both are needed. ``pushed_indexes`` records
+        the persisted index *at the instant the push is attempted*: it must
+        already be the new one, which is what makes this a test of ordering
+        rather than of error handling — an actor-first update would record the
+        stale index here while still reaching the same final state, because the
+        push failure is swallowed either way. The rest asserts the failure is
+        non-fatal: it must not roll back, mask or fail the write that already
+        succeeded, so team listing stays truthful and the orchestrator
+        repopulates on the next resume.
         """
         runtime = manager.create_team(
             _make_team_card(), metadata=AcmeCaseMetadata(tenant="acme", channel="email")
         )
-        _break_metadata_push(actor_system, monkeypatch)
+        pushed_indexes: list[list[str] | None] = []
+        _break_metadata_push(
+            actor_system, monkeypatch, _index_recorder(event_store, runtime.id, pushed_indexes)
+        )
         new_metadata = AcmeCaseMetadata(tenant="acme", channel="chat")
 
         with caplog.at_level(logging.WARNING, logger="akgentic.team.manager"):
             result = manager.update_team_metadata(runtime.id, new_metadata)
 
+        assert pushed_indexes == [["tenant|acme", "channel|chat"]]
         assert "Failed to push metadata" in caplog.text
         assert result.metadata == new_metadata
         stored = event_store.load_team(runtime.id)
@@ -461,6 +517,35 @@ class TestUpdateTeamMetadata:
 
         push.assert_not_called()
         assert result.status == TeamStatus.STOPPED
+        stored = event_store.load_team(runtime.id)
+        assert stored is not None
+        assert stored.metadata_indexes == ["tenant|acme", "channel|chat"]
+
+    def test_running_team_with_no_tracked_runtime_writes_and_skips_the_push(
+        self, manager: TeamManager, event_store: CountingEventStore
+    ) -> None:
+        """AC 13/15: RUNNING in the database but untracked here is not an error.
+
+        This is the worker-restart shape, and the shape of a team owned by
+        another replica: there is no orchestrator address to push to, so the
+        write must stand on its own and the push must be skipped rather than
+        attempted against a stale runtime.
+        """
+        runtime = manager.create_team(
+            _make_team_card(), metadata=AcmeCaseMetadata(tenant="acme", channel="email")
+        )
+        manager.stop_team(runtime.id)  # drops the tracked runtime
+        stopped = event_store.load_team(runtime.id)
+        assert stopped is not None
+        event_store.save_team(stopped.model_copy(update={"status": TeamStatus.RUNNING}))
+
+        with patch.object(TeamManager, "_push_metadata", autospec=True) as push:
+            result = manager.update_team_metadata(
+                runtime.id, AcmeCaseMetadata(tenant="acme", channel="chat")
+            )
+
+        push.assert_not_called()
+        assert result.status == TeamStatus.RUNNING
         stored = event_store.load_team(runtime.id)
         assert stored is not None
         assert stored.metadata_indexes == ["tenant|acme", "channel|chat"]
@@ -514,12 +599,16 @@ class TestUpdateTeamMetadata:
         """AC 9: metadata_type cannot be changed through the update path.
 
         The previously persisted value and index survive a rejected update
-        untouched — a rejection must not leave a partially applied write.
+        untouched — a rejection must not leave a partially applied write. The
+        snapshot is taken BEFORE the rejected call: the store hands back the
+        same object it was given, so a dump taken afterwards would compare the
+        state to itself and pass even if the Process had been mutated in place.
         """
         original = AcmeCaseMetadata(tenant="acme", channel="email", case_ref="c-1")
         runtime = manager.create_team(_make_team_card(), metadata=original)
         before = event_store.load_team(runtime.id)
         assert before is not None
+        snapshot = before.model_dump()
         writes_before = event_store.save_team_calls
 
         with pytest.raises(ValidationError):
@@ -527,7 +616,7 @@ class TestUpdateTeamMetadata:
 
         after = event_store.load_team(runtime.id)
         assert after is not None
-        assert after.model_dump() == before.model_dump()
+        assert after.model_dump() == snapshot
         assert event_store.save_team_calls == writes_before
 
 
