@@ -497,17 +497,15 @@ class TeamManager:
 
         validated_metadata = self._validate_metadata(process.team_card, metadata)
 
-        updated_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=process.status,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=datetime.now(UTC),
-            catalog_namespace=process.catalog_namespace,
-            metadata=validated_metadata,
-            metadata_indexes=derive_metadata_indexes(validated_metadata),
+        # Copy-with-override, as resume_team and stop_team already do: only the
+        # three fields this path owns are named, so every other field — including
+        # the next one added to Process — is carried forward by construction.
+        updated_process = process.model_copy(
+            update={
+                "updated_at": datetime.now(UTC),
+                "metadata": validated_metadata,
+                "metadata_indexes": derive_metadata_indexes(validated_metadata),
+            }
         )
         self._event_store.save_team(updated_process)
 

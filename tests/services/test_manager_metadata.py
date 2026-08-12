@@ -57,6 +57,17 @@ class ContosoMetadata(TeamMetadata):
     region: str = Field(json_schema_extra={"indexed": True})
 
 
+class ProcessWithExtraField(Process):
+    """A ``Process`` carrying one field more than any write path knows about.
+
+    Stands in for the next field added to ``Process``: nothing in ``manager.py``
+    mentions it, so it survives a write only if that write copies the record
+    rather than rebuilding it from a hand-written field list.
+    """
+
+    extra_field: str = ""
+
+
 class CountingEventStore(InMemoryEventStore):
     """InMemoryEventStore that counts ``save_team`` calls.
 
@@ -166,6 +177,29 @@ def _make_team_card(
         description="Test team",
         entry_point=_make_member("lead", "Lead"),
         metadata_type=metadata_type,
+    )
+
+
+def _fully_populated_process() -> Process:
+    """Build a Process with every field set to a distinctive, non-default value.
+
+    Every field carries a value that no default and no other fixture would
+    produce, so a field dropped by a write path shows up as a difference rather
+    than coinciding with what was already there. ``STOPPED`` keeps the update
+    path off the orchestrator push, which this record has no live actors for.
+    """
+    metadata = AcmeCaseMetadata(tenant="acme", channel="email", case_ref="c-1", note="n-1")
+    return Process(
+        team_id=uuid.uuid4(),
+        team_card=_make_team_card(name="acme-original"),
+        status=TeamStatus.STOPPED,
+        user_id="u-1",
+        user_email="u@acme.test",
+        created_at=datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC),
+        updated_at=datetime(2021, 6, 7, 8, 9, 10, tzinfo=UTC),
+        catalog_namespace="ns-1",
+        metadata=metadata,
+        metadata_indexes=derive_metadata_indexes(metadata),
     )
 
 
@@ -423,29 +457,51 @@ class TestUpdateTeamMetadata:
     def test_carries_every_other_process_field_forward(
         self, manager: TeamManager, event_store: CountingEventStore
     ) -> None:
-        """AC 12: an update touches metadata and updated_at, nothing else."""
-        runtime = manager.create_team(
-            _make_team_card(),
-            user_id="u-1",
-            user_email="u@acme.test",
-            catalog_namespace="ns-1",
-            metadata=AcmeCaseMetadata(tenant="acme", channel="email"),
+        """AC 12: an update changes the value, its index and updated_at — nothing else.
+
+        Asserted by whole-model comparison, naming only the three fields that are
+        *supposed* to change. A test that instead listed the fields expected to
+        survive would fail in exactly the same way as an implementation that
+        listed them — it would go on passing while a newly added field was
+        silently dropped, which is precisely how that defect reaches production.
+        """
+        before = _fully_populated_process()
+        event_store.save_team(before)
+        new_metadata = AcmeCaseMetadata(tenant="acme", channel="chat")
+
+        after = manager.update_team_metadata(before.team_id, new_metadata)
+
+        assert after == before.model_copy(
+            update={
+                "updated_at": after.updated_at,
+                "metadata": new_metadata,
+                "metadata_indexes": derive_metadata_indexes(new_metadata),
+            }
         )
-        before = event_store.load_team(runtime.id)
-        assert before is not None
+        assert after.updated_at > before.updated_at
+
+    def test_a_field_added_to_process_survives_an_update(
+        self, manager: TeamManager, event_store: CountingEventStore
+    ) -> None:
+        """AC 12: a field the update path has never heard of still rides along.
+
+        ``ProcessWithExtraField`` stands in for the eleventh field nobody has
+        added yet. Copy-with-override carries it — and preserves the subclass —
+        without ``update_team_metadata`` naming it; a hand-listed rebuild would
+        return a plain ``Process`` with the field gone.
+        """
+        base = _fully_populated_process()
+        # dict(base) hands over the live field values, so the concrete metadata
+        # subclass survives instead of being flattened by a dump/validate cycle.
+        before = ProcessWithExtraField(**dict(base), extra_field="e-1")
+        event_store.save_team(before)
 
         after = manager.update_team_metadata(
-            runtime.id, AcmeCaseMetadata(tenant="acme", channel="chat")
+            before.team_id, AcmeCaseMetadata(tenant="acme", channel="chat")
         )
 
-        assert after.team_id == before.team_id
-        assert after.team_card.name == before.team_card.name
-        assert after.status == before.status
-        assert after.user_id == "u-1"
-        assert after.user_email == "u@acme.test"
-        assert after.created_at == before.created_at
-        assert after.catalog_namespace == "ns-1"
-        assert after.updated_at >= before.updated_at
+        assert isinstance(after, ProcessWithExtraField)
+        assert after.extra_field == "e-1"
 
     def test_pushes_to_the_live_orchestrator_when_running(
         self, manager: TeamManager, actor_system: ActorSystem
