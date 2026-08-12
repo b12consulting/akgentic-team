@@ -359,13 +359,13 @@ class TeamRestorer:
         self,
         events: list[PersistedEvent],
         agent_id: uuid.UUID,
-    ) -> list[Message]:
+    ) -> list[EventMessage]:
         """Filter persisted events to extract EventMessage instances for an agent.
 
         Returns only ``EventMessage`` instances whose ``sender.agent_id`` matches
-        the given ``agent_id``, preserving sequence order.  The return type is
-        ``list[Message]`` (not ``list[EventMessage]``) because the proxy API
-        ``init_llm_context()`` accepts ``list[Any]``.
+        the given ``agent_id``, preserving sequence order. The ``isinstance``
+        filter below is what guarantees the element type, so the annotation
+        states it rather than widening to the base class.
 
         The restorer passes ALL matching EventMessage objects to the agent; the
         downstream chain (BaseAgent -> ReactAgent -> ContextManager) handles
