@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
+from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -18,11 +19,14 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import (
+    ErrorMessage,
     EventMessage,
+    NotificationMessage,
     SentMessage,
     StartMessage,
     StateChangedMessage,
     StopMessage,
+    WarningMessage,
 )
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -2371,3 +2375,189 @@ class TestRestoreRepopulatesMetadata:
         finally:
             MetadataProbeAgent.actor_system = None
             MetadataProbeAgent.observed = []
+
+
+# ---------------------------------------------------------------------------
+# Helpers: NotificationMessage construction (Story 28-1)
+# ---------------------------------------------------------------------------
+
+
+def _make_proxy_address(
+    agent_id: uuid.UUID,
+    name: str,
+    role: str,
+    team_id: uuid.UUID,
+) -> ActorAddressProxy:
+    """Build the ActorAddressProxy a deserialized event carries for an agent."""
+    from akgentic.core.utils.deserializer import ActorAddressDict
+
+    addr_dict: ActorAddressDict = {
+        "__actor_address__": True,
+        "__actor_type__": f"{StubAgent.__module__}.{StubAgent.__name__}",
+        "agent_id": str(agent_id),
+        "name": name,
+        "role": role,
+        "team_id": str(team_id),
+        "squad_id": str(uuid.uuid4()),
+        "user_message": False,
+    }
+    return ActorAddressProxy(addr_dict)
+
+
+def _persist_notification(
+    event_store: InMemoryEventStore,
+    team_id: uuid.UUID,
+    notification: NotificationMessage,
+    agent_id: uuid.UUID,
+    name: str = "lead",
+    role: str = "Lead",
+) -> None:
+    """Persist a NotificationMessage sent by *name*, after the team's own events.
+
+    The sequence is taken past the current maximum so the notification replays
+    last, once every agent has been respawned.
+    """
+    notification.sender = _make_proxy_address(agent_id, name, role, team_id)
+    notification.team_id = team_id
+    event_store.save_event(
+        PersistedEvent(
+            team_id=team_id,
+            sequence=event_store.get_max_sequence(team_id) + 1,
+            event=notification,
+            timestamp=datetime.now(UTC),
+        )
+    )
+
+
+def _restore_capturing_replay(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    process: Process,
+) -> tuple[TeamRuntime, list[Message]]:
+    """Restore the team, capturing every message phase 3 replays.
+
+    The replayed objects are the observation point for address resolution.
+    A subscriber is not: ``Orchestrator._notify_subscribers_message`` snapshots
+    live addresses back to ``ActorAddressProxy`` before fan-out, so a subscriber
+    never sees the rehydrated refs.
+    """
+    replayed: list[Message] = []
+    original_restore_message = Orchestrator.restore_message
+
+    def recording_restore_message(self: Orchestrator, message: Message) -> None:
+        replayed.append(message)
+        original_restore_message(self, message)
+
+    restorer = TeamRestorer(actor_system, event_store)
+    with patch.object(Orchestrator, "restore_message", recording_restore_message):
+        runtime = restorer.restore(process)
+    return runtime, replayed
+
+
+def _replayed_notification(
+    replayed: list[Message],
+    notification_type: type[NotificationMessage],
+) -> NotificationMessage:
+    """Return the single replayed notification of exactly *notification_type*."""
+    matches = [m for m in replayed if type(m) is notification_type]
+    assert len(matches) == 1, (
+        f"expected exactly one replayed {notification_type.__name__}, got {len(matches)}"
+    )
+    return matches[0]
+
+
+# ---------------------------------------------------------------------------
+# Tests: NotificationMessage address resolution (Story 28-1)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerNotificationAddressResolution:
+    """Restore rehydrates ``NotificationMessage.current_message`` addresses.
+
+    ``_resolve_message_addresses`` matches the ``NotificationMessage`` base class,
+    so every subclass -- ``ErrorMessage``, ``WarningMessage``, and any sibling
+    akgentic-core adds later -- has its nested ``current_message`` resolved
+    without a per-subclass branch here.
+    """
+
+    def test_warning_message_current_message_is_rehydrated(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC3: a persisted WarningMessage's nested address comes back live."""
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_id = _lead_agent_id_from_events(event_store, team_id)
+
+        failed = Message()
+        failed.sender = _make_proxy_address(lead_id, "lead", "Lead", team_id)
+        _persist_notification(
+            event_store,
+            team_id,
+            WarningMessage(content="handled by a human", current_message=failed),
+            lead_id,
+        )
+
+        runtime, replayed = _restore_capturing_replay(actor_system, event_store, process)
+
+        warning = _replayed_notification(replayed, WarningMessage)
+        assert warning.current_message is not None
+        resolved = warning.current_message.sender
+        assert not isinstance(resolved, ActorAddressProxy)
+        assert resolved is runtime.addrs["lead"]
+
+    def test_error_message_current_message_is_rehydrated(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC4: widening the branch to the base class keeps ErrorMessage working."""
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_id = _lead_agent_id_from_events(event_store, team_id)
+
+        failed = Message()
+        failed.sender = _make_proxy_address(lead_id, "lead", "Lead", team_id)
+        _persist_notification(
+            event_store,
+            team_id,
+            ErrorMessage(
+                content="boom",
+                exception_type="builtins.ValueError",
+                exception_value="boom",
+                current_message=failed,
+            ),
+            lead_id,
+        )
+
+        runtime, replayed = _restore_capturing_replay(actor_system, event_store, process)
+
+        error = _replayed_notification(replayed, ErrorMessage)
+        assert error.current_message is not None
+        resolved = error.current_message.sender
+        assert not isinstance(resolved, ActorAddressProxy)
+        assert resolved is runtime.addrs["lead"]
+
+    def test_notification_without_current_message_resolves_sender_only(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC5: current_message=None is a no-op -- no error, sender still resolved."""
+        tc = _make_team_card()
+        team_id, process = _populate_stopped_team(event_store, tc)
+        lead_id = _lead_agent_id_from_events(event_store, team_id)
+
+        _persist_notification(
+            event_store,
+            team_id,
+            WarningMessage(content="nothing was being processed"),
+            lead_id,
+        )
+
+        runtime, replayed = _restore_capturing_replay(actor_system, event_store, process)
+
+        warning = _replayed_notification(replayed, WarningMessage)
+        assert warning.current_message is None
+        assert warning.sender is runtime.addrs["lead"]
