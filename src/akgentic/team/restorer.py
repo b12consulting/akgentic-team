@@ -14,8 +14,8 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import (
-    ErrorMessage,
     EventMessage,
+    NotificationMessage,
     SentMessage,
     StartMessage,
     StopMessage,
@@ -595,7 +595,11 @@ class TeamRestorer:
 
         Handles the ``sender`` field common to all messages, plus
         type-specific fields: ``SentMessage.recipient``, ``SentMessage.message``,
-        ``StartMessage.parent``, ``ErrorMessage.current_message``.
+        ``StartMessage.parent``, ``NotificationMessage.current_message``.
+
+        The last branch matches the ``NotificationMessage`` base class, so every
+        subclass -- ``ErrorMessage``, ``WarningMessage``, and any sibling added
+        later -- is covered without a new branch here.
 
         Args:
             msg: The message to resolve addresses in (mutated in-place).
@@ -608,7 +612,7 @@ class TeamRestorer:
             self._resolve_message_addresses(msg.message, addr_map)
         elif isinstance(msg, StartMessage):
             msg.parent = self._resolve_addr(msg.parent, addr_map)
-        elif isinstance(msg, ErrorMessage) and msg.current_message is not None:
+        elif isinstance(msg, NotificationMessage) and msg.current_message is not None:
             self._resolve_message_addresses(msg.current_message, addr_map)
 
     @staticmethod
