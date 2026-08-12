@@ -2399,7 +2399,7 @@ def _make_proxy_address(
         "role": role,
         "team_id": str(team_id),
         "squad_id": str(uuid.uuid4()),
-        "user_message": False,
+        "is_user_proxy": False,
     }
     return ActorAddressProxy(addr_dict)
 
@@ -2523,9 +2523,8 @@ class TestRestorerNotificationAddressResolution:
             event_store,
             team_id,
             ErrorMessage(
+                content_type="ValueError",
                 content="boom",
-                exception_type="builtins.ValueError",
-                exception_value="boom",
                 current_message=failed,
             ),
             lead_id,
