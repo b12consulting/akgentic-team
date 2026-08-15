@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -31,6 +32,7 @@ from akgentic.team.subscriber import (
     DEFAULT_IDLE_STOP_DELAY_SECONDS,
     IDLE_STOP_DELAY_ENV_VAR,
     IdleStopSubscriber,
+    resolve_idle_stop_delay,
 )
 
 
@@ -66,11 +68,11 @@ class _RecordingTimer(Timer):
         self.events.append("cancel")
 
 
-def _wait_for(condition: Any, timeout: float = 2.0) -> None:
-    """Poll ``condition`` (a callable) until true or timeout."""
+def _wait_for(condition: Callable[[], bool], timeout: float = 2.0) -> None:
+    """Poll ``condition`` until true or timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if condition():  # type: ignore[operator]
+        if condition():
             return
         time.sleep(0.01)
     pytest.fail("timed out waiting for condition")
@@ -109,9 +111,13 @@ def test_subclasses_event_subscriber_and_owns_a_core_timer() -> None:
 
 def test_defines_the_three_protocol_hooks_and_no_stop_request() -> None:
     sub, _, _ = _instrumented()
-    assert callable(sub.set_restoring)
-    assert callable(sub.on_message)
-    assert callable(sub.on_stop)
+    # Defined on the class itself, not merely inherited from the Protocol's
+    # no-op defaults — an inherited `...` body would satisfy `callable()` while
+    # implementing none of the behaviour the rest of this file pins.
+    own = vars(IdleStopSubscriber)
+    assert "set_restoring" in own
+    assert "on_message" in own
+    assert "on_stop" in own
     assert not hasattr(sub, "on_stop_request")
 
 
@@ -316,6 +322,25 @@ def test_lifecycle_methods_reject_a_foreign_team_id() -> None:
     assert manager.calls == []
 
 
+def test_a_rejected_foreign_call_leaves_this_subscriber_untouched() -> None:
+    """Rejecting is not enough — the foreign call must have no side effect.
+
+    Raising *after* mutating would let a second team's orchestrator disarm this
+    team's countdown, or corrupt its replay guard, while the ``AssertionError``
+    it raises is discarded by core's per-subscriber exception handling.
+    """
+    sub, _, timer = _instrumented()
+    wrong = uuid.uuid4()
+
+    with pytest.raises(AssertionError):
+        sub.set_restoring(wrong, True)
+    assert sub._restoring is False, "a foreign set_restoring corrupted the replay guard"
+
+    with pytest.raises(AssertionError):
+        sub.on_stop(wrong)
+    assert timer.events == [], "a foreign on_stop disarmed this team's countdown"
+
+
 # --- AC8: on_stop cancels the countdown --------------------------------------
 
 
@@ -363,3 +388,17 @@ def test_delay_falls_back_to_the_module_default(monkeypatch: pytest.MonkeyPatch)
         assert sub._timer.delay == DEFAULT_IDLE_STOP_DELAY_SECONDS
     finally:
         sub._timer.cancel()
+
+
+def test_a_malformed_delay_fails_loudly_at_wiring_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The documented ``Raises:`` contract — a bad value is a deployment error.
+
+    Pinned so that trading it for a warn-and-default degradation is a deliberate
+    change with a red test, not a silent one.
+    """
+    monkeypatch.setenv(IDLE_STOP_DELAY_ENV_VAR, "not-a-number")
+
+    with pytest.raises(ValueError):
+        resolve_idle_stop_delay()
+    with pytest.raises(ValueError):
+        IdleStopSubscriber(_RecordingTeamManager(), uuid.uuid4())  # type: ignore[arg-type]
