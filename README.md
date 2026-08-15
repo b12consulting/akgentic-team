@@ -14,7 +14,6 @@ with event-sourced persistence and crash recovery.
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [Team Definitions](#team-definitions)
-- [Lifecycle Management](#lifecycle-management)
 - [Team Metadata](#team-metadata)
 - [Persistence](#persistence)
 - [CLI](#cli)
@@ -34,8 +33,11 @@ providing:
   Pykka actors with routing wired
 - **Full lifecycle management** via `TeamManager` — create, stop, resume,
   delete with state machine enforcement
-- **Event-sourced persistence** via `PersistenceSubscriber` — every message
-  is captured for crash recovery
+- **Event-sourced persistence** via `PersistenceSubscriber` — every message is
+  captured for crash recovery, with agent state diverted to a latest-per-agent
+  snapshot rather than appended to the log
+- **Idle-stop** via `IdleStopSubscriber` — a per-team inactivity countdown that
+  stops the team itself once it has been idle long enough
 - **Crash recovery** via `TeamRestorer` — 3-phase restore protocol rebuilds
   teams from persisted events
 - **Three storage backends** (YAML files, MongoDB, and PostgreSQL via Nagra)
@@ -102,26 +104,38 @@ Create a team, send a message, stop it, and resume it:
 ```python
 from pathlib import Path
 from akgentic.core import ActorSystem, AgentCard, BaseConfig, BaseState
-from akgentic.core.akgent import Akgent
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.agent import Akgent
+from akgentic.core.messages.message import UserMessage
 from akgentic.team import (
     TeamCard, TeamCardMember, TeamManager, YamlEventStore,
 )
 
 # Define a simple agent
-class EchoAgent(Akgent):
-    def receiveMsg_UserMessage(self, msg):
-        print(f"Echo: {msg.content}")
+class EchoAgent(Akgent[BaseConfig, BaseState]):
+    def receiveMsg_UserMessage(self, message: UserMessage, sender: ActorAddress) -> None:
+        print(f"Echo: {message.content}")
 
-# Build a team definition
-card = AgentCard(
+# Build a team definition. The entry point is the team's external interface and
+# is never a recipient of its own sends, so it needs a member to route to —
+# every config.name in the tree must be unique.
+entry_card = AgentCard(
+    role="Entry", description="Team entry point",
+    skills=["routing"], agent_class=EchoAgent,
+    config=BaseConfig(name="@Entry", role="Entry"),
+)
+echo_card = AgentCard(
     role="Echo", description="Echoes messages",
     skills=["echo"], agent_class=EchoAgent,
     config=BaseConfig(name="@Echo", role="Echo"),
 )
 team_card = TeamCard(
     name="echo-team", description="Simple echo team",
-    entry_point=TeamCardMember(card=card),
-    members=[TeamCardMember(card=card)],
+    entry_point=TeamCardMember(card=entry_card),
+    members=[TeamCardMember(card=echo_card)],
+    # Required for runtime.send(str): the first type is what a plain string is
+    # wrapped in. Without it, send() raises RuntimeError.
+    message_types=[UserMessage],
 )
 
 # Create and manage a team
@@ -141,6 +155,16 @@ resumed.send("Back!")   # → Echo: Back!
 manager.stop_team(resumed.id)
 manager.delete_team(resumed.id)
 ```
+
+Two things to expect when you run this as a script:
+
+- **Sends are asynchronous.** `send()` is fire-and-forget, so the echo prints
+  once the actor gets around to the message, not on the line that sent it. Give
+  it a moment before stopping the team if you want to see the output.
+- **The process does not exit on its own** once the last line runs — the actor
+  system's threads keep the interpreter alive. Long-running programs stop the
+  actor system as part of their own shutdown; the `ak-team` CLI does this for
+  you (see [CLI](#cli)).
 
 ## Architecture
 
@@ -170,7 +194,7 @@ flow:
 | **Models** | Pydantic models for team definitions, runtime state, and persistence |
 | **Ports** | Protocol-based abstractions for storage and service discovery |
 | **Services** | TeamFactory (build), TeamManager (lifecycle), TeamRestorer (recovery) |
-| **Repositories** | EventStore implementations — YAML and MongoDB |
+| **Repositories** | EventStore implementations — YAML, MongoDB and PostgreSQL |
 | **Interfaces** | CLI commands and direct Python imports |
 
 ### State Machine
@@ -184,6 +208,44 @@ Teams follow a strict lifecycle:
                     └────────────────────┘
                        resume_team()
 ```
+
+### Idle-stop
+
+A running team does not stay up indefinitely. `TeamManager` gives every team its
+own `IdleStopSubscriber` (in `akgentic.team.subscriber`), which owns the whole
+idle-stop policy — the countdown included — and calls `stop_team` itself once the
+team has been idle long enough. The `RUNNING → STOPPED` edge above is therefore
+reached automatically as well as by an explicit `stop_team()`.
+
+- **Constructed per team, on both the create and the resume path**, behind the
+  `PersistenceSubscriber` and ahead of any shared subscribers you passed to
+  `TeamManager`. You do not construct or register it.
+- **Armed at construction and cancelled in `on_stop`.** A team that never
+  receives a single message still stops. If the team fails to build, `TeamManager`
+  cancels the countdown on the failure path rather than leaving it armed against
+  a team that does not exist.
+- **Driven by the event stream, not by a wall clock on the team.**
+  `ReceivedMessage` starts a task and `ProcessedMessage` completes one; the
+  countdown fires only while no task is in flight. Counting is suppressed during
+  a restore, so replaying a stopped team's event log cannot drive the clock.
+- **The stop runs on a daemon thread.** Stopping inline from the timeout callback
+  would deadlock: the stop path issues a `proxy_ask` into the orchestrator and
+  waits on the answer, which the orchestrator cannot service while that same
+  call is in flight.
+- **Idempotent.** If the team is already `STOPPED` or `DELETED` by the time the
+  countdown fires, the resulting error is swallowed and logged at DEBUG.
+
+The delay is read by this package's wiring from the `ORCHESTRATOR_TIMEOUT_DELAY`
+environment variable, in seconds; it falls back to a module-level default when
+the variable is unset, and a non-numeric value raises at wiring time rather than
+failing silently later. The variable keeps the name it had while the countdown
+lived in the orchestrator — only the site that reads it moved here, so existing
+deployments need no change.
+
+Because the countdown is armed as soon as a team is created, a short
+`ORCHESTRATOR_TIMEOUT_DELAY` will stop the team in the
+[Quick Start](#quick-start) before you get to `stop_team()`. That is the
+mechanism working, not a fault.
 
 ## Team Definitions
 
@@ -204,8 +266,10 @@ team_card = TeamCard(
     ],
 )
 
-team_card.agent_cards    # flat index of all AgentCards by name
-team_card.supervisors    # AgentCards with subordinates
+team_card.agent_cards    # flat index of all AgentCards by name (raises on a duplicate name)
+team_card.supervisors    # AgentCards of the first layer of members only —
+                         # the entry point is excluded (it is the sender, not a
+                         # recipient) and so are deeper-nested members
 ```
 
 ### TeamRuntime
@@ -414,9 +478,25 @@ provision an index for a query that does not yet exist.
 
 ### Event Sourcing
 
-Every message flowing through the orchestrator is captured by
-`PersistenceSubscriber` as an append-only event. Agent state snapshots
-are saved on `StateChangedMessage`.
+`PersistenceSubscriber` writes on two tracks, and every message takes exactly
+one of them:
+
+- **`StateChangedMessage` carrying a sender** is upserted as a latest-per-agent
+  snapshot via `save_agent_state`, keyed by the agent's UUID and carrying its
+  display name. It does **not** increment the sequence and is **never appended
+  to the event log**.
+- **Every other message** increments the sequence and is appended to the log via
+  `save_event`.
+
+The consequence is worth stating plainly: a snapshot write that is missed is a
+**permanent** loss, not a late write. There is no log entry to replay it from,
+so the agent's state is simply gone until that agent next changes state. A
+missed `save_event` costs one event out of a replayable log; a missed
+`save_agent_state` costs the state itself.
+
+During a restore the subscriber returns immediately from `on_message` and writes
+nothing at all — `TeamManager.resume_team` sets the guard around the replay so
+the replayed log is not persisted a second time.
 
 ### Storage Backends
 
@@ -662,25 +742,31 @@ uv run ruff check packages/akgentic-team/src/
 # Format
 uv run ruff format packages/akgentic-team/src/
 
-# Type check
-uv run mypy packages/akgentic-team/src/
+# Type check — pass this package's config explicitly. The workspace-root config
+# relaxes rules for other packages, so running mypy without it proves less.
+uv run mypy --config-file packages/akgentic-team/pyproject.toml packages/akgentic-team/src/
 ```
+
+All commands above are run from the workspace root.
 
 ### Project Structure
 
 ```
 src/akgentic/team/
-    __init__.py          # Public API (17 exports)
+    __init__.py          # Public API (__all__)
     models.py            # TeamCard, TeamRuntime, Process, TeamStatus, persistence models
+    messages.py          # WelcomeMessage
+    metadata.py          # TeamMetadata, make_index_entry, derive_metadata_indexes
     ports.py             # EventStore, ServiceRegistry protocols, NullServiceRegistry
     factory.py           # TeamFactory — static builder
     manager.py           # TeamManager — lifecycle facade
     restorer.py          # TeamRestorer — crash recovery
-    subscriber.py        # PersistenceSubscriber — event sourcing bridge
-    repositories/        # YamlEventStore, MongoEventStore
+    subscriber.py        # PersistenceSubscriber, IdleStopSubscriber
+    repositories/        # YamlEventStore, MongoEventStore, postgres/NagraEventStore
+    scripts/             # init_db / init_mongo deployment entry points
     cli/                 # ak-team CLI (Typer)
 examples/                # 6 progressive examples with companion docs
-tests/                   # 196 tests organized by domain
+tests/                   # organized by domain, mirroring src/
 ```
 
 ## License
