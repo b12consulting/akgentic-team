@@ -14,7 +14,7 @@ from akgentic.team.metadata import derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
 from akgentic.team.restorer import TeamRestorer
-from akgentic.team.subscriber import PersistenceSubscriber, TimerStopSubscriber
+from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class TeamManager:
                 shared across all teams. These must be thread-safe since
                 different teams' orchestrators may call on_message()
                 concurrently from different actor threads.
-                ``PersistenceSubscriber`` and ``TimerStopSubscriber`` are
+                ``PersistenceSubscriber`` and ``IdleStopSubscriber`` are
                 per-team and constructed internally by ``TeamManager`` in
                 ``create_team`` / ``resume_team``.
             instance_id: Worker instance identifier. Auto-generated if None.
@@ -151,8 +151,9 @@ class TeamManager:
     ) -> TeamRuntime:
         """Create and start a new team from a TeamCard.
 
-        Pre-generates a team_id, creates a PersistenceSubscriber (always first),
-        appends shared subscribers, then delegates to TeamFactory.build.
+        Pre-generates a team_id, creates a PersistenceSubscriber (always first)
+        and an IdleStopSubscriber behind it, appends shared subscribers, then
+        delegates to TeamFactory.build.
         On successful build, persists a Process with RUNNING status and registers
         the team with the ServiceRegistry.
 
@@ -192,10 +193,10 @@ class TeamManager:
 
         # Build subscriber list: per-team subscribers first, shared subscribers behind
         persistence_sub = PersistenceSubscriber(team_id, self._event_store)
-        timer_stop_sub = TimerStopSubscriber(self, team_id)
+        idle_stop_sub = IdleStopSubscriber(self, team_id)
         subscribers: list[EventSubscriber] = [
             persistence_sub,
-            timer_stop_sub,
+            idle_stop_sub,
             *self._shared_subscribers,
         ]
 
@@ -316,10 +317,10 @@ class TeamManager:
         persistence_sub = PersistenceSubscriber(
             team_id, self._event_store, initial_sequence=max_seq
         )
-        timer_stop_sub = TimerStopSubscriber(self, team_id)
+        idle_stop_sub = IdleStopSubscriber(self, team_id)
         all_subs: list[EventSubscriber] = [
             persistence_sub,
-            timer_stop_sub,
+            idle_stop_sub,
             *self._shared_subscribers,
         ]
 

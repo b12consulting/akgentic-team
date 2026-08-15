@@ -17,6 +17,9 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 
+from akgentic.team import manager as manager_module
+from akgentic.team import subscriber as subscriber_module
+from akgentic.team.factory import TeamFactory
 from akgentic.team.manager import GRACE_TIMEOUT_SECONDS, TeamManager
 from akgentic.team.models import (
     Process,
@@ -26,6 +29,8 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.ports import NullServiceRegistry
+from akgentic.team.restorer import TeamRestorer
+from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -1017,22 +1022,124 @@ class TestTeamManagerStop:
 
 
 # ---------------------------------------------------------------------------
-# Tests: TimerStopSubscriber → STOPPED bridge
-# Timer-stop bridge: TimerStopSubscriber is a standard per-team subscriber.
+# Tests: IdleStopSubscriber registration and the idle-stop chain
+# The subscriber is per-team, so TeamManager constructs one on each of the two
+# lifecycle paths — create_team and resume_team. Both sites get their own test:
+# wiring only create leaves resumed teams with no idle clock, and nothing fails
+# until someone leaves a resumed team idle.
 # ---------------------------------------------------------------------------
 
 
-def test_timer_stop_persists_stopped_status(
+def _assert_idle_stop_registration(
+    subscribers: list[EventSubscriber],
+    team_id: uuid.UUID,
+    shared: EventSubscriber,
+) -> None:
+    """Assert a captured subscriber list carries the idle-stop wiring, in order.
+
+    Position is part of the contract, not incidental: per-team subscribers
+    first (PersistenceSubscriber, then idle-stop), shared subscribers behind.
+    """
+    idle_subs = [s for s in subscribers if isinstance(s, IdleStopSubscriber)]
+    assert len(idle_subs) == 1
+    assert idle_subs[0]._team_id == team_id
+    assert isinstance(subscribers[0], PersistenceSubscriber)
+    assert subscribers == [subscribers[0], idle_subs[0], shared]
+
+
+def test_create_team_registers_an_idle_stop_subscriber(
     actor_system: ActorSystem,
     event_store: InMemoryEventStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end: orchestrator inactivity timer drives Process.status == STOPPED.
+    """AC1: create_team hands TeamFactory.build one IdleStopSubscriber for this team.
 
-    Re-enabled in Story 21.3 once TimerStopSubscriber is wired as a
-    standard per-team subscriber. The full chain under test is:
-    timer → _timeout_handler → _notify_subscribers("on_stop_request")
-    → TimerStopSubscriber → stop_team → event_store.save_team(STOPPED).
+    The list is not reachable after the fact — it is passed into the builder and
+    handed to the orchestrator — so it is captured at the call by a wrapper that
+    delegates to the real builder, leaving the rest of create_team intact.
+    """
+    captured: list[list[EventSubscriber]] = []
+    real_build = TeamFactory.build
+
+    def _capturing_build(
+        team_card: TeamCard,
+        system: ActorSystem,
+        subscribers: list[EventSubscriber] | None = None,
+        team_id: uuid.UUID | None = None,
+    ) -> TeamRuntime:
+        captured.append(list(subscribers or []))
+        return real_build(team_card, system, subscribers, team_id)
+
+    monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
+
+    shared = RecordingSubscriber()
+    mgr = TeamManager(
+        actor_system=actor_system,
+        event_store=event_store,
+        subscribers=[shared],
+    )
+    runtime = mgr.create_team(_make_team_card())
+
+    assert len(captured) == 1
+    _assert_idle_stop_registration(captured[0], runtime.id, shared)
+
+
+def test_resume_team_registers_an_idle_stop_subscriber(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2: resume_team builds its own subscriber list — it gets one too.
+
+    Deliberately not a corollary of the create-path test: resume_team assembles
+    a second, independent list, and a resumed team without an idle clock is
+    invisible until someone leaves one idle.
+    """
+    shared = RecordingSubscriber()
+    mgr = TeamManager(
+        actor_system=actor_system,
+        event_store=event_store,
+        subscribers=[shared],
+    )
+    team_id = _create_and_stop_team(mgr, event_store)
+
+    captured: list[list[EventSubscriber]] = []
+    real_restore = TeamRestorer.restore
+
+    def _capturing_restore(
+        restorer: TeamRestorer,
+        process: Process,
+        subscribers: list[EventSubscriber] | None = None,
+    ) -> TeamRuntime:
+        captured.append(list(subscribers or []))
+        return real_restore(restorer, process, subscribers)
+
+    monkeypatch.setattr(manager_module.TeamRestorer, "restore", _capturing_restore)
+
+    mgr.resume_team(team_id)
+
+    assert len(captured) == 1
+    _assert_idle_stop_registration(captured[0], team_id, shared)
+
+
+def test_timer_stop_subscriber_no_longer_exists() -> None:
+    """AC4: the replaced subscriber is gone from the module it lived in."""
+    assert not hasattr(subscriber_module, "TimerStopSubscriber")
+
+
+def test_idle_team_created_through_the_manager_stops_itself(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3: a team nobody talks to stops itself, through the real wiring.
+
+    The whole chain, end to end, and the only assertion that covers all of it:
+    create_team constructs an IdleStopSubscriber with no delay argument, so the
+    subscriber reads ORCHESTRATOR_TIMEOUT_DELAY itself and arms a Timer; no
+    message ever pokes the countdown; the Timer thread fires _on_idle, which
+    hands stop_team to a daemon thread; stop_team tears the orchestrator down
+    and persists STOPPED.
     """
     monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
 

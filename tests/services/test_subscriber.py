@@ -175,8 +175,6 @@ class TestPersistenceSubscriber:
             sub.set_restoring(wrong, True)
         with pytest.raises(AssertionError):
             sub.on_stop(wrong)
-        with pytest.raises(AssertionError):
-            sub.on_stop_request(wrong)
 
     # -- 3.7: Explicit inheritance from EventSubscriber --------------------
 
