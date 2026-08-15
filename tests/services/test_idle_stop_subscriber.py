@@ -50,10 +50,10 @@ class _RecordingTeamManager:
 
 
 class _RecordingTimer(Timer):
-    """``Timer`` double that records ``start``/``cancel`` without arming threads.
+    """``Timer`` double recording ``start``/``cancel``/``close`` without threads.
 
     ``task_started``/``task_completed`` are inherited unchanged, so the task
-    counting under test is the real thing; only the two thread-touching methods
+    counting under test is the real thing; only the thread-touching methods
     they delegate to are replaced by recorders.
     """
 
@@ -66,6 +66,9 @@ class _RecordingTimer(Timer):
 
     def cancel(self) -> None:
         self.events.append("cancel")
+
+    def close(self) -> None:
+        self.events.append("close")
 
 
 def _wait_for(condition: Callable[[], bool], timeout: float = 2.0) -> None:
@@ -109,16 +112,17 @@ def test_subclasses_event_subscriber_and_owns_a_core_timer() -> None:
     assert isinstance(sub._timer, Timer)
 
 
-def test_defines_the_three_protocol_hooks_and_no_stop_request() -> None:
-    sub, _, _ = _instrumented()
+def test_defines_all_four_protocol_hooks() -> None:
     # Defined on the class itself, not merely inherited from the Protocol's
     # no-op defaults — an inherited `...` body would satisfy `callable()` while
-    # implementing none of the behaviour the rest of this file pins.
+    # implementing none of the behaviour the rest of this file pins. That is
+    # exactly the distinction that matters for on_stop_request: inheriting the
+    # Protocol's no-op would leave the countdown armed through the teardown.
     own = vars(IdleStopSubscriber)
     assert "set_restoring" in own
     assert "on_message" in own
+    assert "on_stop_request" in own
     assert "on_stop" in own
-    assert not hasattr(sub, "on_stop_request")
 
 
 # --- AC2: on_message drives the clock, and nothing else does -----------------
@@ -353,6 +357,133 @@ def test_on_stop_cancels_the_countdown() -> None:
 
     # Wait well past the injected delay: the countdown must never fire.
     time.sleep(1.5)
+    assert manager.calls == []
+
+
+# --- AC1/AC3/AC4: on_stop_request closes the countdown terminally -------------
+
+
+def test_on_stop_request_closes_rather_than_cancels_the_countdown() -> None:
+    sub, team_id, timer = _instrumented()
+
+    sub.on_stop_request(team_id)
+
+    assert timer.events == ["close"]
+    assert sub._stopping is True
+
+
+def test_on_stop_request_is_a_no_op_when_repeated_or_after_on_stop() -> None:
+    """Terminal and idempotent — the second signal changes nothing."""
+    manager = _RecordingTeamManager()
+    sub, team_id, timer = _instrumented(manager)
+
+    sub.on_stop_request(team_id)
+    sub.on_stop_request(team_id)
+    sub.on_stop(team_id)
+    sub.on_stop_request(team_id)
+
+    assert timer.events == ["close", "close", "cancel", "close"]
+    assert sub._stopping is True
+    time.sleep(0.05)
+    assert manager.calls == []
+
+
+def test_a_foreign_on_stop_request_leaves_this_subscriber_untouched() -> None:
+    """Same contract as the other hooks: reject *before* any side effect.
+
+    A foreign orchestrator closing this team's countdown would be permanent —
+    ``close()`` has no undo — and the ``AssertionError`` that rejects it is
+    swallowed by core's per-subscriber exception handling.
+    """
+    sub, _, timer = _instrumented()
+    wrong = uuid.uuid4()
+
+    with pytest.raises(AssertionError):
+        sub.on_stop_request(wrong)
+
+    assert timer.events == [], "a foreign on_stop_request closed this team's countdown"
+    assert sub._stopping is False
+
+
+class _FiringRecordingSubscriber(IdleStopSubscriber):
+    """Records every countdown firing, ahead of the dispatch decision.
+
+    The firing is the observable that separates the two disarms. Whether a
+    firing goes on to dispatch a stop is a second, independent question the
+    ``_stopping`` latch answers — so asserting only on ``stop_team`` calls
+    would let a countdown re-arm and fire unnoticed.
+    """
+
+    def __init__(self, team_manager: Any, team_id: uuid.UUID, delay: int) -> None:
+        self.firings: list[float] = []
+        super().__init__(team_manager, team_id, delay=delay)
+
+    def _on_idle(self) -> None:
+        self.firings.append(time.monotonic())
+        super()._on_idle()
+
+
+def test_a_closed_countdown_cannot_be_re_armed_but_a_cancelled_one_can() -> None:
+    """The reason ``close()`` exists, pinned by the contrast rather than implied.
+
+    Both subscribers run a *real* ``Timer`` and receive the same telemetry pair
+    a draining mailbox delivers during a teardown. ``task_completed()`` calls
+    ``start()`` at count zero, so the merely cancelled countdown comes back,
+    fires, and stops the team; the closed one never runs again. If the
+    cancelled half ever stops re-arming, that is a core behaviour change and
+    the pair goes red together, which is the point.
+    """
+    closed_manager = _RecordingTeamManager()
+    closed_team_id = uuid.uuid4()
+    closed = _FiringRecordingSubscriber(closed_manager, closed_team_id, delay=1)
+
+    cancelled_manager = _RecordingTeamManager()
+    cancelled_team_id = uuid.uuid4()
+    cancelled = _FiringRecordingSubscriber(cancelled_manager, cancelled_team_id, delay=1)
+
+    closed.on_stop_request(closed_team_id)
+    cancelled._timer.cancel()  # the pre-fix disarm
+
+    for sub in (closed, cancelled):
+        sub.on_message(ReceivedMessage(message_id=uuid.uuid4()))
+        sub.on_message(ProcessedMessage(message_id=uuid.uuid4()))
+
+    # Well past the injected delay: whatever was going to fire has fired.
+    time.sleep(1.5)
+
+    assert closed.firings == [], "the drain re-armed a countdown that had been closed"
+    assert closed_manager.calls == []
+    assert cancelled.firings, (
+        "a merely cancelled countdown no longer re-arms — close() would be redundant"
+    )
+    assert cancelled_manager.calls == [cancelled_team_id]
+
+
+def test_two_idle_firings_dispatch_exactly_one_stop_team() -> None:
+    manager = _RecordingTeamManager()
+    sub, team_id, _ = _instrumented(manager)
+
+    sub._on_idle()
+    sub._on_idle()
+
+    _wait_for(lambda: manager.calls == [team_id])
+    time.sleep(0.1)
+    assert manager.calls == [team_id]
+
+
+def test_an_idle_firing_after_on_stop_request_dispatches_nothing() -> None:
+    """The narrow race the latch exists for: a callback already on its way.
+
+    ``close()`` cannot unfire a callback whose thread was dispatched
+    microseconds before the stop signal arrived; the latch drops it.
+    """
+    manager = _RecordingTeamManager()
+    sub, team_id, _ = _instrumented(manager)
+
+    sub.on_stop_request(team_id)
+    sub._on_idle()
+
+    time.sleep(0.1)
     assert manager.calls == []
 
 

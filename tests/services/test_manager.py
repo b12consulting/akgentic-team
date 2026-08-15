@@ -15,6 +15,7 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
+from akgentic.core.messages.orchestrator import ProcessedMessage
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 
 from akgentic.team import manager as manager_module
@@ -1222,6 +1223,69 @@ def test_failed_resume_leaves_no_armed_countdown(
 
     time.sleep(2.0)
     assert stop_calls == []
+
+
+def test_a_teardown_dispatches_exactly_one_stop_team(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telemetry draining mid-teardown cannot re-arm the countdown (story 29.4).
+
+    The whole teardown is the window. ``Orchestrator.stop()`` announces itself
+    to subscribers first and drains the mailbox afterwards, so ``on_message``
+    keeps arriving while the team is coming down. A countdown merely
+    *cancelled* is brought back by ``task_completed()`` at count zero, fires
+    inside the window, and re-enters ``stop_team`` while the Process is still
+    RUNNING — ``stop_team`` persists STOPPED only after ``_teardown_team``
+    returns — for a second, concurrent teardown of the same team.
+
+    Exactly one, never ``>= 1``: a second teardown is precisely what this
+    asserts the absence of.
+    """
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    captured: list[IdleStopSubscriber] = []
+    real_build = TeamFactory.build
+
+    def _capturing_build(
+        team_card: TeamCard,
+        system: ActorSystem,
+        subscribers: list[EventSubscriber] | None = None,
+        team_id: uuid.UUID | None = None,
+    ) -> TeamRuntime:
+        captured.extend(s for s in subscribers or [] if isinstance(s, IdleStopSubscriber))
+        return real_build(team_card, system, subscribers, team_id)
+
+    monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
+
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    runtime = mgr.create_team(_make_team_card())
+    team_id = runtime.id
+    assert len(captured) == 1
+    idle_stop = captured[0]
+
+    teardowns: list[uuid.UUID] = []
+    real_teardown = mgr._teardown_team
+
+    def _recording_teardown(tid: uuid.UUID, rt: TeamRuntime) -> None:
+        teardowns.append(tid)
+        # Delegate FIRST: the real teardown is what runs Orchestrator.stop(),
+        # and therefore what raises on_stop_request. A stub replacement raises
+        # nothing and would pass with or without the fix.
+        real_teardown(tid, rt)
+        if len(teardowns) > 1:
+            return  # a re-entrant teardown holds no window open of its own
+        # Then hold the window open, with telemetry still arriving, past the
+        # injected delay — long enough for a re-armed countdown to fire.
+        idle_stop.on_message(ProcessedMessage(message_id=uuid.uuid4()))
+        time.sleep(2.0)
+
+    monkeypatch.setattr(mgr, "_teardown_team", _recording_teardown)
+
+    mgr.stop_team(team_id)
+
+    assert teardowns == [team_id]
 
 
 # ---------------------------------------------------------------------------

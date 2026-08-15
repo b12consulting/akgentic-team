@@ -133,6 +133,22 @@ class PersistenceSubscriber(EventSubscriber):
         assert team_id == self._team_id
         self._restoring = restoring
 
+    def on_stop_request(self, team_id: uuid.UUID) -> None:
+        """No-op: this subscriber holds nothing to release when a stop begins.
+
+        Persistence keeps running until the mailbox is drained — the events
+        still arriving during a teardown are exactly the ones a resume needs.
+
+        Defined rather than inherited: the Protocol's hooks have empty bodies,
+        which makes mypy treat an explicit subclass that leaves one unimplemented
+        as abstract, and this class is instantiated in ``manager.py``.
+
+        Args:
+            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
+                event. MUST match ``self._team_id``.
+        """
+        assert team_id == self._team_id
+
     def on_stop(self, team_id: uuid.UUID) -> None:
         """No-op: required by EventSubscriber protocol.
 
@@ -171,6 +187,18 @@ class IdleStopSubscriber(EventSubscriber):
     guard those drive the clock and a team can idle-stop moments after coming
     back, or mid-restore.
 
+    Two lifecycle moments disarm the countdown, and they differ:
+
+    - ``on_stop_request`` — teardown has *begun*. The countdown is **closed**,
+      terminally: the mailbox is still draining behind this signal, and a
+      merely cancelled timer is re-armed by the next ``task_completed()`` at
+      count zero. A countdown that fires mid-teardown races a second
+      ``stop_team`` into an orchestrator already stopping.
+    - ``on_stop`` — teardown has *ended*. It keeps its plain ``cancel()``: a
+      stop driven straight through Pykka never enters ``Orchestrator.stop()``
+      and so never raises ``on_stop_request``, and that path still needs a
+      disarm.
+
     Idempotent: if ``stop_team`` raises :class:`ValueError` because the team is
     already ``STOPPED`` or ``DELETED``, the error is swallowed and logged at
     DEBUG.
@@ -195,6 +223,10 @@ class IdleStopSubscriber(EventSubscriber):
         self._team_manager = team_manager
         self._team_id = team_id
         self._restoring = False
+        # Set before the countdown is armed: a delay of 0 fires _on_idle on the
+        # Timer thread the moment start() returns, and it reads both.
+        self._stopping = False
+        self._stop_lock = threading.Lock()
         self._timer = Timer(
             resolve_idle_stop_delay() if delay is None else delay,
             timeout_callback=self._on_idle,
@@ -231,8 +263,37 @@ class IdleStopSubscriber(EventSubscriber):
         elif isinstance(msg, ProcessedMessage):
             self._timer.task_completed()
 
+    def on_stop_request(self, team_id: uuid.UUID) -> None:
+        """Close the countdown for good — this team's teardown has *begun*.
+
+        The orchestrator raises this as the first statement of its own
+        ``stop()``, before any child is touched. The countdown is *closed*
+        rather than cancelled because a cancel is resumable: the drain that
+        follows keeps delivering ``ProcessedMessage``, and ``task_completed()``
+        calls ``start()`` unconditionally once the in-flight count reaches
+        zero — re-arming a merely cancelled timer in the middle of the
+        teardown it was supposed to stay out of. ``close()`` is terminal, so
+        nothing the drain delivers brings the clock back.
+
+        Idempotent: calling it twice, or after ``on_stop``, changes nothing.
+        The assertion comes first so a foreign ``team_id`` cannot disarm this
+        team's countdown on its way to raising.
+
+        Args:
+            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
+                event. MUST match ``self._team_id``.
+        """
+        assert team_id == self._team_id
+        with self._stop_lock:
+            self._stopping = True
+        self._timer.close()
+
     def on_stop(self, team_id: uuid.UUID) -> None:
         """Cancel the countdown — the team is stopping, idle or not.
+
+        Kept alongside ``on_stop_request``, not replaced by it: a stop driven
+        straight through Pykka never enters ``Orchestrator.stop()``, so this is
+        the only disarm those paths get.
 
         Args:
             team_id: ``team_id`` of the orchestrator dispatching this lifecycle
@@ -246,7 +307,20 @@ class IdleStopSubscriber(EventSubscriber):
 
         Runs on the ``Timer`` thread. Doing the stop here would deadlock the
         orchestrator, so this method does nothing but dispatch.
+
+        The ``_stopping`` latch is narrow by design. ``close()`` is what makes
+        the countdown unre-armable; what it cannot do is unfire a callback
+        already dispatched microseconds before ``on_stop_request`` arrived.
+        The latch covers that race, and makes a double fire dispatch exactly
+        one stop. It is read-modify-written from the ``Timer`` thread here and
+        from the orchestrator's actor thread in ``on_stop_request``, hence the
+        lock — which is released before the daemon thread starts, so a
+        ``stop_team`` in flight never blocks the actor thread.
         """
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
         thread = threading.Thread(
             target=self._drain_to_stop_team,
             name=f"idle-stop-subscriber-{self._team_id}",

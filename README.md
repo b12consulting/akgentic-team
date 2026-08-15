@@ -222,10 +222,15 @@ reached automatically as well as by an explicit `stop_team()`.
 - **Constructed per team, on both the create and the resume path**, behind the
   `PersistenceSubscriber` and ahead of any shared subscribers you passed to
   `TeamManager`. You do not construct or register it.
-- **Armed at construction and cancelled in `on_stop`.** A team that never
-  receives a single message still stops. If the team fails to build, `TeamManager`
-  cancels the countdown on the failure path rather than leaving it armed against
-  a team that does not exist.
+- **Armed at construction, closed for good when a teardown begins.** A team that
+  never receives a single message still stops. `on_stop_request` — raised by the
+  orchestrator as the first statement of its own stop — closes the countdown
+  terminally, because the mailbox drains behind that signal and a merely
+  cancelled countdown is re-armed by the telemetry still arriving. `on_stop`
+  keeps its plain cancel for the paths that never raise `on_stop_request`, such
+  as a stop driven straight through Pykka. If the team fails to build,
+  `TeamManager` cancels the countdown on the failure path rather than leaving it
+  armed against a team that does not exist.
 - **Driven by the event stream, not by a wall clock on the team.**
   `ReceivedMessage` starts a task and `ProcessedMessage` completes one; the
   countdown fires only while no task is in flight. Counting is suppressed during
