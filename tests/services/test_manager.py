@@ -1161,6 +1161,69 @@ def test_idle_team_created_through_the_manager_stops_itself(
     assert team_id not in mgr._runtimes
 
 
+def test_failed_create_leaves_no_armed_countdown(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team that never built must not be stopped later by a stray countdown.
+
+    The subscriber arms its Timer in its constructor, which runs before
+    TeamFactory.build. Once the build has registered subscribers its own
+    rollback stops the orchestrator, which fans on_stop out and cancels the
+    countdown. A card rejected *before* that point — an entry point with
+    headcount != 1 — never reaches registration, so only create_team can
+    cancel: otherwise the Timer thread outlives the failed call for the whole
+    delay and then reaches stop_team for a team that was never created.
+    """
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    stop_calls: list[uuid.UUID] = []
+    monkeypatch.setattr(mgr, "stop_team", stop_calls.append)
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    invalid = _make_team_card(entry_point=_make_member("lead", "Lead", headcount=2))
+    with pytest.raises(ValueError, match="headcount=1"):
+        mgr.create_team(invalid)
+
+    # Twice the delay: an uncancelled countdown has fired well before this.
+    time.sleep(2.0)
+    assert stop_calls == []
+
+
+def test_failed_resume_leaves_no_armed_countdown(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resume path arms its own countdown, so it needs its own cancel.
+
+    Mirror of the create-path test: resume_team builds a second, independent
+    subscriber, and a restore that raises leaves it armed against a team that
+    is not running.
+    """
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    team_id = _create_and_stop_team(mgr, event_store)
+
+    def _boom(
+        restorer: TeamRestorer,
+        process: Process,
+        subscribers: list[EventSubscriber] | None = None,
+    ) -> TeamRuntime:
+        msg = "restore failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(manager_module.TeamRestorer, "restore", _boom)
+    stop_calls: list[uuid.UUID] = []
+    monkeypatch.setattr(mgr, "stop_team", stop_calls.append)
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    with pytest.raises(RuntimeError):
+        mgr.resume_team(team_id)
+
+    time.sleep(2.0)
+    assert stop_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: catalog_namespace (Story 18.1)
 # ---------------------------------------------------------------------------

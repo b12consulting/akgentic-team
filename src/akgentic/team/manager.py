@@ -201,7 +201,16 @@ class TeamManager:
         ]
 
         # Build the team — if this raises, no Process is persisted
-        runtime = TeamFactory.build(team_card, self._actor_system, subscribers, team_id=team_id)
+        try:
+            runtime = TeamFactory.build(team_card, self._actor_system, subscribers, team_id=team_id)
+        except Exception:
+            # The idle-stop countdown is armed in the subscriber's constructor,
+            # above, but a team that never built has no orchestrator to dispatch
+            # on_stop and cancel it. Without this the Timer thread outlives the
+            # failed call for the whole delay and then fires stop_team on a team
+            # that does not exist.
+            idle_stop_sub.on_stop(team_id)
+            raise
 
         # Track runtime for stop_team
         self._runtimes[team_id] = runtime
@@ -331,6 +340,12 @@ class TeamManager:
 
         try:
             runtime = restorer.restore(process, subscribers=all_subs)
+        except Exception:
+            # Same reason as create_team: nothing dispatches on_stop to a
+            # subscriber whose team never came back up, so cancel its countdown
+            # here rather than leave it armed against a team that is not running.
+            idle_stop_sub.on_stop(team_id)
+            raise
         finally:
             for sub in all_subs:
                 sub.set_restoring(team_id, False)
