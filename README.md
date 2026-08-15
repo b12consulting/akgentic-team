@@ -119,13 +119,15 @@ class EchoAgent(Akgent[BaseConfig, BaseState]):
 # Build a team definition. The entry point is the team's external interface and
 # is never a recipient of its own sends, so it needs a member to route to —
 # every config.name in the tree must be unique.
+# `role` is NOT a constructor argument — it is a read-only property reading
+# config.role, so passing role= here is silently dropped. Set it on the config.
 entry_card = AgentCard(
-    role="Entry", description="Team entry point",
+    description="Team entry point",
     skills=["routing"], agent_class=EchoAgent,
     config=BaseConfig(name="@Entry", role="Entry"),
 )
 echo_card = AgentCard(
-    role="Echo", description="Echoes messages",
+    description="Echoes messages",
     skills=["echo"], agent_class=EchoAgent,
     config=BaseConfig(name="@Echo", role="Echo"),
 )
