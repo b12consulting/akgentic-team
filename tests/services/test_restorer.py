@@ -147,11 +147,17 @@ def _make_start_message(
     parent_id: uuid.UUID | None = None,
     parent_name: str = "orchestrator",
     parent_role: str = "Orchestrator",
+    sender_squad_id: uuid.UUID | None = None,
 ) -> StartMessage:
     """Create a StartMessage with a properly-formed sender address.
 
     Args:
         parent_id: If set, creates a parent ActorAddressProxy with this agent_id.
+        sender_squad_id: Squad stamped into the sender address dict. Defaults to a
+            fresh random UUID -- deliberately unrelated to ``config.squad_id``, which
+            is what the persisted addresses of pre-existing fixtures look like. Pass
+            the config's own squad to build a fixture that does not itself ship the
+            sender/config disagreement a test is trying to detect.
     """
     cfg = config or BaseConfig(name=name, role=role)
     msg = StartMessage(config=cfg)
@@ -166,7 +172,7 @@ def _make_start_message(
         "name": name,
         "role": role,
         "team_id": str(team_id),
-        "squad_id": str(uuid.uuid4()),
+        "squad_id": str(sender_squad_id or uuid.uuid4()),
         "user_message": False,
     }
     sender = ActorAddressProxy(addr_dict)
@@ -220,11 +226,19 @@ def _populate_stopped_team(
     team_card: TeamCard | None = None,
     extra_members: list[tuple[str, str]] | None = None,
     fired_members: list[tuple[str, str, uuid.UUID]] | None = None,
+    orchestrator_config: BaseConfig | None = None,
 ) -> tuple[uuid.UUID, Process]:
     """Populate InMemoryEventStore with events simulating a stopped team.
 
     Creates StartMessage events for orchestrator + all agents in team_card,
     plus optional fired agents (with matching StopMessage events).
+
+    Args:
+        orchestrator_config: Config persisted on the orchestrator's StartMessage.
+            Defaults to ``BaseConfig(name="@Orchestrator", role="Orchestrator")``,
+            which carries no squad -- so the default fixture cannot express a
+            squad-preservation regression. Pass a config carrying a ``squad_id``
+            (and non-default name/role) to exercise the restore passthrough.
 
     Returns:
         Tuple of (team_id, Process with STOPPED status).
@@ -236,13 +250,19 @@ def _populate_stopped_team(
     # Orchestrator StartMessage
     orch_id = uuid.uuid4()
     seq += 1
+    orch_config = orchestrator_config or BaseConfig(name="@Orchestrator", role="Orchestrator")
     orch_start = _make_start_message(
         orch_id,
         "orchestrator",
         "Orchestrator",
         team_id,
         agent_class=Orchestrator,
-        config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
+        config=orch_config,
+        # Keep the persisted sender in agreement with the persisted config, so a
+        # sender/config mismatch observed after restore can only come from the
+        # restore path. With the default config (no squad) this falls back to the
+        # random UUID every other fixture stamps.
+        sender_squad_id=orch_config.squad_id,
     )
     event_store.save_event(
         PersistedEvent(
@@ -2560,3 +2580,114 @@ class TestRestorerNotificationAddressResolution:
         warning = _replayed_notification(replayed, WarningMessage)
         assert warning.current_message is None
         assert warning.sender is runtime.addrs["lead"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: orchestrator config passthrough on restore (Story 30-1)
+# ---------------------------------------------------------------------------
+
+
+def _replayed_orchestrator_start(
+    replayed: list[Message],
+    orchestrator_id: uuid.UUID,
+) -> StartMessage:
+    """Return the replayed ``StartMessage`` sent by the restored orchestrator."""
+    matches = [
+        m
+        for m in replayed
+        if isinstance(m, StartMessage)
+        and m.sender is not None
+        and m.sender.agent_id == orchestrator_id
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one replayed orchestrator StartMessage, got {len(matches)}"
+    )
+    return matches[0]
+
+
+class TestRestorerOrchestratorConfigPreserved:
+    """Restore hands the orchestrator its persisted config, not a synthesised one.
+
+    ``ActorAddressImpl`` caches ``squad_id``/``name``/``role`` from ``actor.config``
+    at construction, so whatever config the restore path passes to ``createActor``
+    is frozen into every address the orchestrator subsequently appears in --
+    including the ``sender`` of its own replayed ``StartMessage``. Synthesising a
+    config here therefore does not merely lose fields, it publishes wrong ones.
+    """
+
+    def test_persisted_squad_id_survives_restore(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 2: the restored orchestrator address reports the persisted squad."""
+        persisted_squad = uuid.uuid4()
+        team_id, process = _populate_stopped_team(
+            event_store,
+            orchestrator_config=BaseConfig(
+                name="@Orchestrator",
+                role="Orchestrator",
+                squad_id=persisted_squad,
+            ),
+        )
+        del team_id
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert runtime.orchestrator_addr.squad_id == persisted_squad
+
+    def test_replayed_start_message_agrees_with_itself(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 3: the replayed orchestrator StartMessage does not contradict itself.
+
+        ``_resolve_event_addresses`` swaps the persisted proxy sender for the live
+        address before replay, so ``sender.squad_id`` reads what ``createActor`` was
+        handed while ``config.squad_id`` stays the persisted value -- the two sides
+        of the assertion.
+        """
+        persisted_squad = uuid.uuid4()
+        team_id, process = _populate_stopped_team(
+            event_store,
+            orchestrator_config=BaseConfig(
+                name="@Orchestrator",
+                role="Orchestrator",
+                squad_id=persisted_squad,
+            ),
+        )
+        del team_id
+
+        runtime, replayed = _restore_capturing_replay(actor_system, event_store, process)
+
+        orch_start = _replayed_orchestrator_start(replayed, runtime.orchestrator_addr.agent_id)
+        assert orch_start.sender is not None
+        # The persisted side must still be the persisted value: createActor mutates
+        # the config object it is handed, so a config passed by reference would have
+        # this assertion pass by corrupting the event rather than by fixing restore.
+        assert orch_start.config.squad_id == persisted_squad
+        assert orch_start.sender.squad_id == orch_start.config.squad_id
+
+    def test_persisted_name_and_role_survive_restore(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 4: non-default name/role on the persisted config survive the restore."""
+        team_id, process = _populate_stopped_team(
+            event_store,
+            orchestrator_config=BaseConfig(
+                name="@TeamCoordinator",
+                role="Coordinator",
+                squad_id=uuid.uuid4(),
+            ),
+        )
+        del team_id
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert runtime.orchestrator_addr.name == "@TeamCoordinator"
+        assert runtime.orchestrator_addr.role == "Coordinator"
