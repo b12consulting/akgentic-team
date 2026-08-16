@@ -3,9 +3,9 @@
 [![CI](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/e986fdd05c8c3d93e718782dc034e0c1/raw/coverage.json)](https://github.com/b12consulting/akgentic-team/actions/workflows/ci.yml)
 
-Team lifecycle management for the [Akgentic](https://github.com/b12consulting/akgentic-quick-start)
-multi-agent framework. Create, resume, stop, and delete multi-agent teams
-with event-sourced persistence and crash recovery.
+Team lifecycle management for the [Akgentic](https://github.com/b12consulting/akgentic-framework)
+multi-agent framework (open-source bundle). Create, resume, stop, and delete
+multi-agent teams with event-sourced persistence and crash recovery.
 
 ## Table of Contents
 
@@ -64,38 +64,63 @@ TeamCard ──▶ TeamFactory.build() ──▶ TeamRuntime (live actors)
 
 ## Installation
 
-### Workspace Installation (Recommended)
-
-This package is designed for use within the Akgentic monorepo workspace:
+Published on PyPI. Python 3.12 or newer.
 
 ```bash
-git clone git@github.com:b12consulting/akgentic-quick-start.git
-cd akgentic-quick-start
-git submodule update --init --recursive
-
-uv venv
-source .venv/bin/activate
-uv sync --all-packages --all-extras
+uv add akgentic-team
+# or
+pip install akgentic-team
 ```
 
-All dependencies (`akgentic-core`) resolve automatically via workspace
-configuration.
+That is the whole install. `akgentic-core`, `pydantic` and `pyyaml` come with it
+as ordinary dependencies — no workspace checkout, no submodules.
 
 ### Optional Extras
 
+The base install gives you the lifecycle service and the YAML event store. Each
+extra adds one optional surface:
+
+| Extra      | Packages pulled in         | Enables                     |
+|------------|----------------------------|-----------------------------|
+| `cli`      | `typer`, `rich`            | `ak-team` console script    |
+| `mongo`    | `pymongo`                  | `MongoEventStore`           |
+| `postgres` | `nagra`, `psycopg[binary]` | `NagraEventStore`           |
+
 ```bash
-# CLI (Typer + Rich)
-uv sync --extra cli
-
-# MongoDB backend
-uv sync --extra mongo
-
-# PostgreSQL backend (Nagra)
-uv sync --extra postgres
-
-# Everything
-uv sync --all-extras
+uv add "akgentic-team[cli]"
+uv add "akgentic-team[cli,postgres]"
 ```
+
+`mongo` and `postgres` are alternative backends — pick the one you deploy. An
+optional backend is imported lazily, so importing `akgentic.team` without
+`pymongo` or `psycopg` installed is fine.
+
+### As part of the framework bundle
+
+`akgentic-framework` is the meta-distribution that pins every akgentic package
+at versions built and tested together. Install `akgentic-team` through it when
+you want the release-wide pin rather than a single package:
+
+```bash
+pip install "akgentic-framework[team]"   # this package + its closure, release-pinned
+pip install "akgentic-framework[all]"    # the whole framework
+```
+
+### Working on the package itself
+
+To develop `akgentic-team` rather than use it, clone the open-source bundle
+[akgentic-framework](https://github.com/b12consulting/akgentic-framework), which
+carries every package together as submodules:
+
+```bash
+git clone git@github.com:b12consulting/akgentic-framework.git
+cd akgentic-framework
+git submodule update --init
+# uncomment the two "SOURCE MODE" blocks in pyproject.toml
+uv sync
+```
+
+Source mode resolves `akgentic-*` to the local checkouts, editable.
 
 ## Quick Start
 
@@ -738,23 +763,26 @@ uv sync --all-extras
 
 ```bash
 # Run tests
-uv run pytest packages/akgentic-team/tests/
+uv run pytest tests/
 
 # Run tests with coverage
-uv run pytest packages/akgentic-team/tests/ --cov=akgentic.team --cov-fail-under=80
+uv run pytest tests/ --cov=akgentic.team --cov-fail-under=80
 
 # Lint
-uv run ruff check packages/akgentic-team/src/
+uv run ruff check src/ tests/
 
 # Format
-uv run ruff format packages/akgentic-team/src/
+uv run ruff format src/ tests/
 
-# Type check — pass this package's config explicitly. The workspace-root config
-# relaxes rules for other packages, so running mypy without it proves less.
-uv run mypy --config-file packages/akgentic-team/pyproject.toml packages/akgentic-team/src/
+# Type check
+uv run mypy src/
 ```
 
-All commands above are run from the workspace root.
+All commands above are run from this repository's root. Inside the
+`akgentic-framework` bundle they take a `packages/akgentic-team/` prefix, and
+mypy then needs `--config-file packages/akgentic-team/pyproject.toml` — the
+bundle-root config relaxes rules for other packages, so running mypy without it
+proves less.
 
 ### Project Structure
 
