@@ -15,8 +15,12 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
+from akgentic.core.messages.orchestrator import ProcessedMessage
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 
+from akgentic.team import manager as manager_module
+from akgentic.team import subscriber as subscriber_module
+from akgentic.team.factory import TeamFactory
 from akgentic.team.manager import GRACE_TIMEOUT_SECONDS, TeamManager
 from akgentic.team.models import (
     Process,
@@ -26,6 +30,8 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.ports import NullServiceRegistry
+from akgentic.team.restorer import TeamRestorer
+from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -1017,22 +1023,124 @@ class TestTeamManagerStop:
 
 
 # ---------------------------------------------------------------------------
-# Tests: TimerStopSubscriber → STOPPED bridge
-# Timer-stop bridge: TimerStopSubscriber is a standard per-team subscriber.
+# Tests: IdleStopSubscriber registration and the idle-stop chain
+# The subscriber is per-team, so TeamManager constructs one on each of the two
+# lifecycle paths — create_team and resume_team. Both sites get their own test:
+# wiring only create leaves resumed teams with no idle clock, and nothing fails
+# until someone leaves a resumed team idle.
 # ---------------------------------------------------------------------------
 
 
-def test_timer_stop_persists_stopped_status(
+def _assert_idle_stop_registration(
+    subscribers: list[EventSubscriber],
+    team_id: uuid.UUID,
+    shared: EventSubscriber,
+) -> None:
+    """Assert a captured subscriber list carries the idle-stop wiring, in order.
+
+    Position is part of the contract, not incidental: per-team subscribers
+    first (PersistenceSubscriber, then idle-stop), shared subscribers behind.
+    """
+    idle_subs = [s for s in subscribers if isinstance(s, IdleStopSubscriber)]
+    assert len(idle_subs) == 1
+    assert idle_subs[0]._team_id == team_id
+    assert isinstance(subscribers[0], PersistenceSubscriber)
+    assert subscribers == [subscribers[0], idle_subs[0], shared]
+
+
+def test_create_team_registers_an_idle_stop_subscriber(
     actor_system: ActorSystem,
     event_store: InMemoryEventStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end: orchestrator inactivity timer drives Process.status == STOPPED.
+    """AC1: create_team hands TeamFactory.build one IdleStopSubscriber for this team.
 
-    Re-enabled in Story 21.3 once TimerStopSubscriber is wired as a
-    standard per-team subscriber. The full chain under test is:
-    timer → _timeout_handler → _notify_subscribers("on_stop_request")
-    → TimerStopSubscriber → stop_team → event_store.save_team(STOPPED).
+    The list is not reachable after the fact — it is passed into the builder and
+    handed to the orchestrator — so it is captured at the call by a wrapper that
+    delegates to the real builder, leaving the rest of create_team intact.
+    """
+    captured: list[list[EventSubscriber]] = []
+    real_build = TeamFactory.build
+
+    def _capturing_build(
+        team_card: TeamCard,
+        system: ActorSystem,
+        subscribers: list[EventSubscriber] | None = None,
+        team_id: uuid.UUID | None = None,
+    ) -> TeamRuntime:
+        captured.append(list(subscribers or []))
+        return real_build(team_card, system, subscribers, team_id)
+
+    monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
+
+    shared = RecordingSubscriber()
+    mgr = TeamManager(
+        actor_system=actor_system,
+        event_store=event_store,
+        subscribers=[shared],
+    )
+    runtime = mgr.create_team(_make_team_card())
+
+    assert len(captured) == 1
+    _assert_idle_stop_registration(captured[0], runtime.id, shared)
+
+
+def test_resume_team_registers_an_idle_stop_subscriber(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2: resume_team builds its own subscriber list — it gets one too.
+
+    Deliberately not a corollary of the create-path test: resume_team assembles
+    a second, independent list, and a resumed team without an idle clock is
+    invisible until someone leaves one idle.
+    """
+    shared = RecordingSubscriber()
+    mgr = TeamManager(
+        actor_system=actor_system,
+        event_store=event_store,
+        subscribers=[shared],
+    )
+    team_id = _create_and_stop_team(mgr, event_store)
+
+    captured: list[list[EventSubscriber]] = []
+    real_restore = TeamRestorer.restore
+
+    def _capturing_restore(
+        restorer: TeamRestorer,
+        process: Process,
+        subscribers: list[EventSubscriber] | None = None,
+    ) -> TeamRuntime:
+        captured.append(list(subscribers or []))
+        return real_restore(restorer, process, subscribers)
+
+    monkeypatch.setattr(manager_module.TeamRestorer, "restore", _capturing_restore)
+
+    mgr.resume_team(team_id)
+
+    assert len(captured) == 1
+    _assert_idle_stop_registration(captured[0], team_id, shared)
+
+
+def test_timer_stop_subscriber_no_longer_exists() -> None:
+    """AC4: the replaced subscriber is gone from the module it lived in."""
+    assert not hasattr(subscriber_module, "TimerStopSubscriber")
+
+
+def test_idle_team_created_through_the_manager_stops_itself(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3: a team nobody talks to stops itself, through the real wiring.
+
+    The whole chain, end to end, and the only assertion that covers all of it:
+    create_team constructs an IdleStopSubscriber with no delay argument, so the
+    subscriber reads ORCHESTRATOR_TIMEOUT_DELAY itself and arms a Timer; no
+    message ever pokes the countdown; the Timer thread fires _on_idle, which
+    hands stop_team to a daemon thread; stop_team tears the orchestrator down
+    and persists STOPPED.
     """
     monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
 
@@ -1052,6 +1160,132 @@ def test_timer_stop_persists_stopped_status(
     assert process is not None
     assert process.status == TeamStatus.STOPPED
     assert team_id not in mgr._runtimes
+
+
+def test_failed_create_leaves_no_armed_countdown(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team that never built must not be stopped later by a stray countdown.
+
+    The subscriber arms its Timer in its constructor, which runs before
+    TeamFactory.build. Once the build has registered subscribers its own
+    rollback stops the orchestrator, which fans on_stop out and cancels the
+    countdown. A card rejected *before* that point — an entry point with
+    headcount != 1 — never reaches registration, so only create_team can
+    cancel: otherwise the Timer thread outlives the failed call for the whole
+    delay and then reaches stop_team for a team that was never created.
+    """
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    stop_calls: list[uuid.UUID] = []
+    monkeypatch.setattr(mgr, "stop_team", stop_calls.append)
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    invalid = _make_team_card(entry_point=_make_member("lead", "Lead", headcount=2))
+    with pytest.raises(ValueError, match="headcount=1"):
+        mgr.create_team(invalid)
+
+    # Twice the delay: an uncancelled countdown has fired well before this.
+    time.sleep(2.0)
+    assert stop_calls == []
+
+
+def test_failed_resume_leaves_no_armed_countdown(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resume path arms its own countdown, so it needs its own cancel.
+
+    Mirror of the create-path test: resume_team builds a second, independent
+    subscriber, and a restore that raises leaves it armed against a team that
+    is not running.
+    """
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    team_id = _create_and_stop_team(mgr, event_store)
+
+    def _boom(
+        restorer: TeamRestorer,
+        process: Process,
+        subscribers: list[EventSubscriber] | None = None,
+    ) -> TeamRuntime:
+        msg = "restore failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(manager_module.TeamRestorer, "restore", _boom)
+    stop_calls: list[uuid.UUID] = []
+    monkeypatch.setattr(mgr, "stop_team", stop_calls.append)
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    with pytest.raises(RuntimeError):
+        mgr.resume_team(team_id)
+
+    time.sleep(2.0)
+    assert stop_calls == []
+
+
+def test_a_teardown_dispatches_exactly_one_stop_team(
+    actor_system: ActorSystem,
+    event_store: InMemoryEventStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Telemetry draining mid-teardown cannot re-arm the countdown (story 29.4).
+
+    The whole teardown is the window. ``Orchestrator.stop()`` announces itself
+    to subscribers first and drains the mailbox afterwards, so ``on_message``
+    keeps arriving while the team is coming down. A countdown merely
+    *cancelled* is brought back by ``task_completed()`` at count zero, fires
+    inside the window, and re-enters ``stop_team`` while the Process is still
+    RUNNING — ``stop_team`` persists STOPPED only after ``_teardown_team``
+    returns — for a second, concurrent teardown of the same team.
+
+    Exactly one, never ``>= 1``: a second teardown is precisely what this
+    asserts the absence of.
+    """
+    monkeypatch.setenv("ORCHESTRATOR_TIMEOUT_DELAY", "1")
+
+    captured: list[IdleStopSubscriber] = []
+    real_build = TeamFactory.build
+
+    def _capturing_build(
+        team_card: TeamCard,
+        system: ActorSystem,
+        subscribers: list[EventSubscriber] | None = None,
+        team_id: uuid.UUID | None = None,
+    ) -> TeamRuntime:
+        captured.extend(s for s in subscribers or [] if isinstance(s, IdleStopSubscriber))
+        return real_build(team_card, system, subscribers, team_id)
+
+    monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
+
+    mgr = TeamManager(actor_system=actor_system, event_store=event_store)
+    runtime = mgr.create_team(_make_team_card())
+    team_id = runtime.id
+    assert len(captured) == 1
+    idle_stop = captured[0]
+
+    teardowns: list[uuid.UUID] = []
+    real_teardown = mgr._teardown_team
+
+    def _recording_teardown(tid: uuid.UUID, rt: TeamRuntime) -> None:
+        teardowns.append(tid)
+        # Delegate FIRST: the real teardown is what runs Orchestrator.stop(),
+        # and therefore what raises on_stop_request. A stub replacement raises
+        # nothing and would pass with or without the fix.
+        real_teardown(tid, rt)
+        if len(teardowns) > 1:
+            return  # a re-entrant teardown holds no window open of its own
+        # Then hold the window open, with telemetry still arriving, past the
+        # injected delay — long enough for a re-armed countdown to fire.
+        idle_stop.on_message(ProcessedMessage(message_id=uuid.uuid4()))
+        time.sleep(2.0)
+
+    monkeypatch.setattr(mgr, "_teardown_team", _recording_teardown)
+
+    mgr.stop_team(team_id)
+
+    assert teardowns == [team_id]
 
 
 # ---------------------------------------------------------------------------

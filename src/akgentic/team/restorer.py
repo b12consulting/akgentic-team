@@ -11,7 +11,6 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressProxy
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
-from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import (
     EventMessage,
@@ -251,12 +250,19 @@ class TeamRestorer:
             msg = f"Orchestrator StartMessage has no sender for team {team_id}"
             raise ValueError(msg)
 
+        # Pass the persisted config through, exactly as _spawn_agents does for every
+        # other agent. Synthesising one here dropped every field it did not name --
+        # squad_id above all -- and ActorAddressImpl caches squad_id/name/role from
+        # config at construction, so the wrong values froze into every address the
+        # orchestrator appeared in. model_copy() (naming nothing) keeps everything;
+        # the copy matters because createActor mutates the config it is handed, and
+        # the persisted object is replayed as an event moments later.
         orchestrator_addr = self._actor_system.createActor(
             Orchestrator,
             restoring=True,
             agent_id=orchestrator_start.sender.agent_id,
             team_id=team_id,
-            config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
+            config=orchestrator_start.config.model_copy(),
         )
         spawned_addrs.append(orchestrator_addr)
 

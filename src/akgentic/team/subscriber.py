@@ -1,16 +1,22 @@
-"""PersistenceSubscriber: EventSubscriber to EventStore bridge for live event sourcing."""
+"""Per-team ``EventSubscriber`` implementations: event persistence and idle-stop."""
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from akgentic.core.messages.message import Message
-from akgentic.core.messages.orchestrator import StateChangedMessage
+from akgentic.core.messages.orchestrator import (
+    ProcessedMessage,
+    ReceivedMessage,
+    StateChangedMessage,
+)
 from akgentic.core.orchestrator import EventSubscriber
+from akgentic.core.utils.timer import Timer
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent
 from akgentic.team.ports import EventStore
 
@@ -18,6 +24,34 @@ if TYPE_CHECKING:
     from akgentic.team.manager import TeamManager
 
 logger = logging.getLogger(__name__)
+
+# Seconds of inactivity before an idle team is stopped, when the environment
+# says nothing. Historical value: the implicit one-hour auto-stop the
+# Orchestrator used to apply before the clock moved into this package.
+DEFAULT_IDLE_STOP_DELAY_SECONDS = 3600
+
+# The knob keeps the name it had while core owned the clock; only the read site
+# moved here. Deployments already set it.
+IDLE_STOP_DELAY_ENV_VAR = "ORCHESTRATOR_TIMEOUT_DELAY"
+
+
+def resolve_idle_stop_delay() -> int:
+    """Read the inactivity delay from the environment.
+
+    Returns:
+        The value of ``ORCHESTRATOR_TIMEOUT_DELAY`` in seconds, or
+        :data:`DEFAULT_IDLE_STOP_DELAY_SECONDS` when the variable is unset.
+
+    Raises:
+        ValueError: The variable is set to something non-numeric. This mirrors
+            the bare ``int()`` read it replaces — a malformed value is a
+            deployment error and fails loudly at wiring time.
+    """
+    raw = os.environ.get(IDLE_STOP_DELAY_ENV_VAR)
+    if raw is None:
+        return DEFAULT_IDLE_STOP_DELAY_SECONDS
+    return int(raw)
+
 
 class PersistenceSubscriber(EventSubscriber):
     """Bridges EventSubscriber (akgentic-core) with EventStore (akgentic-team).
@@ -99,6 +133,22 @@ class PersistenceSubscriber(EventSubscriber):
         assert team_id == self._team_id
         self._restoring = restoring
 
+    def on_stop_request(self, team_id: uuid.UUID) -> None:
+        """No-op: this subscriber holds nothing to release when a stop begins.
+
+        Persistence keeps running until the mailbox is drained — the events
+        still arriving during a teardown are exactly the ones a resume needs.
+
+        Defined rather than inherited: the Protocol's hooks have empty bodies,
+        which makes mypy treat an explicit subclass that leaves one unimplemented
+        as abstract, and this class is instantiated in ``manager.py``.
+
+        Args:
+            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
+                event. MUST match ``self._team_id``.
+        """
+        assert team_id == self._team_id
+
     def on_stop(self, team_id: uuid.UUID) -> None:
         """No-op: required by EventSubscriber protocol.
 
@@ -108,91 +158,172 @@ class PersistenceSubscriber(EventSubscriber):
         """
         assert team_id == self._team_id
 
-    def on_stop_request(self, team_id: uuid.UUID) -> None:
-        """No-op: required by EventSubscriber protocol.
 
-        Args:
-            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
-                event. MUST match ``self._team_id``.
-        """
-        assert team_id == self._team_id
+class IdleStopSubscriber(EventSubscriber):
+    """``EventSubscriber`` that detects an idle team *and* stops it.
 
+    Counts in-flight work from the telemetry it already receives —
+    ``ReceivedMessage`` starts a task, ``ProcessedMessage`` completes one —
+    and drives a :class:`akgentic.core.utils.timer.Timer` with those two
+    pokes. When the count stays at zero for ``delay`` seconds the countdown
+    fires and the team is stopped through ``TeamManager.stop_team``. The
+    countdown is armed at construction, so a team that never receives a
+    single message still stops.
 
-class TimerStopSubscriber(EventSubscriber):
-    """``EventSubscriber`` that bridges inactivity-timer stops into ``stop_team``.
+    Three threads meet here, which is what shapes the code:
 
-    When the orchestrator's inactivity timer fires, it calls
-    ``on_stop_request()`` on each subscriber (before the actor stops).
-    This subscriber offloads ``TeamManager.stop_team`` to a daemon
-    thread so the full shutdown path runs: ``Process.status=STOPPED``
-    is persisted and the runtime is cleaned up. Without this bridge
-    only the actor tree is torn down; the team-state record remains
-    ``RUNNING`` indefinitely.
+    - ``on_message`` arrives on the orchestrator's actor thread. It must
+      return immediately and touch neither the ``TeamManager`` nor the actor
+      system.
+    - The timeout callback fires on the ``Timer`` thread, which has no
+      supervisor — an exception escaping it is silent, so everything that can
+      raise lives inside ``_drain_to_stop_team``'s ``try``.
+    - ``stop_team`` runs on a third, daemon thread. Calling it inline from the
+      callback deadlocks: it reaches ``_teardown_team``, which issues a
+      ``proxy_ask`` into the orchestrator and waits on the answer.
 
-    Note: ``on_stop()`` is a no-op. The trigger to ``stop_team`` lives
-    earlier in ``on_stop_request()``; by the time ``on_stop()`` runs
-    the daemon-thread dispatch has already happened and there is
-    nothing left to clean up on this subscriber.
+    ``set_restoring`` suppresses the counting, not the countdown. A resume
+    replays a burst of ``ReceivedMessage``/``ProcessedMessage``; without the
+    guard those drive the clock and a team can idle-stop moments after coming
+    back, or mid-restore.
 
-    Idempotent: if ``stop_team`` raises :class:`ValueError` because
-    the team is already ``STOPPED`` or ``DELETED``, the error is
-    swallowed and logged at DEBUG.
+    Two lifecycle moments disarm the countdown, and they differ:
+
+    - ``on_stop_request`` — teardown has *begun*. The countdown is **closed**,
+      terminally: the mailbox is still draining behind this signal, and a
+      merely cancelled timer is re-armed by the next ``task_completed()`` at
+      count zero. A countdown that fires mid-teardown races a second
+      ``stop_team`` into an orchestrator already stopping.
+    - ``on_stop`` — teardown has *ended*. It keeps its plain ``cancel()``: a
+      stop driven straight through Pykka never enters ``Orchestrator.stop()``
+      and so never raises ``on_stop_request``, and that path still needs a
+      disarm.
+
+    Idempotent: if ``stop_team`` raises :class:`ValueError` because the team is
+    already ``STOPPED`` or ``DELETED``, the error is swallowed and logged at
+    DEBUG.
     """
 
-    def __init__(self, team_manager: TeamManager, team_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        team_manager: TeamManager,
+        team_id: uuid.UUID,
+        delay: int | None = None,
+    ) -> None:
+        """Bind to a team and arm the inactivity countdown.
+
+        Args:
+            team_manager: Owner of ``stop_team``, called when the team goes idle.
+            team_id: Team this subscriber is bound to. Lifecycle callbacks
+                carrying any other ``team_id`` are rejected.
+            delay: Seconds of inactivity before the team is stopped. When
+                ``None``, resolved from the environment via
+                :func:`resolve_idle_stop_delay`.
+        """
         self._team_manager = team_manager
         self._team_id = team_id
+        self._restoring = False
+        # Set before the countdown is armed: a delay of 0 fires _on_idle on the
+        # Timer thread the moment start() returns, and it reads both.
+        self._stopping = False
+        self._stop_lock = threading.Lock()
+        self._timer = Timer(
+            resolve_idle_stop_delay() if delay is None else delay,
+            timeout_callback=self._on_idle,
+        )
+        self._timer.start()
 
     def set_restoring(self, team_id: uuid.UUID, restoring: bool) -> None:  # noqa: FBT001
-        """No-op: timer-stop bridging is orthogonal to replay guarding.
+        """Toggle the replay guard.
+
+        Only flips the flag: the countdown keeps running during a restore,
+        exactly as it did when the orchestrator owned the clock. What the flag
+        gates is the task counting in ``on_message``.
 
         Args:
             team_id: ``team_id`` of the orchestrator dispatching this lifecycle
                 event. MUST match ``self._team_id``.
-            restoring: Ignored — the timer-stop bridge does not care whether
-                the team is replaying or live.
+            restoring: ``True`` while replayed events are being delivered.
         """
         assert team_id == self._team_id
-        del restoring
+        self._restoring = restoring
 
-    def on_stop(self, team_id: uuid.UUID) -> None:
-        """No-op: nothing to clean up after the stop completes.
-
-        ``TimerStopSubscriber`` only acts on the inactivity-timer signal,
-        which is delivered through ``on_stop_request`` — by the time
-        ``on_stop`` runs, the daemon-thread ``stop_team`` dispatch has
-        already happened (see ``on_stop_request``) and this subscriber
-        holds no resources that need explicit teardown. See ADR-18 §6
-        for the rationale.
+    def on_message(self, msg: Message) -> None:
+        """Drive the countdown from the two telemetry signals that bound work.
 
         Args:
-            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
-                event. MUST match ``self._team_id``.
+            msg: The message flowing through the orchestrator. Anything other
+                than ``ReceivedMessage``/``ProcessedMessage`` leaves the timer
+                untouched.
         """
-        assert team_id == self._team_id
+        if self._restoring:
+            return
+        if isinstance(msg, ReceivedMessage):
+            self._timer.task_started()
+        elif isinstance(msg, ProcessedMessage):
+            self._timer.task_completed()
 
     def on_stop_request(self, team_id: uuid.UUID) -> None:
-        """Drain the orchestrator stop into TeamManager.stop_team (async).
+        """Close the countdown for good — this team's teardown has *begun*.
 
-        The orchestrator calls this from its own
-        handler on the actor thread. Calling ``TeamManager.stop_team``
-        synchronously here would deadlock: ``stop_team`` → ``_teardown_team``
-        issues ``proxy_ask`` on the same orchestrator, which is busy
-        servicing the current message and cannot answer. The work is
-        therefore offloaded to a daemon thread so the actor thread can
-        return immediately and proceed to its own ``on_stop``; by the
-        time the daemon's ``stop_team`` reaches ``_teardown_team``, the
-        orchestrator has finished stopping and ``stop_team``'s subsequent
-        state-store writes land cleanly.
+        The orchestrator raises this as the first statement of its own
+        ``stop()``, before any child is touched. The countdown is *closed*
+        rather than cancelled because a cancel is resumable: the drain that
+        follows keeps delivering ``ProcessedMessage``, and ``task_completed()``
+        calls ``start()`` unconditionally once the in-flight count reaches
+        zero — re-arming a merely cancelled timer in the middle of the
+        teardown it was supposed to stay out of. ``close()`` is terminal, so
+        nothing the drain delivers brings the clock back.
+
+        Idempotent: calling it twice, or after ``on_stop``, changes nothing.
+        The assertion comes first so a foreign ``team_id`` cannot disarm this
+        team's countdown on its way to raising.
 
         Args:
             team_id: ``team_id`` of the orchestrator dispatching this lifecycle
                 event. MUST match ``self._team_id``.
         """
         assert team_id == self._team_id
+        with self._stop_lock:
+            self._stopping = True
+        self._timer.close()
+
+    def on_stop(self, team_id: uuid.UUID) -> None:
+        """Cancel the countdown — the team is stopping, idle or not.
+
+        Kept alongside ``on_stop_request``, not replaced by it: a stop driven
+        straight through Pykka never enters ``Orchestrator.stop()``, so this is
+        the only disarm those paths get.
+
+        Args:
+            team_id: ``team_id`` of the orchestrator dispatching this lifecycle
+                event. MUST match ``self._team_id``.
+        """
+        assert team_id == self._team_id
+        self._timer.cancel()
+
+    def _on_idle(self) -> None:
+        """Timeout callback: hand the stop to a daemon thread and return.
+
+        Runs on the ``Timer`` thread. Doing the stop here would deadlock the
+        orchestrator, so this method does nothing but dispatch.
+
+        The ``_stopping`` latch is narrow by design. ``close()`` is what makes
+        the countdown unre-armable; what it cannot do is unfire a callback
+        already dispatched microseconds before ``on_stop_request`` arrived.
+        The latch covers that race, and makes a double fire dispatch exactly
+        one stop. It is read-modify-written from the ``Timer`` thread here and
+        from the orchestrator's actor thread in ``on_stop_request``, hence the
+        lock — which is released before the daemon thread starts, so a
+        ``stop_team`` in flight never blocks the actor thread.
+        """
+        with self._stop_lock:
+            if self._stopping:
+                return
+            self._stopping = True
         thread = threading.Thread(
             target=self._drain_to_stop_team,
-            name=f"orchestrator-stop-subscriber-{self._team_id}",
+            name=f"idle-stop-subscriber-{self._team_id}",
             daemon=True,
         )
         thread.start()
@@ -203,17 +334,13 @@ class TimerStopSubscriber(EventSubscriber):
             self._team_manager.stop_team(self._team_id)
         except ValueError as exc:
             logger.debug(
-                "TimerStopSubscriber idempotent no-op team_id=%s err=%s",
+                "IdleStopSubscriber idempotent no-op team_id=%s err=%s",
                 self._team_id,
                 exc,
             )
         except Exception:
             logger.warning(
-                "TimerStopSubscriber.stop_team failed team_id=%s",
+                "IdleStopSubscriber.stop_team failed team_id=%s",
                 self._team_id,
                 exc_info=True,
             )
-
-    def on_message(self, msg: Message) -> None:
-        """No-op: this subscriber only reacts to orchestrator stop."""
-        del msg
