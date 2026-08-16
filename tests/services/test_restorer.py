@@ -2587,6 +2587,12 @@ class TestRestorerNotificationAddressResolution:
 # ---------------------------------------------------------------------------
 
 
+class _ConfigWithExtraField(BaseConfig):
+    """A persisted orchestrator config carrying a field the restore path cannot name."""
+
+    extra_field: str = "sentinel"
+
+
 def _replayed_orchestrator_start(
     replayed: list[Message],
     orchestrator_id: uuid.UUID,
@@ -2691,3 +2697,37 @@ class TestRestorerOrchestratorConfigPreserved:
 
         assert runtime.orchestrator_addr.name == "@TeamCoordinator"
         assert runtime.orchestrator_addr.role == "Coordinator"
+
+    def test_a_field_the_restore_path_cannot_name_survives(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """AC 1: the config is copied whole, never rebuilt field by field.
+
+        The three tests above stay green against a hand-written
+        ``BaseConfig(name=..., role=..., squad_id=...)`` -- the same
+        enumerated-reconstruction defect with one more field named, correct the
+        day it is written and silently lossy the day a field is added. Only a
+        field the restore path has never heard of separates the two, so this is
+        the test that actually pins ``model_copy()`` with no ``update=``.
+        """
+        persisted = _ConfigWithExtraField(
+            name="@Orchestrator",
+            role="Orchestrator",
+            squad_id=uuid.uuid4(),
+            extra_field="sentinel",
+        )
+        team_id, process = _populate_stopped_team(
+            event_store,
+            orchestrator_config=persisted,
+        )
+        del team_id
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        # Read over the public proxy API, never through actor internals.
+        restored_config = actor_system.proxy_ask(runtime.orchestrator_addr, Orchestrator).config
+        assert isinstance(restored_config, _ConfigWithExtraField)
+        assert restored_config.extra_field == "sentinel"

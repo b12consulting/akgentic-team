@@ -128,5 +128,23 @@ class InMemoryEventStore:
         return max((e.sequence for e in events), default=0)
 
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
-        """Load all agent state snapshots for a team."""
-        return [v for k, v in self.agent_states.items() if k[0] == team_id]
+        """Load all agent state snapshots for a team, detached from the store.
+
+        The state comes back as a ``serializable_copy()`` -- a fresh,
+        observer-free instance of the same class -- because that is what the
+        real backends produce: they rebuild the state from storage on every
+        load and never hand out the object they hold.
+
+        Returning the stored object aliased it to the caller. Restore phase 2d
+        passes the loaded state straight to ``Akgent.init_state``, which does
+        ``state.observer(...)`` -- an in-place write of ``_observer`` and the
+        ``_last_serialized`` baseline. Through the alias that landed on the
+        store's own snapshot, so a later ``load_agent_states`` returned a state
+        that no longer compared equal to the one saved (Pydantic v2 ``__eq__``
+        compares private attrs).
+        """
+        return [
+            snapshot.model_copy(update={"state": snapshot.state.serializable_copy()})
+            for (snapshot_team_id, _), snapshot in self.agent_states.items()
+            if snapshot_team_id == team_id
+        ]
