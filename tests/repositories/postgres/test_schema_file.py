@@ -43,7 +43,11 @@ def test_team_process_entries_shape() -> None:
     assert table["natural_key"] == ["id"]
     columns = table["columns"]
     assert isinstance(columns, dict)
-    assert columns == {"id": "str", "data": "json"}
+    # ``metadata_indexes`` is the table's first promoted non-key column: the
+    # derived metadata index, declared here as ``str[]`` so the postgresql
+    # flavor emits ``TEXT[]`` and the GIN index in ``init_db`` has something
+    # to index. The value itself still lives in ``data``.
+    assert columns == {"id": "str", "data": "json", "metadata_indexes": "str[]"}
 
 
 def test_event_entries_shape() -> None:

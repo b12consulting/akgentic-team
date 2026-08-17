@@ -52,14 +52,29 @@ def _ensure_schema_loaded() -> None:
 
 
 def init_db(conn_string: str) -> None:
-    """Create missing tables and indexes against the target Postgres instance.
+    """Create missing tables, columns and indexes against the target Postgres.
 
     Idempotent: calling twice against the same database succeeds both times
-    and does not create duplicate tables or indexes — table creation is
-    handled by ``Schema.default.create_tables()`` (Nagra's ``CREATE TABLE
-    IF NOT EXISTS`` path); the ``team_process_user_id_idx`` functional
-    expression index is created with ``CREATE INDEX IF NOT EXISTS``. Both
-    DDL statements run inside the same transaction. See ADR-16 §4.
+    and does not create duplicate tables, columns or indexes — table
+    creation is handled by ``Schema.default.create_tables()`` (Nagra's
+    ``CREATE TABLE IF NOT EXISTS`` path), and both expression / GIN indexes
+    are created with ``CREATE INDEX IF NOT EXISTS``. Every DDL statement
+    runs inside the same transaction. See ADR-16 §4.
+
+    This is also the upgrade path for an existing deployment.
+    ``Schema.default.create_tables()`` handles BOTH missing tables and
+    missing columns: it introspects the live database and emits an
+    ``ADD COLUMN`` for anything declared in ``schema.toml`` but absent from
+    the table. That is why ``team_process_entries.metadata_indexes`` — the
+    ``TEXT[]`` column added by ADR-24 §D5 — needs no hand-written
+    ``ALTER TABLE`` here: a database provisioned before that column existed
+    gains it on the next call. The column is nullable, so the add succeeds
+    on a populated table; rows written earlier keep ``NULL`` and simply
+    match no metadata filter.
+
+    Index creation runs after ``create_tables()`` in the same transaction,
+    so ``metadata_indexes`` is guaranteed to exist before
+    ``team_process_metadata_indexes_idx`` references it. Do not reorder.
 
     Intended as a deployment hook — NEVER called implicitly by
     ``NagraEventStore.__init__``.
@@ -75,6 +90,13 @@ def init_db(conn_string: str) -> None:
         trn.execute(
             "CREATE INDEX IF NOT EXISTS team_process_user_id_idx "
             "ON team_process_entries ((data ->> 'user_id'))"
+        )
+        # GIN over the derived metadata index — the array operator class
+        # serves the `metadata_indexes @> %s` containment term in
+        # NagraEventStore.list_teams. The name is part of the contract.
+        trn.execute(
+            "CREATE INDEX IF NOT EXISTS team_process_metadata_indexes_idx "
+            "ON team_process_entries USING GIN (metadata_indexes)"
         )
 
 
