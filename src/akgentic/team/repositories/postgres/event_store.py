@@ -50,13 +50,28 @@ class NagraEventStore:
     # --- team process (team_process_entries) -------------------------------
 
     def save_team(self, process: Process) -> None:
-        """Upsert a team process snapshot keyed by ``team_id``."""
+        """Upsert a team process snapshot keyed by ``team_id``.
+
+        Writes the whole ``Process`` as JSON into ``data`` AND its derived
+        index into the promoted ``metadata_indexes`` column, in one
+        statement. The ``ON CONFLICT`` branch refreshes both: setting only
+        ``data`` would leave a stale index that :meth:`list_teams` then
+        queries as though it were current.
+
+        The index is persisted as handed over, never re-derived here.
+        ``derive_metadata_indexes`` has exactly one call site per write
+        path, in the manager; a second derivation in the repository is the
+        drift the single-derivation rule exists to prevent, and it would
+        also overwrite an index a caller deliberately planted.
+        """
         data = json.dumps(process.model_dump())
         with Transaction(self._conn_string) as trn:
             trn.execute(
-                "INSERT INTO team_process_entries (id, data) VALUES (%s, %s) "
-                "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
-                (str(process.team_id), data),
+                "INSERT INTO team_process_entries (id, data, metadata_indexes) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, "
+                "metadata_indexes = EXCLUDED.metadata_indexes",
+                (str(process.team_id), data, list(process.metadata_indexes)),
             )
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
@@ -79,15 +94,32 @@ class NagraEventStore:
     ) -> list[Process]:
         """Return persisted team processes. Order is unspecified.
 
-        When ``user_id`` is provided, the filter is pushed down to the
-        database via a JSONB extraction ``WHERE`` clause
-        (``WHERE (data ->> 'user_id') = %s``) backed by the functional
-        expression index ``team_process_user_id_idx`` created by
-        :func:`init_db`. ``user_id`` is bound through psycopg's ``%s``
-        placeholder — no f-strings, no string concatenation. See ADR-16 §4.
-        ``status`` and ``metadata`` are filtered on the hydrated rows
-        instead; see the comments at each filter for why that is the shipped
-        behaviour here.
+        Two of the three filters are pushed down into a single ``WHERE``
+        clause; the third is applied after hydration:
+
+        * ``user_id`` → ``(data ->> 'user_id') = %s``, backed by the
+          functional expression index ``team_process_user_id_idx``. See
+          ADR-16 §4.
+        * ``metadata`` → ``metadata_indexes @> %s``, an array-containment
+          term backed by the GIN index ``team_process_metadata_indexes_idx``
+          over the promoted ``TEXT[]`` column. See ADR-24 §D5.
+        * ``status`` → in memory, on the hydrated rows. Its push-down needs
+          a further expression index and is story 26.5, still DEFERRED, so
+          this is the shipped behaviour of this backend rather than a
+          placeholder. Both indexes above are created by :func:`init_db`.
+
+        The pushed-down terms AND-combine in one statement, and ``user_id``
+        is appended whenever it is given — never dropped, weakened, or made
+        conditional on ``metadata`` being more selective. It is a trust
+        boundary, not an optimisation (ADR-24 §D5).
+
+        Every caller-supplied value travels as a bound ``%s`` parameter; the
+        statement is assembled only from fixed fragments joined with
+        ``AND``, so no value ever reaches SQL through an f-string or
+        concatenation.
+
+        Results never depend on an index existing. Dropping either index
+        changes the access path the planner picks and nothing else.
 
         Args:
             user_id: If provided, return only snapshots whose
@@ -104,34 +136,33 @@ class NagraEventStore:
 
         All three filters are independent terms combining as a conjunction.
         """
+        clauses: list[str] = []
+        params: list[object] = []
+        if user_id is not None:
+            clauses.append("(data ->> 'user_id') = %s")
+            params.append(user_id)
+        # Truthiness, NOT ``is not None``: an empty mapping must add no term
+        # at all. ``x @> '{}'`` is TRUE for any non-null array but NULL for
+        # a row written before this column existed, so an ``is not None``
+        # gate would silently stop returning every pre-migration team while
+        # looking correct against a store populated after it.
+        if metadata:
+            # Equality-only containment, one entry per key, AND-combined by
+            # the array operator itself. Entries are built with the shared
+            # helper the write path derived with, so the ``|`` escaping
+            # cannot drift between the two sides.
+            clauses.append("metadata_indexes @> %s")
+            params.append([make_index_entry(k, v) for k, v in metadata.items()])
+        sql = "SELECT data FROM team_process_entries"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         with Transaction(self._conn_string) as trn:
-            if user_id is None:
-                cursor = trn.execute("SELECT data FROM team_process_entries")
-            else:
-                cursor = trn.execute(
-                    "SELECT data FROM team_process_entries "
-                    "WHERE (data ->> 'user_id') = %s",
-                    (user_id,),
-                )
+            cursor = trn.execute(sql, tuple(params))
             rows = cursor.fetchall()
         teams = [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
-        # In-memory status filter, applied after hydration rather than as a
-        # ``WHERE`` term. The Postgres push-down (accumulated WHERE clauses
-        # plus the status expression index, story 26.5) is DEFERRED, so this
-        # discard is the current shipped behaviour of this backend and not a
-        # placeholder awaiting replacement. Results are correct either way;
-        # what is missing is only the row-count reduction at the database.
+        # The one filter still evaluated in Python — see the docstring.
         if status is not None:
             teams = [t for t in teams if t.status == status]
-        # In-memory metadata filter, same story as the status one above: the
-        # Postgres push-down (a `text[]` column, a GIN index and a `@>`
-        # containment term) is DEFERRED, so this discard is the current
-        # shipped behaviour of this backend and not a placeholder awaiting
-        # replacement. Entries are built with the shared helper so the `|`
-        # escaping stays symmetric with the derivation side.
-        if metadata:
-            entries = {make_index_entry(k, v) for k, v in metadata.items()}
-            teams = [t for t in teams if entries.issubset(set(t.metadata_indexes))]
         return teams
 
     def delete_team(self, team_id: uuid.UUID) -> None:

@@ -3,6 +3,7 @@ natural_key = ["id"]
 [team_process_entries.columns]
 id = "str"
 data = "json"
+metadata_indexes = "str[]"
 
 [event_entries]
 natural_key = ["team_id", "sequence"]

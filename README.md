@@ -484,7 +484,7 @@ Three properties are worth knowing:
 |---|---|---|
 | YAML | in-memory containment, applied to the raw parsed mapping before validation | none — the backend is here for parity, not throughput |
 | MongoDB | pushed down into the same `find` filter as `user_id` and `status` | multikey `teams_metadata_indexes_idx`, provisioned by `ensure_indexes()` |
-| PostgreSQL | interim in-memory filter after hydration — **push-down deferred** | none yet |
+| PostgreSQL | pushed down as an `metadata_indexes @> …` containment term, in the same `WHERE` clause as `user_id` | GIN `team_process_metadata_indexes_idx` over the `TEXT[]` column, provisioned by `init_db` |
 
 Correctness never depends on the index. A missing or un-created index makes a
 query more expensive; it never changes which teams come back. That is what makes
@@ -498,9 +498,22 @@ always created:
 python -m akgentic.team.scripts.init_mongo
 ```
 
-The PostgreSQL backend returns correct results today, but selects them in Python
-after loading the rows — the database-side push-down is deferred. Do not
-provision an index for a query that does not yet exist.
+The PostgreSQL backend filters at the database. `Process.metadata_indexes` is
+promoted to a `metadata_indexes TEXT[]` column on `team_process_entries`,
+written by the same `save_team` statement that writes the JSON payload, and
+`list_teams(metadata=…)` answers from a `metadata_indexes @> ARRAY[…]`
+containment term AND-combined with the `user_id` scope. `init_db` provisions
+the GIN index `team_process_metadata_indexes_idx` that serves it, and adds both
+the column and the index to a database created before they existed — running
+
+```bash
+python -m akgentic.team.scripts.init_db
+```
+
+again is the whole upgrade. Rows written before the column existed carry `NULL`,
+list normally, and match no metadata filter. The `status` filter is still applied
+in Python after loading the rows on this backend; pushing it down needs its own
+expression index and has not shipped.
 
 > **Not to be confused with `AgentCard.metadata`**, which is a free-form
 > annotation bag on an individual agent. `Process.metadata` is the team's typed,
@@ -566,9 +579,15 @@ indexes, not the source of truth):
 
 | Table | Natural key | Purpose |
 |---|---|---|
-| `team_process_entries` | `id` | One row per team — `Process` snapshot |
+| `team_process_entries` | `id` | One row per team — `Process` snapshot. Also carries the promoted `metadata_indexes TEXT[]` column |
 | `event_entries` | `(team_id, sequence)` | Append-only event log |
 | `agent_state_entries` | `(team_id, agent_id)` | Agent state snapshots |
+
+`init_db` creates two indexes on `team_process_entries`: the functional
+expression index `team_process_user_id_idx` over `(data ->> 'user_id')`, and
+the GIN index `team_process_metadata_indexes_idx` over `metadata_indexes`.
+Both names are part of the contract — an operator inspecting a database
+addresses them by name.
 
 Each public `NagraEventStore` method opens its own `Transaction`. The one
 exception is `delete_team`, which spans a single transaction across the

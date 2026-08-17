@@ -138,6 +138,160 @@ class TestInitDbIntegration:
             rows = cursor.fetchall()
         assert len(rows) == 1
 
+    def test_init_db_metadata_indexes_column_is_a_text_array(
+        self, postgres_initialized: str
+    ) -> None:
+        """``metadata_indexes`` exists on ``team_process_entries`` as ``TEXT[]``.
+
+        Asserted against the live database rather than by reading
+        ``schema.toml`` back: the point at issue is what Nagra's postgresql
+        flavor emitted for the declared ``str[]`` dtype, which the TOML
+        cannot answer. ``data_type = 'ARRAY'`` with ``udt_name = '_text'``
+        is how PostgreSQL spells ``TEXT[]`` in ``information_schema``.
+        """
+        from nagra import Transaction
+
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT data_type, udt_name, is_nullable "
+                "FROM information_schema.columns "
+                "WHERE table_name = 'team_process_entries' "
+                "AND column_name = 'metadata_indexes'"
+            )
+            rows = cursor.fetchall()
+
+        assert len(rows) == 1, "expected exactly one metadata_indexes column"
+        data_type, udt_name, is_nullable = rows[0]
+        assert data_type == "ARRAY"
+        assert udt_name == "_text"
+        # Nullable by construction: the column is not in natural_key nor
+        # not_null, which is what lets it be added to a populated table.
+        assert is_nullable == "YES"
+
+    def test_init_db_adds_the_column_to_an_already_existing_table(
+        self, postgres_initialized: str
+    ) -> None:
+        """The upgrade path: a live table missing the column gets it back.
+
+        Every other schema assertion here is satisfied by a table Nagra
+        created from scratch, which proves nothing about a deployment that
+        predates the column. Dropping it and re-running ``init_db``
+        simulates exactly that upgrade — ``Schema.create_tables()`` adds
+        declared-but-absent columns to existing tables, so no hand-written
+        ``ALTER`` is needed.
+
+        Dropping the column also drops the GIN index that depends on it, so
+        this covers the index's half of the upgrade too. Restored in a
+        ``finally``: the container is session-scoped.
+        """
+        from nagra import Transaction
+
+        from akgentic.team.repositories.postgres import init_db
+
+        try:
+            with Transaction(postgres_initialized) as trn:
+                trn.execute(
+                    "ALTER TABLE team_process_entries DROP COLUMN metadata_indexes"
+                )
+
+            with Transaction(postgres_initialized) as trn:
+                cursor = trn.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'team_process_entries' "
+                    "AND column_name = 'metadata_indexes'"
+                )
+                assert cursor.fetchall() == [], "precondition: column must be gone"
+        finally:
+            init_db(postgres_initialized)
+
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT udt_name FROM information_schema.columns "
+                "WHERE table_name = 'team_process_entries' "
+                "AND column_name = 'metadata_indexes'"
+            )
+            column_rows = cursor.fetchall()
+            cursor = trn.execute(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE indexname = 'team_process_metadata_indexes_idx'"
+            )
+            index_rows = cursor.fetchall()
+
+        assert len(column_rows) == 1
+        assert column_rows[0][0] == "_text"
+        assert len(index_rows) == 1, "the GIN index must come back with the column"
+
+    def test_init_db_creates_metadata_indexes_gin_index(
+        self, postgres_initialized: str
+    ) -> None:
+        """``team_process_metadata_indexes_idx`` exists and is a GIN index.
+
+        The name is part of the contract — an operator inspecting a
+        database, and the drop/restore test for the index-absent invariant,
+        both address it by name. ``USING gin`` is asserted because a btree
+        index over the same column would exist under the same name while
+        serving no ``@>`` query.
+        """
+        from nagra import Transaction
+
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname = 'team_process_metadata_indexes_idx'"
+            )
+            rows = cursor.fetchall()
+
+        assert len(rows) == 1
+        indexdef = rows[0][0]
+        assert "USING gin" in indexdef
+        assert "metadata_indexes" in indexdef
+        assert "team_process_entries" in indexdef
+
+    def test_repeated_init_db_leaves_one_column_and_one_index(
+        self, postgres_initialized: str
+    ) -> None:
+        """AC: idempotence across the column and the GIN index together.
+
+        The session fixture already ran ``init_db`` once; two more calls
+        must not raise, must not duplicate the column, must not duplicate
+        the index, and must leave the table set unchanged.
+        """
+        from nagra import Transaction
+
+        from akgentic.team.repositories.postgres import init_db
+
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'"
+            )
+            before = {row[0] for row in cursor.fetchall()}
+
+        init_db(postgres_initialized)  # must not raise
+        init_db(postgres_initialized)  # must not raise
+
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public'"
+            )
+            after = {row[0] for row in cursor.fetchall()}
+            cursor = trn.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'team_process_entries' "
+                "AND column_name = 'metadata_indexes'"
+            )
+            column_count = cursor.fetchone()[0]
+            cursor = trn.execute(
+                "SELECT count(*) FROM pg_indexes "
+                "WHERE indexname = 'team_process_metadata_indexes_idx'"
+            )
+            index_count = cursor.fetchone()[0]
+
+        assert before == after
+        assert column_count == 1
+        assert index_count == 1
+
     def test_init_db_user_id_index_creation_is_idempotent(
         self, postgres_initialized: str
     ) -> None:
