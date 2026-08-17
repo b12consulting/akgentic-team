@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import psycopg
 import pytest
@@ -282,6 +282,36 @@ class TestMetadataFilterIsPushedDown:
         # payload carries the matching entry.
         assert store.list_teams(metadata={"tenant": "acme"}) == []
 
+    def test_metadata_values_are_bound_never_interpolated(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """A value carrying SQL syntax is treated as data, never as statement text.
+
+        The statement is assembled only from fixed fragments and every
+        caller-supplied value travels as a ``%s`` parameter, so a value that
+        would otherwise close a string literal and open a new statement is
+        matched literally instead. Without this test nothing goes red if a
+        later edit interpolates the value into the SQL — every other
+        acceptance criterion here has a behavioural pin, and this one is the
+        security-relevant one.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        hostile = "acme'; DROP TABLE team_process_entries; --"
+        planted = make_indexed_process(AcmeTeamMetadata(tenant=hostile))
+        ordinary = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        store.save_team(planted)
+        store.save_team(ordinary)
+
+        # The value round-trips as data: it matches its own team and no other.
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": hostile})] == [
+            planted.team_id
+        ]
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": "acme"})] == [
+            ordinary.team_id
+        ]
+        # ...and the table the value names is still there, with both rows in it.
+        assert len({p.team_id for p in store.list_teams()}) == 2
+
     def test_legacy_row_is_still_returned_by_an_empty_metadata_filter(
         self, postgres_clean_tables: str
     ) -> None:
@@ -423,10 +453,11 @@ class TestCrossBackendParity:
     """
 
     def test_three_backends_return_the_same_team_ids(
-        self, postgres_clean_tables: str, tmp_path: Path, mongo_db: object
+        self, postgres_clean_tables: str, tmp_path: Path, mongo_db: Any
     ) -> None:
+        # ``mongomock`` is already gated by the ``mongo_client`` fixture; only
+        # ``pymongo`` still needs a guard here, as ``mongo_store`` does.
         pytest.importorskip("pymongo")
-        pytest.importorskip("mongomock")
         from akgentic.team.repositories.mongo import MongoEventStore
         from akgentic.team.repositories.yaml import YamlEventStore
 

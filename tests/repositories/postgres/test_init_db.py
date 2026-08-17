@@ -168,10 +168,10 @@ class TestInitDbIntegration:
         # not_null, which is what lets it be added to a populated table.
         assert is_nullable == "YES"
 
-    def test_init_db_adds_the_column_to_an_already_existing_table(
-        self, postgres_initialized: str
+    def test_init_db_adds_the_column_to_a_populated_existing_table(
+        self, postgres_clean_tables: str
     ) -> None:
-        """The upgrade path: a live table missing the column gets it back.
+        """The upgrade path: a POPULATED live table missing the column gets it back.
 
         Every other schema assertion here is satisfied by a table Nagra
         created from scratch, which proves nothing about a deployment that
@@ -180,21 +180,43 @@ class TestInitDbIntegration:
         declared-but-absent columns to existing tables, so no hand-written
         ``ALTER`` is needed.
 
+        The table carries a row throughout, which is the half of the claim an
+        empty table cannot make: an ``ADD COLUMN`` on an empty table succeeds
+        whatever the column's nullability, so only a populated one shows that
+        a real deployment upgrades without losing rows and without needing a
+        backfill. The surviving row lands on ``NULL`` and from then on behaves
+        exactly like any other pre-migration row.
+
         Dropping the column also drops the GIN index that depends on it, so
         this covers the index's half of the upgrade too. Restored in a
         ``finally``: the container is session-scoped.
         """
+        import json
+
         from nagra import Transaction
 
-        from akgentic.team.repositories.postgres import init_db
+        from akgentic.team.repositories.postgres import NagraEventStore, init_db
+        from tests.models.conftest import AcmeTeamMetadata, make_indexed_process
+
+        existing = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u1")
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute(
+                "INSERT INTO team_process_entries (id, data, metadata_indexes) "
+                "VALUES (%s, %s, %s)",
+                (
+                    str(existing.team_id),
+                    json.dumps(existing.model_dump()),
+                    list(existing.metadata_indexes),
+                ),
+            )
 
         try:
-            with Transaction(postgres_initialized) as trn:
+            with Transaction(postgres_clean_tables) as trn:
                 trn.execute(
                     "ALTER TABLE team_process_entries DROP COLUMN metadata_indexes"
                 )
 
-            with Transaction(postgres_initialized) as trn:
+            with Transaction(postgres_clean_tables) as trn:
                 cursor = trn.execute(
                     "SELECT 1 FROM information_schema.columns "
                     "WHERE table_name = 'team_process_entries' "
@@ -202,9 +224,9 @@ class TestInitDbIntegration:
                 )
                 assert cursor.fetchall() == [], "precondition: column must be gone"
         finally:
-            init_db(postgres_initialized)
+            init_db(postgres_clean_tables)
 
-        with Transaction(postgres_initialized) as trn:
+        with Transaction(postgres_clean_tables) as trn:
             cursor = trn.execute(
                 "SELECT udt_name FROM information_schema.columns "
                 "WHERE table_name = 'team_process_entries' "
@@ -216,10 +238,21 @@ class TestInitDbIntegration:
                 "WHERE indexname = 'team_process_metadata_indexes_idx'"
             )
             index_rows = cursor.fetchall()
+            cursor = trn.execute(
+                "SELECT metadata_indexes FROM team_process_entries WHERE id = %s",
+                (str(existing.team_id),),
+            )
+            surviving = cursor.fetchall()
 
         assert len(column_rows) == 1
         assert column_rows[0][0] == "_text"
         assert len(index_rows) == 1, "the GIN index must come back with the column"
+        # The row survived the round trip and is now an ordinary legacy row:
+        # NULL index, lists normally, matched by no metadata filter.
+        assert surviving == [(None,)], "the pre-existing row must survive on NULL"
+        store = NagraEventStore(postgres_clean_tables)
+        assert [p.team_id for p in store.list_teams()] == [existing.team_id]
+        assert store.list_teams(metadata={"tenant": "acme"}) == []
 
     def test_init_db_creates_metadata_indexes_gin_index(
         self, postgres_initialized: str

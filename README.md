@@ -484,7 +484,7 @@ Three properties are worth knowing:
 |---|---|---|
 | YAML | in-memory containment, applied to the raw parsed mapping before validation | none — the backend is here for parity, not throughput |
 | MongoDB | pushed down into the same `find` filter as `user_id` and `status` | multikey `teams_metadata_indexes_idx`, provisioned by `ensure_indexes()` |
-| PostgreSQL | pushed down as an `metadata_indexes @> …` containment term, in the same `WHERE` clause as `user_id` | GIN `team_process_metadata_indexes_idx` over the `TEXT[]` column, provisioned by `init_db` |
+| PostgreSQL | pushed down as a `metadata_indexes @> …` containment term, in the same `WHERE` clause as `user_id` | GIN `team_process_metadata_indexes_idx` over the `TEXT[]` column, provisioned by `init_db` |
 
 Correctness never depends on the index. A missing or un-created index makes a
 query more expensive; it never changes which teams come back. That is what makes
