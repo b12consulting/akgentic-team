@@ -14,6 +14,7 @@ multi-agent teams with event-sourced persistence and crash recovery.
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [Team Definitions](#team-definitions)
+- [Messages](#messages)
 - [Team Metadata](#team-metadata)
 - [Persistence](#persistence)
 - [CLI](#cli)
@@ -27,8 +28,9 @@ multi-agent teams with event-sourced persistence and crash recovery.
 teams. It sits between static team definitions and the running actor system,
 providing:
 
-- **Declarative team definitions** via `TeamCard` / `TeamCardMember` models
-  with hierarchical member trees
+- **Declarative team definitions** — `TeamCard` is the root object that
+  parametrizes a whole team: its hierarchical `TeamCardMember` tree, entry
+  point, message type, metadata schema and hireable profiles
 - **One-call team building** via `TeamFactory` — from a `TeamCard` to live
   Pykka actors with routing wired
 - **Full lifecycle management** via `TeamManager` — create, stop, resume,
@@ -161,7 +163,8 @@ team_card = TeamCard(
     entry_point=TeamCardMember(card=entry_card),
     members=[TeamCardMember(card=echo_card)],
     # Required for runtime.send(str): the first type is what a plain string is
-    # wrapped in. Without it, send() raises RuntimeError.
+    # wrapped in. Without it, send(str) raises RuntimeError — though send() also
+    # accepts a pre-formed Message, which needs no declared type. See Messages.
     message_types=[UserMessage],
 )
 
@@ -281,40 +284,301 @@ mechanism working, not a fault.
 
 ## Team Definitions
 
-### TeamCard
+### TeamCard — the root object
 
-Declarative team structure with hierarchical member trees:
+`TeamCard` is the one object that parametrizes a team. Everything the framework
+needs in order to build the team and route into it is declared there: who is in
+the team, who reports to whom, who faces the outside world, which message type
+the team speaks, what business metadata it carries, and which extra profiles it
+is allowed to hire while running.
+
+It is a **pure Pydantic model** — no actor exists until the card is handed to
+`TeamFactory.build()`, in practice through `TeamManager.create_team()`.
+
+#### Creation — the card builds the team
+
+```
+create_team(team_card)
+   │
+   ├─▶ TeamFactory.build(team_card)
+   │      1. Orchestrator actor
+   │      2. entry_point, then the members tree — each agent is spawned
+   │         through its parent and emits StartMessage(config, parent)
+   │      3. agent_profiles ──▶ orchestrator role catalog
+   │      4. welcome_message ──▶ WelcomeMessage on the event stream
+   │      │
+   │      └─▶ TeamRuntime          (live handle, returned to you)
+   │
+   │   every message above reaches the registered subscribers:
+   │      PersistenceSubscriber ──▶ EventStore ─┬─ events
+   │                                            └─ agent_states
+   │
+   └─▶ save_team(Process(team_id, team_card, RUNNING, metadata, …))
+          │
+          └─▶ team collection      (the card, stored for reference)
+```
+
+#### Restore — the card does *not* rebuild the team
+
+The card kept on the `Process` is a reference: what this team was *asked* to be.
+The roster that comes back is the one that was actually alive, and that is read
+from the event store, not from the card.
+
+```
+resume_team(team_id)
+   │
+   ├─▶ load_team(team_id) ──▶ Process.team_card       (reference — see below)
+   │
+   └─▶ TeamRestorer.restore(process)
+          1. load_events(team_id) + load_agent_states(team_id)
+          2. roster = every StartMessage with no later StopMessage
+                ├─ orchestrator StartMessage ──▶ Orchestrator actor
+                └─ agent StartMessages ──▶ each agent respawned with its
+                     persisted config, under its persisted parent, then its
+                     agent_states snapshot applied
+          3. replay the event log into the orchestrator (history and context)
+          └─▶ TeamRuntime
+```
+
+| Rebuilt from | What it supplies |
+|---|---|
+| `StartMessage` / `StopMessage` in the event log | which agents are alive, and each one's name, role, config and parent |
+| `agent_states` collection | each agent's persisted state |
+| replay of the remaining events | the orchestrator's history and the agents' message context |
+| `Process.team_card` | the team-level wiring only — which member is the entry point, which are the supervisors, which `agent_profiles` to re-register, which `metadata_type` to validate against |
+
+The practical consequence: an agent hired at runtime comes back after a resume
+even though no card ever mentioned it, and a member the card declares stays gone
+if it was fired. Editing a card does not retro-fit a team already created from it.
+
+Storing the card on the `Process` is nonetheless what makes it round-trip through
+the team collection, which is why every field is a declared, serializable type —
+and why the same card can be written as YAML and fed to the CLI (see [CLI](#cli)).
+
+#### Fields
+
+| Field | Type | Default | What it parametrizes |
+|---|---|---|---|
+| `name` | `str \| None` | `None` | Name of the *definition*. Descriptive only — a running team is identified by its `team_id` UUID, and two teams may share a card name. |
+| `description` | `str \| None` | `None` | Human-readable summary of what the team does. |
+| `entry_point` | `TeamCardMember` | *required* | The team's external interface — the agent every `send()` routes **through**. It is the sender, never a recipient of its own sends, so a card whose `members` is empty delivers nothing. |
+| `members` | `list[TeamCardMember]` | `[]` | The team proper, as a tree. Its **first layer** are the supervisors — the agents the entry point actually delivers to. |
+| `message_types` | `list[type]` | `[]` | The message classes the team speaks. **The first is the team default**: it is what a plain `str` handed to `send()` gets wrapped in. See [Messages](#messages). |
+| `metadata_type` | `type[SerializableBaseModel] \| None` | `None` | The model class this team's business metadata must validate against, typically a `TeamMetadata` subclass. See [Team Metadata](#team-metadata). |
+| `agent_profiles` | `list[AgentCard]` | `[]` | The profiles the orchestrator is given access to: cards registered in its catalog but **not** spawned. They are what an agent may hire at runtime, and what the `team_roles()` tool advertises in the system prompt. |
+| `welcome_message` | `str \| None` | `None` | Static greeting published on the team's event stream when the team is first created (not on resume). `None` disables it. |
+
+Two properties are derived from the tree rather than declared:
+
+| Property | Returns |
+|---|---|
+| `agent_cards` | Flat `dict[name, AgentCard]` of every card in the tree, entry point included. **Raises `ValueError` on a duplicate `config.name`** — this is where name collisions surface. |
+| `supervisors` | The `AgentCard`s of the **first layer of `members` only**. The entry point is excluded (it is the sender), and so is anything nested deeper. This is exactly the set `send()` fans out to. |
+
+Two fields deserve a note beyond the table:
+
+- **`agent_profiles` is the orchestrator's role catalog.** The factory registers
+  it through `Orchestrator.register_agent_profiles()` at create *and* at restore,
+  keyed by `card.role`. Two things read it back:
+
+  - **`team_roles()`**, the Team tool's role-profiles prompt (exposed on the
+    system-prompt and command channels). It renders the catalog into the agent's
+    system prompt one line per profile — `role: description (Skills: …)` — which
+    is how an LLM agent learns which roles exist for hiring, and why `description`
+    and `skills` on those cards are prompt copy, not decoration.
+  - **`hire_member(role)` / `hire_members(roles)`**, which look the card up by
+    role and spawn it.
+
+  Because the catalog is keyed by role, two profiles sharing a role silently
+  overwrite each other. And keep live members out of the list: they are already in
+  the room, so registering them lets the LLM hire a duplicate of an agent it can
+  already talk to.
+- **`metadata_type` is a declared field, not a type parameter.** A parameterised
+  `TeamCard[X]` has no importable dotted path, which would break the very
+  round-trip `Process.team_card` exists to perform.
+
+### TeamCardMember — the member tree
+
+`TeamCardMember` wraps an `AgentCard` with a multiplicity and its subordinates.
+It is self-referential, so a team's hierarchy is just a tree of them:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `card` | `AgentCard` | *required* | The agent to spawn — its `agent_class`, `skills`, `description` and `config` (where `name` and `role` live). |
+| `headcount` | `int` | `1` | How many instances of this member to spawn. |
+| `members` | `list[TeamCardMember]` | `[]` | Subordinates, spawned **through this member**, so it owns their lifecycle. |
+
+The rules the factory enforces, or silently relies on:
+
+- **Every `config.name` in the tree must be unique.** Reusing one card in two
+  slots is the common way to break this; `agent_cards` raises on it.
+- **The entry point must have `headcount=1`** — `build()` raises `ValueError`
+  otherwise.
+- **`headcount > 1` renames the instances.** Three researchers named
+  `@Researcher` become `@Researcher_0`, `@Researcher_1`, `@Researcher_2`; the
+  bare name never exists at runtime, so `send_to("@Researcher")` will not find
+  anyone. Children declared under such a member are spawned under the **last**
+  instance.
+- **Nesting is the spawn hierarchy, not a routing table.** A child is created
+  through its parent's actor, so the parent owns it and takes it down with it.
+  Who may talk to whom is decided by the agents at runtime, not by the tree.
+- **`role` is not a constructor argument on `AgentCard`** — it is a read-only
+  property over `config.role`, which must be non-empty. Passing `role=` to
+  `AgentCard(...)` is silently dropped; set it on the config.
+- **`routes_to` on an `AgentCard` is declared but not enforced** by this package:
+  nothing in the team, core, agent or llm runtime consults it. Treat it as
+  documentation until that changes.
+
+#### A worked card
 
 ```python
 team_card = TeamCard(
     name="research-team",
-    description="A research team with lead and workers",
-    entry_point=TeamCardMember(card=lead_card),
+    description="A research team with a lead and workers",
+    entry_point=TeamCardMember(card=entry_card),          # @Entry — faces the outside
     members=[
-        TeamCardMember(card=lead_card, members=[
-            TeamCardMember(card=researcher_card, headcount=3),
-            TeamCardMember(card=reviewer_card),
+        TeamCardMember(card=lead_card, members=[          # @Lead — the only supervisor
+            TeamCardMember(card=researcher_card, headcount=3),  # @Researcher_0..2
+            TeamCardMember(card=reviewer_card),                 # @Reviewer
         ]),
     ],
+    message_types=[UserMessage],                          # team default type
+    agent_profiles=[translator_card],                     # hireable, not spawned
+    welcome_message="Research team ready.",
 )
 
-team_card.agent_cards    # flat index of all AgentCards by name (raises on a duplicate name)
-team_card.supervisors    # AgentCards of the first layer of members only —
-                         # the entry point is excluded (it is the sender, not a
-                         # recipient) and so are deeper-nested members
+team_card.agent_cards   # {"@Entry": ..., "@Lead": ..., "@Researcher": ..., "@Reviewer": ...}
+team_card.supervisors   # [lead_card] — first layer of members only
+```
+
+`runtime.send("...")` here reaches `@Lead` and nobody else; `@Researcher_*` and
+`@Reviewer` are `@Lead`'s to delegate to.
+
+#### The same card as YAML
+
+The card is serializable in both directions, so the CLI can create a team from a
+file (`ak-team create card.yaml`). Class references travel as tagged dicts —
+`agent_class` as a dotted string, types as `__type__`:
+
+```yaml
+name: research-team
+description: A research team with a lead and workers
+entry_point:
+  card:
+    agent_class: myapp.agents.EntryAgent
+    description: Team entry point
+    skills: [routing]
+    config: {name: "@Entry", role: Entry}
+members:
+  - card:
+      agent_class: myapp.agents.LeadAgent
+      description: Leads the research
+      skills: [planning]
+      config: {name: "@Lead", role: Lead}
+message_types:
+  - __type__: akgentic.core.messages.message.UserMessage
 ```
 
 ### TeamRuntime
 
-Live handle to a running team, returned by `create_team()` and
-`resume_team()`:
+Live handle to a running team, returned by `create_team()` and `resume_team()`:
 
 ```python
-runtime.send("Hello!")                    # send to entry point
-runtime.send_to("@Reviewer", message)    # directed messaging
 runtime.id                                # team UUID
-runtime.addrs                             # agent name → ActorAddress
+runtime.team                              # the TeamCard it was built from
+runtime.addrs                             # agent name → ActorAddress (every member)
+runtime.supervisor_addrs                  # the first-layer members send() fans out to
+
+runtime.send("Hello!")                    # into the team, through the entry point
+runtime.send_to("@Reviewer", "Hello!")    # directed to one member
+runtime.send_from_to("@Lead", "@Reviewer", "Hello!")   # sender is @Lead, not @Entry
+runtime.emitMessage(some_message)         # publish to the record, no agent involved
 ```
+
+`TeamRuntime` is itself serializable: the addresses are persistent fields and the
+actor proxies are rebuilt from them in `model_post_init`, which is what lets a
+restored team be handed back as an ordinary runtime.
+
+## Messages
+
+### `message_types` — the type the team speaks
+
+`TeamCard.message_types` declares the message classes a team handles, and **the
+first entry is the team's default type**. It is used in exactly one place: when
+`send()`, `send_to()` or `send_from_to()` is given a plain `str`, the string is
+wrapped in `message_types[0]` before being routed.
+
+```python
+team_card = TeamCard(..., message_types=[UserMessage])
+
+runtime.send("Hello!")            # → UserMessage(content="Hello!")
+```
+
+Consequences worth knowing before you pick one:
+
+- **The class must accept `content=` as its only required argument** — the wrap
+  is `message_types[0](content=content)`. `UserMessage` (core) and `AgentMessage`
+  (akgentic-agent) both satisfy this.
+- **A team with no `message_types` cannot be sent a `str`.** `send("...")` raises
+  `RuntimeError: No message type declared for this team`. It can still be sent a
+  `Message` — see below.
+- **Entries beyond the first are declaration, not dispatch.** Nothing selects
+  among them at runtime; they document what the team accepts.
+- **The agent side must actually handle the type.** Routing is by handler name:
+  an agent receives a `UserMessage` through `receiveMsg_UserMessage`. Declaring a
+  type no agent has a handler for produces a silently ignored message, not an
+  error.
+
+### `send()` takes a `str` or a `Message`
+
+All three processing verbs accept `str | Message`. A `str` is wrapped in the team
+default as above; a `Message` is **passed through untouched**, so the caller — not
+the card — picks the concrete type and fills its fields:
+
+```python
+from akgentic.core.messages.message import UserMessage
+
+runtime.send("Hello!")                                  # team default type
+runtime.send(UserMessage(content="Hello!"))             # caller's own instance
+runtime.send(CaseUpdate(content="Hello!", severity="high"))  # caller's own type
+```
+
+This is how a product injects a richer, domain-specific message into a team
+without the team card having to know that type — and it is the only way to send
+into a team that declares no `message_types` at all.
+
+Four things do **not** change when you pass a `Message`:
+
+- **Routing is still the framework's.** `send()` still fans out to the
+  supervisors, `send_to()` still targets the named member. A `recipient` you set
+  on the message is not consulted for routing.
+- **The sender is still the routing proxy** — the entry agent for `send()` and
+  `send_to()`, the named sender for `send_from_to()`. A `sender` you set on the
+  message is not authoritative.
+- **The message is still processed by an agent.** It lands in a mailbox and the
+  agent acts on it. To publish something *without* any agent touching it, use
+  `emitMessage()`.
+- **`send()` hands the same instance to every supervisor.** It is a passthrough,
+  not a clone per recipient — do not mutate a message after sending it to a team
+  with more than one supervisor.
+
+### The four verbs
+
+| Verb | Meaning | Reaches | Agent processing | Type chosen by |
+|---|---|---|---|---|
+| `send(content)` | converse with the team | every supervisor, sent by the entry agent | yes | team default, or the caller if a `Message` is passed |
+| `send_to(name, content)` | converse with one member | that member, sent by the entry agent | yes | team default, or the caller |
+| `send_from_to(sender, recipient, content)` | converse as a specific member | that recipient, sent by `sender` | yes | team default, or the caller |
+| `emitMessage(message)` | publish a record into the team's event log | subscribers only — event store (durable) and live stream | **no** | the caller, always |
+
+`emitMessage()` is the door for display or record messages — an ingestion
+warning, a status banner — that must survive stop/resume and render live, but
+that no agent should answer. It is fire-and-forget to the orchestrator, which
+stamps `team_id` and fans it out to the subscribers with no routing and no
+outbound dispatch.
+
+All four are **asynchronous tells**: they return before anything has been
+processed.
 
 ## Team Metadata
 
