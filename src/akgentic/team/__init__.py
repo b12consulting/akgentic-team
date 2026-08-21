@@ -29,6 +29,7 @@ from akgentic.team.ports import (
     NullServiceRegistry,
     ServiceRegistry,
 )
+from akgentic.team.reference_metadata import ReferenceTeamMetadata
 from akgentic.team.repositories import YamlEventStore
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import PersistenceSubscriber
@@ -44,6 +45,7 @@ __all__: list[str] = [
     "PersistenceSubscriber",
     "PersistedEvent",
     "Process",
+    "ReferenceTeamMetadata",
     "ServiceRegistry",
     "TeamCard",
     "TeamCardMember",
