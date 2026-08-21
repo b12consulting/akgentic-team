@@ -615,10 +615,16 @@ subclass with no marked field at all is legal — it is just not filterable.
 a bare `owner: str | None`. A client-facing field descriptor reports a field as
 *mandatory* only when it is required **and** not nullable, so a bare
 `owner: str | None` is advertised to a form as optional — while Pydantic still
-counts it as required, because the key must be present. The form leaves the input
-blank, sends no key at all, and the write comes back as a 422 *field required*
-the user has no way to satisfy or clear. The `= None` default is what makes the
-two halves agree, and it applies to every nullable field, indexed or not.
+counts it as required, because the key must be present. Leave that input blank
+and the form sends no key at all, so the write answers 422 *field required*
+naming a field it had just shown as optional — and a value once set can never be
+cleared. The `= None` default is what makes the two halves agree, and it applies
+to every nullable field, indexed or not.
+
+Nothing catches a breach of this rule when the class is defined. Unlike the
+scalar restriction below, a required-nullable field is a perfectly legal
+declaration for any client that is not a form, so it is a rule for the declaring
+author to keep rather than one the base class can enforce.
 
 That is why `channel: str | None` above carries `default=None` — it is nullable,
 so it must be defaultable too. `case_ref: str` needs nothing: being neither
