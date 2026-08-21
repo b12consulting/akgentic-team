@@ -121,3 +121,8 @@ class TestSerializationRoundTrip:
         dumped = meta.model_dump()
         assert "__model__" in dumped
         assert ReferenceTeamMetadata.model_validate(dumped) == meta
+
+    def test_the_emitted_model_tag_resolves_to_the_class(self) -> None:
+        """The branch Process.metadata restore takes — it is typed SerializableBaseModel | None."""
+        dumped = _populated().model_dump()
+        assert import_class(dumped["__model__"]) is ReferenceTeamMetadata
