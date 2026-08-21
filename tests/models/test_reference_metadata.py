@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import get_args
 
+import pytest
 from akgentic.core.utils.deserializer import import_class
+from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 
 from akgentic.team.metadata import derive_metadata_indexes, make_index_entry
@@ -126,3 +128,44 @@ class TestSerializationRoundTrip:
         """The branch Process.metadata restore takes — it is typed SerializableBaseModel | None."""
         dumped = _populated().model_dump()
         assert import_class(dumped["__model__"]) is ReferenceTeamMetadata
+
+
+class TestDeclaredPatterns:
+    """Where each pattern lands in the JSON Schema — not merely that one was written.
+
+    A catalog reads these descriptors out of ``model_json_schema()``, and a
+    pattern sits in a different place depending on the field's nullability. A
+    test asserting only that ``Field(pattern=...)`` was declared would pass even
+    if the projection could never find the value, so each shape is pinned where
+    it actually appears.
+    """
+
+    def test_the_required_field_carries_its_pattern_at_the_top_level(self) -> None:
+        prop = ReferenceTeamMetadata.model_json_schema(by_alias=False)["properties"]["tenant"]
+        assert prop["pattern"] == r"^[a-z][a-z0-9-]{2,31}$"
+
+    def test_the_nullable_field_carries_its_pattern_nested_in_anyof(self) -> None:
+        """The shape a top-level lookup drops -- and the one authors are told to write."""
+        prop = ReferenceTeamMetadata.model_json_schema(by_alias=False)["properties"]["case_ref"]
+        assert "pattern" not in prop
+        assert [b["pattern"] for b in prop["anyOf"] if "pattern" in b] == [r"^[a-z]+-\d+$"]
+
+    def test_the_unpatterned_fields_declare_none(self) -> None:
+        props = ReferenceTeamMetadata.model_json_schema(by_alias=False)["properties"]
+        for name in ("tier", "note"):
+            assert "pattern" not in props[name]
+            assert "anyOf" not in props[name]
+
+    def test_both_patterns_accept_the_fixture_values(self) -> None:
+        """The fixtures are the model's own worked example; a pattern must not invalidate them."""
+        assert _populated().tenant == "acme"
+        assert _populated().case_ref == "case-1"
+        assert _sparse().tenant == "contoso"
+
+    def test_a_malformed_value_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ReferenceTeamMetadata(tenant="Acme Corp")
+
+    def test_the_pattern_does_not_make_the_optional_field_mandatory(self) -> None:
+        """A pattern constrains a value that is present; it never requires one."""
+        assert _sparse().case_ref is None
