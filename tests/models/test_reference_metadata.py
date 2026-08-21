@@ -39,6 +39,21 @@ def _sparse() -> ReferenceTeamMetadata:
     return ReferenceTeamMetadata(tenant="contoso")
 
 
+class TestFieldDescriptors:
+    """The key and description halves of what a client-facing descriptor reports."""
+
+    def test_the_four_fields_are_declared_in_the_order_a_form_renders_them(self) -> None:
+        assert list(ReferenceTeamMetadata.model_fields) == ["tenant", "case_ref", "tier", "note"]
+
+    def test_exactly_one_field_declares_no_description(self) -> None:
+        undescribed = {
+            name
+            for name, field in ReferenceTeamMetadata.model_fields.items()
+            if not field.description
+        }
+        assert undescribed == {"note"}
+
+
 class TestIndexedFields:
     """The reference model declares exactly two indexed fields, in order."""
 
