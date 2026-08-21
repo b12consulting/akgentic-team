@@ -31,8 +31,13 @@ def test_version_in_all() -> None:
 
 
 def test_metadata_contract_is_exported() -> None:
-    """The metadata base, the entry primitive and the derivation helper are public."""
-    for name in ("TeamMetadata", "make_index_entry", "derive_metadata_indexes"):
+    """The metadata base, the reference model, the entry primitive and the helper are public."""
+    for name in (
+        "TeamMetadata",
+        "ReferenceTeamMetadata",
+        "make_index_entry",
+        "derive_metadata_indexes",
+    ):
         assert name in akgentic.team.__all__, f"{name} missing from __all__"
         assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
 
