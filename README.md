@@ -611,6 +611,25 @@ Unmarked fields are ordinary model fields: they are persisted with the team and
 come back on every read, they are simply not something you can filter on. A
 subclass with no marked field at all is legal — it is just not filterable.
 
+**A nullable field must carry `= None`.** Write `owner: str | None = None`, never
+a bare `owner: str | None`. A client-facing field descriptor reports a field as
+*mandatory* only when it is required **and** not nullable, so a bare
+`owner: str | None` is advertised to a form as optional — while Pydantic still
+counts it as required, because the key must be present. Leave that input blank
+and the form sends no key at all, so the write answers 422 *field required*
+naming a field it had just shown as optional — and a value once set can never be
+cleared. The `= None` default is what makes the two halves agree, and it applies
+to every nullable field, indexed or not.
+
+Nothing catches a breach of this rule when the class is defined. Unlike the
+scalar restriction below, a required-nullable field is a perfectly legal
+declaration for any client that is not a form, so it is a rule for the declaring
+author to keep rather than one the base class can enforce.
+
+That is why `channel: str | None` above carries `default=None` — it is nullable,
+so it must be defaultable too. `case_ref: str` needs nothing: being neither
+nullable nor defaulted, it is reported mandatory, which is exactly what it is.
+
 **Only indexed fields are restricted to scalars.** A marked field must be
 annotated `str`, `bool`, `int`, `UUID`, `Enum`, `date` or `datetime` (optionally
 `| None`); `float` is excluded, because float equality is not a sound index key.
@@ -626,6 +645,18 @@ class Broken(TeamMetadata):
 #            Indexed fields must be str, bool, int, UUID, Enum, date or datetime
 #            (optionally '| None').
 ```
+
+`ReferenceTeamMetadata` is the shipped, executable version of everything above:
+
+```python
+from akgentic.team import ReferenceTeamMetadata
+```
+
+It declares one field per state a client-side descriptor can report — indexed and
+mandatory, indexed and nullable (carrying its `= None`), unindexed with a
+non-`None` default, and one that declares no description at all. Read it as a
+worked example, not as a contract to adopt or a base to inherit from: declare
+your own `TeamMetadata` subclass, with your own fields.
 
 ### Declaring it on the TeamCard
 
@@ -1075,6 +1106,7 @@ src/akgentic/team/
     models.py            # TeamCard, TeamRuntime, Process, TeamStatus, persistence models
     messages.py          # WelcomeMessage
     metadata.py          # TeamMetadata, make_index_entry, derive_metadata_indexes
+    reference_metadata.py # ReferenceTeamMetadata — the worked metadata example
     ports.py             # EventStore, ServiceRegistry protocols, NullServiceRegistry
     factory.py           # TeamFactory — static builder
     manager.py           # TeamManager — lifecycle facade

@@ -14,6 +14,10 @@ Only scalars can be indexed (``str``, ``bool``, ``int``, ``UUID``, ``Enum``,
 defined, not when a value is written. The model itself may hold nested models,
 lists and dicts freely — they simply cannot be filtered on.
 
+:class:`akgentic.team.reference_metadata.ReferenceTeamMetadata` is the worked
+example: one subclass covering every state a client-side field descriptor can
+report.
+
 Implements ADR-24 §D4.
 """
 
@@ -124,6 +128,18 @@ class TeamMetadata(SerializableBaseModel):
     Subclasses declare their own fields and mark the filterable ones with
     ``Field(json_schema_extra={"indexed": True})``. A subclass with no marked
     field is legal — it is simply not filterable.
+
+    **A nullable field must carry ``= None``** — write ``owner: str | None =
+    None``, never ``owner: str | None``. A client-facing field descriptor
+    reports ``mandatory`` as *required and not nullable*, so a required-nullable
+    field is reported non-mandatory and yet cannot be satisfied by leaving the
+    input blank: the server answers 422 "field required" and the user has no way
+    to clear it. Nothing enforces this at class-definition time, because a
+    required-nullable field is a valid declaration for a client that is not a
+    form; it is a rule for the declaring author to keep.
+
+    See :class:`akgentic.team.reference_metadata.ReferenceTeamMetadata` for a
+    worked declaration.
     """
 
     @classmethod
