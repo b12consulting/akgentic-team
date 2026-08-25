@@ -34,6 +34,7 @@ from pydantic import Field
 
 from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import (
+    AgentStateSnapshot,
     PersistedEvent,
     Process,
     TeamCard,
@@ -231,7 +232,8 @@ def _populate_stopped_team(
     """Populate InMemoryEventStore with events simulating a stopped team.
 
     Creates StartMessage events for orchestrator + all agents in team_card,
-    plus optional fired agents (with matching StopMessage events).
+    plus optional fired agents (StopMessage + the state snapshot a real fire
+    leaves behind -- nothing deletes it).
 
     Args:
         orchestrator_config: Config persisted on the orchestrator's StartMessage.
@@ -315,7 +317,10 @@ def _populate_stopped_team(
     for member in tc.members:
         _walk_member(member)
 
-    # Fired members: add StartMessage + StopMessage pairs
+    # Fired members: StartMessage + StopMessage, plus the snapshot that outlives
+    # them. Omitting the snapshot made every fired-agent test vacuous: the restore
+    # path's state lookup found nothing, so it could not crash the way it did in
+    # production the first time a team was restored after firing an agent.
     if fired_members:
         for fname, frole, fid in fired_members:
             seq += 1
@@ -336,6 +341,15 @@ def _populate_stopped_team(
                     sequence=seq,
                     event=fstop,
                     timestamp=datetime.now(UTC),
+                )
+            )
+            event_store.save_agent_state(
+                AgentStateSnapshot(
+                    team_id=team_id,
+                    agent_id=str(fid),
+                    name=fname,
+                    state=_MarkerState(marker=f"fired:{fname}"),
+                    updated_at=datetime.now(UTC),
                 )
             )
 
@@ -2187,6 +2201,116 @@ class TestRestorerReemitStateOnRestore:
 
         assert events_after == events_before, "Re-emit must not append to the event log"
         assert states_after == states_before, "Re-emit must not write the snapshot store"
+
+
+# ---------------------------------------------------------------------------
+# Tests: the re-emit skips agents that were never rebuilt (Story 34-1)
+# ---------------------------------------------------------------------------
+
+
+class TestRestorerReemitSkipsFiredAgents:
+    """A fired agent's StartMessage is replayed; its state must not be re-emitted.
+
+    The agent is deliberately not rebuilt, so its address never resolves past
+    ``ActorAddressProxy`` -- while its snapshot outlives it. The re-emit must
+    therefore consult the live set (``addr_map``), not the snapshot store.
+    """
+
+    def test_restore_survives_a_fired_agent_with_a_surviving_snapshot(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """The production crash: ungated, ``proxy_ask`` gets a dead proxy."""
+        tc = _make_team_card()
+        fired_id = uuid.uuid4()
+        team_id, process = _populate_stopped_team(
+            event_store,
+            tc,
+            fired_members=[("fired-agent", "FiredRole", fired_id)],
+        )
+        # The lookup this test guards must genuinely have something to find.
+        stored = {snap.agent_id for snap in event_store.load_agent_states(team_id)}
+        assert str(fired_id) in stored
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert "fired-agent" not in runtime.addrs
+        assert runtime.addrs["lead"].is_alive()
+
+    def test_no_state_is_reemitted_for_a_fired_agent(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Stream parity: a fresh team emits no state for an agent that is gone.
+
+        Asserts on sender ids, so re-emitting the fired state through some other
+        live agent fails too.
+        """
+        tc = _make_team_card()
+        fired_id = uuid.uuid4()
+        team_id, process = _populate_stopped_team(
+            event_store,
+            tc,
+            fired_members=[("fired-agent", "FiredRole", fired_id)],
+        )
+        lead_agent_id = _lead_agent_id_from_events(event_store, team_id)
+        event_store.save_agent_state(
+            AgentStateSnapshot(
+                team_id=team_id,
+                agent_id=str(lead_agent_id),
+                name="lead",
+                state=_MarkerState(marker="restored"),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        restorer.restore(process, subscribers=[recording])
+
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        emitted_ids = {m.sender.agent_id for m in state_msgs if m.sender is not None}
+        assert emitted_ids == {lead_agent_id}
+        markers = [m.state.marker for m in state_msgs if isinstance(m.state, _MarkerState)]
+        assert markers == ["restored"]
+
+    def test_legacy_name_keyed_snapshot_of_a_fired_agent_is_skipped(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """The name fallback must not reanimate a fired agent either.
+
+        Gating on the live set closes this door; gating on the snapshot's shape
+        would not.
+        """
+        tc = _make_team_card()
+        fired_id = uuid.uuid4()
+        team_id, process = _populate_stopped_team(
+            event_store,
+            tc,
+            fired_members=[("fired-agent", "FiredRole", fired_id)],
+        )
+        # A pre-Epic-23 snapshot for the same agent: keyed by NAME, not UUID.
+        event_store.save_agent_state(
+            AgentStateSnapshot(
+                team_id=team_id,
+                agent_id="fired-agent",
+                state=_MarkerState(marker="legacy-fired"),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+        recording = RecordingSubscriber()
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process, subscribers=[recording])
+
+        assert "fired-agent" not in runtime.addrs
+        state_msgs = [m for m in recording.messages if isinstance(m, StateChangedMessage)]
+        assert state_msgs == []
 
 
 # ---------------------------------------------------------------------------

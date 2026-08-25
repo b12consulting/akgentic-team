@@ -515,7 +515,10 @@ class TeamRestorer:
 
         Resolves ``ActorAddressProxy`` instances in events to live addresses
         before replay so that ``get_team()`` returns live ``ActorAddressImpl``
-        refs instead of stale proxies.
+        refs instead of stale proxies. Resolution is PARTIAL by design: an agent
+        fired during the team's life is not rebuilt, so its address has no live
+        counterpart and stays a proxy. Anything this method does per event must
+        therefore tolerate a dead sender -- see the ``addr_map`` gate below.
 
         After each replayed ``StartMessage``, re-emits the sender agent's state
         snapshot onto the event stream via ``Akgent.notify_state_change`` so a
@@ -545,7 +548,20 @@ class TeamRestorer:
 
             # Re-emit the agent's state right after its StartMessage so the
             # restored stream matches a fresh team's (ADR-020 §3).
-            if isinstance(pe.event, StartMessage) and pe.event.sender is not None:
+            #
+            # Only for agents that were actually rebuilt. Phase 3 replays EVERY
+            # StartMessage, including those of agents fired during the team's
+            # life -- those are excluded from the respawn set by
+            # _determine_live_agents, so their sender never resolves and stays
+            # an unresolvable ActorAddressProxy. Their snapshot nonetheless
+            # survives in the state store (firing an agent does not delete it),
+            # so the state_map lookup hits and proxy_ask is handed a dead
+            # address. addr_map is the live set; gate on it.
+            if (
+                isinstance(pe.event, StartMessage)
+                and pe.event.sender is not None
+                and pe.event.sender.agent_id in addr_map
+            ):
                 self._reemit_state(pe.event.sender, state_map)
 
         orchestrator_proxy.end_restoration()
@@ -563,8 +579,10 @@ class TeamRestorer:
         attached subscribers. A sender with no matching snapshot (e.g. the
         orchestrator's StartMessage) is a no-op.
 
-        ``sender`` is already a live address here -- ``_resolve_event_addresses``
-        ran at the top of ``_replay_events``.
+        ``sender`` is a live address here: ``_resolve_event_addresses`` ran at
+        the top of ``_replay_events``, and the caller gates this call on the
+        sender being present in ``addr_map`` -- a fired agent's sender resolves
+        to nothing and must not reach here.
 
         Args:
             sender: The live address of the replayed StartMessage's sender.
@@ -584,6 +602,11 @@ class TeamRestorer:
 
         Walks each event's address fields and swaps proxies for live
         ``ActorAddressImpl`` refs using the addr_map built from Phase 2.
+
+        Not every proxy is replaced: addr_map holds only the agents that were
+        rebuilt, so a fired agent's address survives as an ``ActorAddressProxy``
+        and its replayed events still carry it. Callers must not assume a
+        post-resolution address is live.
 
         Args:
             events: Persisted events to resolve in-place.
@@ -634,7 +657,10 @@ class TeamRestorer:
 
         Returns:
             The live address if the input was a proxy with a known mapping,
-            or the original address unchanged.
+            or the original address unchanged. Unchanged is the normal outcome
+            for an agent fired during the team's life: it is absent from
+            addr_map because it was deliberately not rebuilt, and the returned
+            proxy cannot be sent to.
         """
         if addr is not None and isinstance(addr, ActorAddressProxy):
             return addr_map.get(addr.agent_id, addr)
