@@ -191,7 +191,11 @@ class TestScalarRendering:
         assert make_index_entry("k", _OPENED_ON) == "k|2026-08-11"
 
     def test_datetime_renders_isoformat_not_date_only(self) -> None:
-        assert make_index_entry("k", _OPENED_AT) == f"k|{_OPENED_AT.isoformat()}"
+        # The ISO ``T`` separator folds to ``t`` — the fold applies to the
+        # rendered form of every scalar, ``datetime`` included. Symmetric: a
+        # caller filtering a datetime prefix renders through the same helper.
+        assert make_index_entry("k", _OPENED_AT) == f"k|{_OPENED_AT.isoformat().casefold()}"
+        assert make_index_entry("k", _OPENED_AT) == "k|2026-08-11t14:30:15+00:00"
 
     def test_unexpected_type_falls_back_to_str(self) -> None:
         """make_index_entry is public and takes query values too -- it never raises."""
@@ -207,7 +211,7 @@ class TestScalarRendering:
             "priority|1",
             "region|eu-west",
             "opened_on|2026-08-11",
-            f"opened_at|{_OPENED_AT.isoformat()}",
+            f"opened_at|{_OPENED_AT.isoformat().casefold()}",
         ]
 
     def test_rendering_is_stable_across_repeated_calls(self) -> None:
@@ -218,6 +222,61 @@ class TestScalarRendering:
         meta = ScalarMetadata()
         restored = ScalarMetadata.model_validate(meta.model_dump())
         assert restored.index_entries() == meta.index_entries()
+
+
+class TestValueHalfIsCasefolded:
+    """The value half folds at derivation; the key half never does.
+
+    Folding on write is what buys case-insensitive matching *without* a
+    case-insensitive query — a Mongo ``$options: "i"`` regex uses no index at
+    all, so the seek would be gone.
+    """
+
+    def test_value_is_folded_and_the_key_keeps_its_case(self) -> None:
+        """A mixed-case KEY alongside a mixed-case value — both halves pinned.
+
+        Folding the finished entry passes every all-lowercase-key fixture in
+        this suite and only breaks the day a ``caseId`` field is declared, so
+        the key has to be mixed-case here for the assertion to bite.
+        """
+        assert make_index_entry("caseId", "AZE") == "caseId|aze"
+
+    def test_folding_is_casefold_not_lower(self) -> None:
+        """``ß`` and ``SS`` must land on the same entry.
+
+        ``.lower()`` leaves ``ß`` intact and makes the two differ, so a
+        German-language value stops matching its own uppercase form.
+        """
+        assert make_index_entry("k", "STRASSE") == make_index_entry("k", "straße")
+        assert make_index_entry("k", "straße") == "k|strasse"
+
+    def test_fold_composes_with_the_separator_escaping(self) -> None:
+        """A value whose rendered form holds a ``|`` yields ONE folded, escaped entry."""
+        entries = OptionalScalarMetadata(case_ref="a|B").index_entries()
+        assert entries == ["case_ref|a\\|b"]
+        assert len(entries) == 1
+
+    def test_mixed_case_values_fold_through_index_entries(self) -> None:
+        """The fold reaches the model derivation path, not just the helper."""
+        meta = ContosoMetadata(tenant="AzeFR", case_ref="C-1")
+        assert meta.index_entries() == ["tenant|azefr", "case_ref|c-1"]
+
+    def test_derive_metadata_indexes_folds_too(self) -> None:
+        """``derive_metadata_indexes`` is the one write-path entry point."""
+        meta = AcmeTeamMetadata(tenant="AzeFR")
+        assert derive_metadata_indexes(meta) == ["tenant|azefr"]
+
+    def test_the_stored_metadata_value_itself_is_untouched(self) -> None:
+        """Casefolding costs no information: only the DERIVED index folds."""
+        meta = AcmeTeamMetadata(tenant="AzeFR")
+        assert meta.tenant == "AzeFR"
+        assert meta.model_dump()["tenant"] == "AzeFR"
+
+    def test_a_query_term_folds_through_the_same_helper(self) -> None:
+        """Query and derivation fold identically, so matching stays symmetric."""
+        stored = AcmeTeamMetadata(tenant="AzeFR").index_entries()
+        assert stored == [make_index_entry("tenant", "AZEFR")]
+        assert stored == [make_index_entry("tenant", "azefr")]
 
 
 class TestScalarOnlyRestriction:

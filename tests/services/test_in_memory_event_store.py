@@ -10,8 +10,15 @@ drift fails a test instead of going unnoticed.
 
 from __future__ import annotations
 
+import pytest
+
 from akgentic.team.models import TeamStatus
 from tests.models.conftest import AcmeTeamMetadata, make_indexed_process, make_process
+from tests.repositories.test_event_store_contract import (
+    METADATA_FILTER_IDS,
+    METADATA_FILTER_MATRIX,
+    build_metadata_fixture_set,
+)
 from tests.services.conftest import InMemoryEventStore
 
 
@@ -84,7 +91,7 @@ class TestInMemoryEventStoreListTeams:
         store.save_team(acme)
         store.save_team(contoso)
 
-        result = store.list_teams(metadata={"tenant": "acme"})
+        result = store.list_teams(metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {acme.team_id}
 
     def test_metadata_and_combines_across_keys(self) -> None:
@@ -95,7 +102,7 @@ class TestInMemoryEventStoreListTeams:
         store.save_team(both)
         store.save_team(tenant_only)
 
-        result = store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        result = store.list_teams(metadata={"tenant": ["acme"], "case_ref": ["C-1"]})
         assert {p.team_id for p in result} == {both.team_id}
 
     def test_metadata_combines_with_user_id(self) -> None:
@@ -106,7 +113,7 @@ class TestInMemoryEventStoreListTeams:
         store.save_team(mine)
         store.save_team(theirs)
 
-        result = store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        result = store.list_teams(user_id="u1", metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {mine.team_id}
 
     def test_metadata_combines_with_status(self) -> None:
@@ -121,7 +128,7 @@ class TestInMemoryEventStoreListTeams:
         store.save_team(running)
         store.save_team(stopped)
 
-        result = store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": "acme"})
+        result = store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {running.team_id}
 
     def test_all_three_filters_combine_with_and(self) -> None:
@@ -147,7 +154,7 @@ class TestInMemoryEventStoreListTeams:
             store.save_team(process)
 
         result = store.list_teams(
-            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]}
         )
         assert {p.team_id for p in result} == {wanted.team_id}
 
@@ -173,6 +180,43 @@ class TestInMemoryEventStoreListTeams:
         store = InMemoryEventStore()
         store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme", department="ops")))
 
-        assert store.list_teams(metadata={"nope": "acme"}) == []
+        assert store.list_teams(metadata={"nope": ["acme"]}) == []
         # `department` is declared but NOT indexed, so it is not matchable.
-        assert store.list_teams(metadata={"department": "ops"}) == []
+        assert store.list_teams(metadata={"department": ["ops"]}) == []
+
+
+class TestInMemoryEventStoreMatchesTheSharedMatrix:
+    """The fake answers the contract suite's matrix exactly as the backends do.
+
+    Imported rather than restated, so this provably runs the SAME cases the
+    three real backends run. Without it a fake left on whole-entry equality
+    drifts with no failure anywhere: ``EventStore`` is a plain ``Protocol``, not
+    a ``@runtime_checkable`` one, and CI mypy covers ``src/`` only.
+    """
+
+    @pytest.mark.parametrize(
+        "case_label,metadata,expected_labels",
+        METADATA_FILTER_MATRIX,
+        ids=METADATA_FILTER_IDS,
+    )
+    def test_metadata_filter_matrix(
+        self,
+        case_label: str,
+        metadata: dict[str, list[str]] | None,
+        expected_labels: set[str] | frozenset[str],
+    ) -> None:
+        store = InMemoryEventStore()
+        teams = build_metadata_fixture_set()
+        for process in teams.values():
+            store.save_team(process)
+
+        found = {p.team_id for p in store.list_teams(metadata=metadata)}
+        assert found == {teams[label].team_id for label in expected_labels}, case_label
+
+    def test_a_bare_string_metadata_value_is_rejected(self) -> None:
+        """The fake rejects the un-migrated call shape too, or it hides the bug."""
+        store = InMemoryEventStore()
+        store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+
+        with pytest.raises(TypeError, match="tenant"):
+            store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]

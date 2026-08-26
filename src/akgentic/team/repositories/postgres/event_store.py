@@ -17,13 +17,90 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Mapping
 
 from nagra import Transaction  # type: ignore[import-untyped]
 
-from akgentic.team.metadata import make_index_entry
+from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
+
+_LIKE_ESCAPE = "!"
+"""``ESCAPE`` character for the metadata ``LIKE`` patterns — chosen, not default.
+
+``LIKE``'s default escape character is the backslash, and a backslash is
+already in play twice on this path: ``make_index_entry`` plants ``\\|`` for an
+escaped separator, and ``re.escape`` emits backslashes on the Mongo side of the
+very same rendered prefix. Taking the default would put three layers of
+backslash in one string, where a value of ``a\\b`` has to be doubled to survive
+and a miscount is invisible until a user types one. ``!`` is not produced by any
+escaping layer, so a backslash in an entry passes through ``LIKE`` as the
+ordinary character it is, and only ``!`` itself, ``%`` and ``_`` need escaping.
+
+Declaring it explicitly also sidesteps ``ESCAPE '\\'``, which is not a
+well-formed SQL literal when ``standard_conforming_strings`` is off.
+"""
+
+_LIKE_METACHARACTERS = ("%", "_")
+
+_LIKE_TERM = f"entry LIKE %s ESCAPE '{_LIKE_ESCAPE}'"
+"""One term inside an ``EXISTS``. Fixed fragment — the value rides the ``%s``."""
+
+
+def _metadata_key_clause(term_count: int) -> str:
+    """Build the ``EXISTS`` clause for ONE filtered metadata key.
+
+    One ``EXISTS`` per key, its inner ``WHERE`` ORing that key's term patterns:
+    terms for a key are a disjunction, and the per-key clauses are ``AND``-ed by
+    the caller (ADR-28 §D7).
+
+    The ``OR`` sits *inside* the ``EXISTS`` so the disjunction is per-element:
+    one stored entry must satisfy one of the terms, rather than two different
+    entries each satisfying a different term. **Today those two readings cannot
+    differ** — indexed fields are scalars, so a key contributes at most one entry
+    per team — and hoisting the ``OR`` outside into one ``EXISTS`` per term was
+    mutation-tested to change no behaviour, only the statement. It is kept inside
+    because it is the reading that stays correct if a key ever contributes more
+    than one entry, and because it is one clause per key rather than per term.
+
+    Assembled only from fixed fragments repeated ``term_count`` times; every
+    caller value travels as a bound ``%s``. ``unnest`` is what makes the match
+    per-entry — the GIN index over the column serves containment and cannot
+    serve a prefix on an element, so this is a sequential scan by design
+    (ADR-28 §D6).
+
+    Args:
+        term_count: How many terms this key carries. Always at least one:
+            a key that renders no term yields no group and never reaches here.
+
+    Returns:
+        The clause, with one ``%s`` placeholder per term.
+    """
+    return (
+        "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) WHERE "
+        + " OR ".join([_LIKE_TERM] * term_count)
+        + ")"
+    )
+
+
+def _like_prefix_pattern(prefix: str) -> str:
+    """Turn a rendered index prefix into a literal-matching ``LIKE`` pattern.
+
+    The escape character is escaped FIRST — doing it after ``%``/``_`` would
+    re-escape the escapes this function just wrote and corrupt every pattern
+    containing a metacharacter.
+
+    Args:
+        prefix: A rendered ``"key|value"`` prefix, matched literally.
+
+    Returns:
+        The pattern, with a trailing ``%`` making it an anchored prefix match.
+    """
+    escaped = prefix.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+    for metacharacter in _LIKE_METACHARACTERS:
+        escaped = escaped.replace(metacharacter, _LIKE_ESCAPE + metacharacter)
+    return escaped + "%"
 
 
 class NagraEventStore:
@@ -90,7 +167,7 @@ class NagraEventStore:
         self,
         user_id: str | None = None,
         status: TeamStatus | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: Mapping[str, list[str]] | None = None,
     ) -> list[Process]:
         """Return persisted team processes. Order is unspecified.
 
@@ -100,9 +177,14 @@ class NagraEventStore:
         * ``user_id`` → ``(data ->> 'user_id') = %s``, backed by the
           functional expression index ``team_process_user_id_idx``. See
           ADR-16 §4.
-        * ``metadata`` → ``metadata_indexes @> %s``, an array-containment
-          term backed by the GIN index ``team_process_metadata_indexes_idx``
-          over the promoted ``TEXT[]`` column. See ADR-24 §D5.
+        * ``metadata`` → one ``EXISTS (SELECT 1 FROM unnest(metadata_indexes)
+          ... LIKE %s ESCAPE ...)`` clause per filtered KEY, its inner ``WHERE``
+          ORing that key's terms, matching per array element. This is a
+          sequential scan: the GIN index
+          ``team_process_metadata_indexes_idx`` serves array *containment*
+          and cannot serve a prefix on an element. ADR-28 §D6 records the
+          remedy — a side table with a ``text_pattern_ops`` B-tree — as
+          something to take when volume calls for it, not now.
         * ``status`` → in memory, on the hydrated rows. Its push-down needs
           a further expression index and is story 26.5, still DEFERRED, so
           this is the shipped behaviour of this backend rather than a
@@ -129,30 +211,33 @@ class NagraEventStore:
                 ``Process.status`` matches. If ``None`` (default), every
                 lifecycle state is returned, including ``DELETED``. See
                 ADR-23 §1.
-            metadata: If provided, return only snapshots whose
-                ``metadata_indexes`` contains an entry for EVERY key/value
-                pair given. An empty dict matches everything, like ``None``.
-                See ADR-24 §D5.
+            metadata: Mapping of indexed field name to a list of prefix terms.
+                Terms for one key OR-combine; distinct keys AND-combine. Empty
+                terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
+                and ``None`` all leave the statement without a metadata clause
+                — and a legacy row whose column is ``NULL`` keeps listing,
+                because ``unnest(NULL)`` yields no rows and so is matched by no
+                metadata term while being excluded by none either. See
+                ADR-24 §D5 and ADR-28 §D3/§D7.
 
         All three filters are independent terms combining as a conjunction.
+
+        Raises:
+            TypeError: If a ``metadata`` value is a bare ``str``.
         """
         clauses: list[str] = []
         params: list[object] = []
         if user_id is not None:
             clauses.append("(data ->> 'user_id') = %s")
             params.append(user_id)
-        # Truthiness, NOT ``is not None``: an empty mapping must add no term
-        # at all. ``x @> '{}'`` is TRUE for any non-null array but NULL for
-        # a row written before this column existed, so an ``is not None``
-        # gate would silently stop returning every pre-migration team while
-        # looking correct against a store populated after it.
-        if metadata:
-            # Equality-only containment, one entry per key, AND-combined by
-            # the array operator itself. Entries are built with the shared
-            # helper the write path derived with, so the ``|`` escaping
-            # cannot drift between the two sides.
-            clauses.append("metadata_indexes @> %s")
-            params.append([make_index_entry(k, v) for k, v in metadata.items()])
+        # Gate on the RENDERED groups, not on ``metadata`` truthiness: a key
+        # carrying an empty term list is itself truthy and must still add no
+        # clause, or a caller who sent a blank gets a different answer from one
+        # who sent nothing. A group is never empty, so no clause is ever built
+        # with zero ``OR`` arms.
+        for group in make_index_prefix_groups(metadata):
+            clauses.append(_metadata_key_clause(len(group)))
+            params.extend(_like_prefix_pattern(prefix) for prefix in group)
         sql = "SELECT data FROM team_process_entries"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)

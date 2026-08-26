@@ -19,7 +19,7 @@ import uuid
 import pytest
 from akgentic.core.messages.message import UserMessage
 
-from akgentic.team.models import TeamStatus
+from akgentic.team.models import Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError, EventStore
 from tests.models.conftest import (
     AcmeTeamMetadata,
@@ -29,6 +29,126 @@ from tests.models.conftest import (
     make_persisted_event,
     make_process,
 )
+
+
+def build_metadata_fixture_set() -> dict[str, Process]:
+    """Seed teams for the shared metadata-filter matrix, keyed by label.
+
+    Built through ``make_indexed_process`` so the value and its derived index
+    are seeded together exactly as a real write path leaves them — an index
+    written by hand would let a query-side folding or escaping bug pass.
+
+    The set is deliberately adversarial. It carries a mixed-case value (the
+    casefold), a value holding the separator (the escaping), one value per
+    regex and ``LIKE`` metacharacter, and for the two metacharacters that would
+    match something if left unescaped a **decoy** the unescaped pattern would
+    wrongly reach: ``axb`` for ``a.b`` and ``a_b``, ``5012`` for ``50%``.
+    """
+    return {
+        "azefr": make_indexed_process(AcmeTeamMetadata(tenant="AzeFR")),
+        "azejyt": make_indexed_process(AcmeTeamMetadata(tenant="azejyt")),
+        "acme": make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1")),
+        "contoso": make_indexed_process(AcmeTeamMetadata(tenant="contoso", case_ref="C-1")),
+        "piped": make_indexed_process(AcmeTeamMetadata(tenant="acme|corp")),
+        "dot": make_indexed_process(AcmeTeamMetadata(tenant="a.b")),
+        "star": make_indexed_process(AcmeTeamMetadata(tenant="a*b")),
+        "caret": make_indexed_process(AcmeTeamMetadata(tenant="a^b")),
+        "dollar": make_indexed_process(AcmeTeamMetadata(tenant="a$b")),
+        "bracket": make_indexed_process(AcmeTeamMetadata(tenant="a[b")),
+        "percent": make_indexed_process(AcmeTeamMetadata(tenant="50%")),
+        "underscore": make_indexed_process(AcmeTeamMetadata(tenant="a_b")),
+        "backslash": make_indexed_process(AcmeTeamMetadata(tenant="a\\b")),
+        "axb": make_indexed_process(AcmeTeamMetadata(tenant="axb")),
+        "fifty_twelve": make_indexed_process(AcmeTeamMetadata(tenant="5012")),
+        "bare": make_process(),
+    }
+
+
+ALL_LABELS = frozenset(build_metadata_fixture_set())
+"""Every seeded label — the answer any call that constrains nothing must give."""
+
+_MetadataCase = tuple[str, dict[str, list[str]] | None, set[str] | frozenset[str]]
+
+METADATA_FILTER_MATRIX: list[_MetadataCase] = [
+    # --- AC5: anchored prefix -------------------------------------------
+    ("prefix reaches longer values", {"tenant": ["aze"]}, {"azefr", "azejyt"}),
+    ("a longer prefix narrows", {"tenant": ["azef"]}, {"azefr"}),
+    ("the whole value is still a prefix", {"tenant": ["azefr"]}, {"azefr"}),
+    ("not anchored at the start", {"tenant": ["zef"]}, set()),
+    ("longer than the stored value", {"tenant": ["azefrx"]}, set()),
+    ("a term under another key", {"case_ref": ["aze"]}, set()),
+    # --- AC6: the direction is stored-starts-with-term -------------------
+    # A reversed predicate satisfies every case above and makes this one red:
+    # the crafted term STARTS WITH the stored ``tenant|acme`` entry.
+    ("a crafted term cannot span two entries", {"tenant": ["acme|case_ref|C-1"]}, set()),
+    # --- AC7: case-insensitive without a case-insensitive query ----------
+    ("an upper-case term", {"tenant": ["AZE"]}, {"azefr", "azejyt"}),
+    ("a mixed-case term", {"tenant": ["AzE"]}, {"azefr", "azejyt"}),
+    ("a mixed-case whole value", {"tenant": ["AzEfR"]}, {"azefr"}),
+    # --- AC8: same key ORs, different keys AND ----------------------------
+    # The load-bearing case: under the AND rule this returned NOTHING, because
+    # no team's tenant can start with both "acme" and "contoso". It is what
+    # separates the disjunction from the conjunction, so the OR->AND mutation
+    # has something to go red on.
+    ("terms for one key OR-combine", {"tenant": ["acme", "contoso"]}, {"acme", "piped", "contoso"}),
+    # Terms reaching disjoint parts of the store — a conjunction cannot produce
+    # this set at all, whichever way it is written.
+    (
+        "terms for one key reach disjoint values",
+        {"tenant": ["aze", "50"]},
+        {"azefr", "azejyt", "percent", "fifty_twelve"},
+    ),
+    # Nested prefixes: OR and AND happen to agree here, which is precisely why
+    # this case cannot be the only multi-term one. Kept as evidence that the
+    # redundant spelling is idempotent rather than an error.
+    ("nested terms for one key are idempotent", {"tenant": ["ac", "acm"]}, {"acme", "piped"}),
+    ("distinct keys AND-combine", {"tenant": ["acme"], "case_ref": ["C-"]}, {"acme"}),
+    ("a key pair no team carries", {"tenant": ["acme"], "case_ref": ["C-9"]}, set()),
+    # Both rules at once: the tenant terms OR, and the result is then ANDed
+    # against the case_ref key. `piped` carries no case_ref and drops out.
+    (
+        "keys AND while their own terms OR",
+        {"tenant": ["acme", "contoso"], "case_ref": ["C-1"]},
+        {"acme", "contoso"},
+    ),
+    # --- AC9: an empty term contributes no constraint --------------------
+    ("no metadata at all", None, ALL_LABELS),
+    ("an empty mapping", {}, ALL_LABELS),
+    ("an empty term list", {"tenant": []}, ALL_LABELS),
+    ("a single blank term", {"tenant": [""]}, ALL_LABELS),
+    ("two blank terms", {"tenant": ["", ""]}, ALL_LABELS),
+    ("a blank term beside an empty list", {"tenant": [""], "case_ref": []}, ALL_LABELS),
+    # Under a DISJUNCTION this is the sharp one: a blank surviving into the
+    # group would match every entry for the key and widen the answer to
+    # everything, instead of merely failing to narrow it.
+    ("a blank term does not widen a real one", {"tenant": ["", "aze"]}, {"azefr", "azejyt"}),
+    # An emptied key must contribute no arm at all — not an empty disjunction,
+    # which MongoDB rejects — while a real key beside it still constrains.
+    ("an emptied key beside a real one", {"tenant": [], "case_ref": ["C-1"]}, {"acme", "contoso"}),
+    # --- AC11: metacharacters are matched literally ----------------------
+    ("the regex dot is literal", {"tenant": ["a.b"]}, {"dot"}),
+    ("the regex star is literal", {"tenant": ["a*b"]}, {"star"}),
+    ("the regex caret is literal", {"tenant": ["a^b"]}, {"caret"}),
+    ("the regex dollar is literal", {"tenant": ["a$b"]}, {"dollar"}),
+    ("the regex bracket is literal", {"tenant": ["a[b"]}, {"bracket"}),
+    ("the LIKE wildcard is literal", {"tenant": ["50%"]}, {"percent"}),
+    ("the LIKE single-char wildcard is literal", {"tenant": ["a_b"]}, {"underscore"}),
+    ("a backslash is literal", {"tenant": ["a\\b"]}, {"backslash"}),
+    ("the separator is literal", {"tenant": ["acme|corp"]}, {"piped"}),
+    # The decoys are reachable, so "not returned above" is evidence and not
+    # an artefact of them being absent from the store.
+    ("the dot decoy is present", {"tenant": ["axb"]}, {"axb"}),
+    ("the wildcard decoy is present", {"tenant": ["5012"]}, {"fifty_twelve"}),
+]
+"""One shared matrix of (seeded teams x filter input) covering AC5-AC11.
+
+Held as data so the parametrized contract suite and the ``InMemoryEventStore``
+conformance suite provably run the SAME cases — ``EventStore`` is not
+``@runtime_checkable`` and CI mypy does not reach ``tests/``, so a backend or a
+fake left on whole-entry equality has no other gate.
+"""
+
+METADATA_FILTER_IDS = [case[0] for case in METADATA_FILTER_MATRIX]
 
 
 class TestEventStoreContract:
@@ -269,7 +389,7 @@ class TestEventStoreContract:
         for process in (both, tenant_only, other):
             event_store.save_team(process)
 
-        result = event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        result = event_store.list_teams(metadata={"tenant": ["acme"], "case_ref": ["C-1"]})
         assert {p.team_id for p in result} == {both.team_id}
 
     def test_list_teams_metadata_and_combines_with_user_id(
@@ -282,7 +402,7 @@ class TestEventStoreContract:
         for process in (u1_acme, u1_contoso, u2_acme):
             event_store.save_team(process)
 
-        result = event_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        result = event_store.list_teams(user_id="u1", metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {u1_acme.team_id}
 
     def test_list_teams_metadata_and_combines_with_status(
@@ -301,11 +421,11 @@ class TestEventStoreContract:
         for process in (running, deleted, running_contoso):
             event_store.save_team(process)
 
-        result = event_store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": "acme"})
+        result = event_store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {running.team_id}
 
         # metadata alone does not implicitly constrain status.
-        unconstrained = event_store.list_teams(metadata={"tenant": "acme"})
+        unconstrained = event_store.list_teams(metadata={"tenant": ["acme"]})
         assert {p.team_id for p in unconstrained} == {running.team_id, deleted.team_id}
 
     def test_list_teams_all_three_filters_combine_with_and(
@@ -333,7 +453,7 @@ class TestEventStoreContract:
             event_store.save_team(process)
 
         result = event_store.list_teams(
-            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+            user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]}
         )
         assert {p.team_id for p in result} == {wanted.team_id}
 
@@ -350,7 +470,7 @@ class TestEventStoreContract:
             make_indexed_process(AcmeTeamMetadata(tenant="contoso", case_ref="C-9"))
         )
 
-        assert event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-9"}) == []
+        assert event_store.list_teams(metadata={"tenant": ["acme"], "case_ref": ["C-9"]}) == []
 
     def test_list_teams_metadata_unknown_key_returns_empty(
         self, event_store: EventStore
@@ -366,8 +486,8 @@ class TestEventStoreContract:
             make_indexed_process(AcmeTeamMetadata(tenant="acme", department="ops"))
         )
 
-        assert event_store.list_teams(metadata={"unknown_key": "acme"}) == []
-        assert event_store.list_teams(metadata={"department": "ops"}) == []
+        assert event_store.list_teams(metadata={"unknown_key": ["acme"]}) == []
+        assert event_store.list_teams(metadata={"department": ["ops"]}) == []
 
     def test_list_teams_empty_metadata_dict_equals_no_metadata_filter(
         self, event_store: EventStore
@@ -404,7 +524,7 @@ class TestEventStoreContract:
         event_store.save_team(u1)
         event_store.save_team(u2)
 
-        result = event_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+        result = event_store.list_teams(user_id="u1", metadata={"tenant": ["acme"]})
         assert [p.team_id for p in result] == [u1.team_id]
 
         # And the unfiltered-by-metadata call is scoped identically, so the
@@ -428,30 +548,36 @@ class TestEventStoreContract:
         assert [p.team_id for p in event_store.list_teams(status=TeamStatus.RUNNING)] == [
             bare.team_id
         ]
-        assert event_store.list_teams(metadata={"tenant": "acme"}) == []
+        assert event_store.list_teams(metadata={"tenant": ["acme"]}) == []
 
     def test_list_teams_metadata_value_containing_the_separator_matches_itself(
         self, event_store: EventStore
     ) -> None:
         """Escaping is symmetric: a ``|`` in a value matches, and cannot forge an entry.
 
-        Query entries are built with the same ``make_index_entry`` the
+        Query terms are built with the same ``make_index_entry`` the
         derivation uses. A second, hand-rolled implementation in the query
         path would drift on exactly this input — the value would stop
         matching itself — and a crafted value could otherwise span two
         separate entries.
+
+        Under prefix matching the shorter term legitimately reaches BOTH
+        teams: ``tenant|acme\\|corp`` starts with ``tenant|acme``. That is the
+        intended widening, not a leak — the two stay distinguishable by the
+        longer term, which is the first assertion here.
         """
         piped = make_indexed_process(AcmeTeamMetadata(tenant="acme|corp"))
         plain = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
         event_store.save_team(piped)
         event_store.save_team(plain)
 
-        assert [p.team_id for p in event_store.list_teams(metadata={"tenant": "acme|corp"})] == [
+        assert [p.team_id for p in event_store.list_teams(metadata={"tenant": ["acme|corp"]})] == [
             piped.team_id
         ]
-        assert [p.team_id for p in event_store.list_teams(metadata={"tenant": "acme"})] == [
-            plain.team_id
-        ]
+        assert {p.team_id for p in event_store.list_teams(metadata={"tenant": ["acme"]})} == {
+            piped.team_id,
+            plain.team_id,
+        }
 
     def test_list_teams_metadata_cannot_match_across_two_entries(
         self, event_store: EventStore
@@ -465,10 +591,79 @@ class TestEventStoreContract:
         team = make_indexed_process(AcmeTeamMetadata(tenant="acme", case_ref="C-1"))
         event_store.save_team(team)
 
-        assert event_store.list_teams(metadata={"tenant": "acme|case_ref|C-1"}) == []
+        assert event_store.list_teams(metadata={"tenant": ["acme|case_ref|C-1"]}) == []
         # The honest query for the same team still works.
-        result = event_store.list_teams(metadata={"tenant": "acme", "case_ref": "C-1"})
+        result = event_store.list_teams(metadata={"tenant": ["acme"], "case_ref": ["C-1"]})
         assert [p.team_id for p in result] == [team.team_id]
+
+    # --- the shared prefix-matching matrix --------------------------------
+
+    @pytest.mark.parametrize(
+        "case_label,metadata,expected_labels",
+        METADATA_FILTER_MATRIX,
+        ids=METADATA_FILTER_IDS,
+    )
+    def test_list_teams_metadata_filter_matrix(
+        self,
+        event_store: EventStore,
+        case_label: str,
+        metadata: dict[str, list[str]] | None,
+        expected_labels: set[str] | frozenset[str],
+    ) -> None:
+        """AC5-AC11 on every backend, from one shared matrix.
+
+        Runs once per backend via the parametrized ``event_store`` fixture, so
+        a backend left on whole-entry equality fails a named spec of its own
+        rather than hiding behind the others.
+        """
+        teams = build_metadata_fixture_set()
+        for process in teams.values():
+            event_store.save_team(process)
+
+        found = {p.team_id for p in event_store.list_teams(metadata=metadata)}
+        expected = {teams[label].team_id for label in expected_labels}
+        assert found == expected, case_label
+
+    def test_list_teams_rejects_a_bare_string_metadata_value(
+        self, event_store: EventStore
+    ) -> None:
+        """A bare ``str`` raises rather than filtering on one term per character.
+
+        ``str`` IS a ``Sequence[str]``, so an un-migrated caller would otherwise
+        filter ``"acme"`` as ``["a", "c", "m", "e"]`` — four prefixes, each of
+        which matches something — and get plausible wrong rows back with no
+        error anywhere. The annotation stops a caller mypy covers; this stops
+        the rest.
+        """
+        event_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+
+        with pytest.raises(TypeError, match="tenant"):
+            event_store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]
+
+    def test_list_teams_rejects_a_bare_string_on_an_empty_store(
+        self, event_store: EventStore
+    ) -> None:
+        """The rejection does not depend on there being anything to return.
+
+        A backend that renders its terms lazily — after an early return for an
+        empty store, or inside the row loop — would answer ``[]`` here and look
+        entirely reasonable doing it.
+        """
+        with pytest.raises(TypeError):
+            event_store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]
+
+    def test_list_teams_casefolding_costs_no_information_in_the_value(
+        self, event_store: EventStore
+    ) -> None:
+        """Only the derived index folds; ``Process.metadata`` reports what was written."""
+        process = make_indexed_process(AcmeTeamMetadata(tenant="AzeFR", case_ref="C-1"))
+        event_store.save_team(process)
+
+        found = event_store.list_teams(metadata={"tenant": ["aze"]})
+        assert [p.team_id for p in found] == [process.team_id]
+        metadata = AcmeTeamMetadata.model_validate(found[0].metadata)
+        assert metadata.tenant == "AzeFR"
+        assert metadata.case_ref == "C-1"
 
     # --- save_event / load_events ordering --------------------------------
 

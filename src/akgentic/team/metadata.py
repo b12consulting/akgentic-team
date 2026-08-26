@@ -3,11 +3,13 @@
 A ``TeamMetadata`` subclass declares which of its fields are filterable by
 marking them ``Field(json_schema_extra={"indexed": True})``. ``index_entries()``
 flattens the marked fields into ``"key|value"`` strings that a backend stores as
-a plain array of strings and filters on by equality.
+a plain array of strings and filters on by **anchored prefix**.
 
-``|`` is the separator. A ``|`` inside a value is escaped as ``\\|`` so that a
-value can never forge a second entry. Derivation and query construction both go
-through :func:`make_index_entry`, so the two sides can never diverge.
+``|`` is the separator, and the **value half is casefolded** — ``tenant="AzeFR"``
+is stored as ``"tenant|azefr"``. A ``|`` inside a value is escaped as ``\\|`` so
+that a value can never forge a second entry. Derivation and query construction
+both go through :func:`make_index_entry`, so the fold and the escaping can never
+diverge between the two sides.
 
 Only scalars can be indexed (``str``, ``bool``, ``int``, ``UUID``, ``Enum``,
 ``date``, ``datetime``). The restriction is enforced when the subclass is
@@ -24,6 +26,7 @@ Implements ADR-24 §D4.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import Enum
 from types import UnionType
@@ -81,6 +84,17 @@ def make_index_entry(key: str, value: Any) -> str:
     so must any caller building a query entry — the symmetry is what stops a
     value containing ``|`` from matching an entry it did not produce.
 
+    The rendered value is **casefolded**; the key half is not. Folding on
+    write is what buys case-insensitive matching without a case-insensitive
+    query — a Mongo ``$options: "i"`` regex uses no index at all, so the seek
+    the multikey index exists for would be gone (ADR-28 §D2). The fold happens
+    here and nowhere else, so query construction and derivation cannot drift.
+
+    Order is load-bearing: fold the rendered value, then escape ``|``, then
+    prepend the key. Folding the *finished* entry would also fold the key —
+    which passes today only because every declared key happens to be lowercase,
+    and breaks the day a ``caseId`` field is declared.
+
     Args:
         key: Field name. Python identifiers cannot contain ``|``, so the key
             half is unforgeable and is not escaped.
@@ -89,8 +103,72 @@ def make_index_entry(key: str, value: Any) -> str:
     Returns:
         The entry string, e.g. ``"tenant|acme"``.
     """
-    rendered = _render_scalar(value).replace(INDEX_SEPARATOR, _ESCAPED_SEPARATOR)
+    rendered = _render_scalar(value).casefold().replace(INDEX_SEPARATOR, _ESCAPED_SEPARATOR)
     return f"{key}{INDEX_SEPARATOR}{rendered}"
+
+
+def make_index_prefix_groups(metadata: Mapping[str, list[str]] | None) -> list[list[str]]:
+    """Render a ``list_teams`` metadata filter to its anchored match prefixes.
+
+    The query-side counterpart of :func:`make_index_entry`, shared by all four
+    ``EventStore`` implementations so the combination rule, the empty-term rule
+    and the bare-``str`` rejection cannot drift per backend. Each prefix is
+    matched against a stored entry with *stored startswith prefix* — never the
+    reverse, which would let a term crafted to span two entries match.
+
+    **The grouping is the combination rule.** One group per key: prefixes
+    *within* a group are a disjunction, and the groups themselves are a
+    conjunction. That is ordinary faceted search — same field ORs, different
+    fields AND — and it is what repeating a query parameter means everywhere
+    else. Terms on one key had to OR: under prefix matching two terms on the
+    same key are either redundant (one is a prefix of the other) or jointly
+    unsatisfiable, so a conjunction there would make the whole list dead weight.
+
+    An **empty term contributes no constraint** for its key. ``make_index_entry(k, "")``
+    yields ``"k|"``, whose prefix matches every entry for that key, so treating a
+    blank as "no term" makes the store's answer independent of whether the caller
+    sent one. Under a disjunction that rule is load-bearing rather than tidy: a
+    blank surviving into a group would match *everything* for that key and
+    silently widen the answer instead of narrowing it.
+
+    **A key whose terms all render away yields no group at all** — never an empty
+    one. This is structural, not a guard each backend has to remember: an empty
+    group would become an empty ``$or``, which MongoDB rejects outright, and an
+    empty conjunction, which matches zero documents. ADR-24 recorded the
+    ``$all``-over-an-empty-array version of that hazard; the disjunction re-opens
+    it one level further down.
+
+    Args:
+        metadata: Mapping of indexed field name to a list of prefix terms, or
+            ``None`` for no metadata filter.
+
+    Returns:
+        One non-empty group of rendered prefixes per contributing key, in
+        mapping order then term order — deterministic, so a backend can assert
+        on the query it builds.
+
+    Raises:
+        TypeError: If a value is a bare ``str`` rather than a list of terms.
+            ``str`` is itself a sequence of ``str``, so ``{"tenant": "acme"}``
+            would otherwise filter on four one-character terms and return
+            plausible wrong rows. A caller mypy does not cover must fail loudly.
+    """
+    if not metadata:
+        return []
+    groups: list[list[str]] = []
+    for key, terms in metadata.items():
+        if isinstance(terms, str | bytes):
+            msg = (
+                f"list_teams(metadata=...) takes a list of terms per key, but "
+                f"{key!r} was given the bare {type(terms).__name__} {terms!r}. "
+                f"Pass [{terms!r}] instead — a bare string would be read as one "
+                f"term per character."
+            )
+            raise TypeError(msg)
+        group = [make_index_entry(key, term) for term in terms if term]
+        if group:
+            groups.append(group)
+    return groups
 
 
 def _is_indexed(json_schema_extra: Any) -> bool:

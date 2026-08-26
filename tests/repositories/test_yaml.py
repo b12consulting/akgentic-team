@@ -162,7 +162,7 @@ class TestYamlEventStoreYamlSpecific:
 
         monkeypatch.setattr(Process, "model_validate", counting)
 
-        matched = yaml_store.list_teams(metadata={"tenant": "acme"})
+        matched = yaml_store.list_teams(metadata={"tenant": ["acme"]})
         assert len(matched) == 1
         assert len(calls) == 1  # NOT 4 — the contoso teams are never hydrated
 
@@ -202,7 +202,7 @@ class TestYamlEventStoreYamlSpecific:
         monkeypatch.setattr(Process, "model_validate", counting)
 
         matched = yaml_store.list_teams(
-            status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+            status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]}
         )
         assert len(matched) == 1
         assert len(calls) == 1  # NOT 2 (status-only) and NOT 4 (unfiltered)
@@ -242,7 +242,7 @@ class TestYamlEventStoreYamlSpecific:
             data["metadata_indexes"] = corrupt
         team_path.write_text(yaml.dump(data))
 
-        result = yaml_store.list_teams(metadata={"tenant": "acme"})
+        result = yaml_store.list_teams(metadata={"tenant": ["acme"]})
         assert [p.team_id for p in result] == [good.team_id]
 
     def test_list_teams_without_metadata_filter_still_returns_malformed_team(
@@ -265,7 +265,7 @@ class TestYamlEventStoreYamlSpecific:
         assert [p.team_id for p in yaml_store.list_teams(status=TeamStatus.RUNNING)] == [
             legacy.team_id
         ]
-        assert yaml_store.list_teams(metadata={"tenant": "acme"}) == []
+        assert yaml_store.list_teams(metadata={"tenant": ["acme"]}) == []
 
     def test_list_teams_metadata_filter_skips_document_that_is_not_a_mapping(
         self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -286,7 +286,7 @@ class TestYamlEventStoreYamlSpecific:
         team_dir.mkdir()
         (team_dir / "team.yaml").write_text("- just\n- a\n- list\n")
 
-        filtered = yaml_store.list_teams(metadata={"tenant": "acme"})
+        filtered = yaml_store.list_teams(metadata={"tenant": ["acme"]})
         assert [p.team_id for p in filtered] == [good.team_id]
 
         caplog.clear()
@@ -430,3 +430,129 @@ class TestYamlEventStoreYamlSpecific:
         loaded = store.load_agent_states(team_id)
         assert len(loaded) == 1
         assert loaded[0].agent_id == "good-agent"
+
+
+class TestYamlMetadataPredicateConstruction:
+    """What the walk is handed, not only what it returns.
+
+    A result-level assertion cannot tell "no metadata predicate" from "a
+    predicate that happens to match everything", so the empty-term rule is
+    pinned on the argument ``_matches`` actually receives.
+    """
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"tenant": []},
+            {"tenant": [""]},
+            {"tenant": ["", ""]},
+            {"tenant": [""], "case_ref": []},
+        ],
+        ids=[
+            "none",
+            "empty-dict",
+            "empty-term-list",
+            "one-blank-term",
+            "two-blank-terms",
+            "blank-term-and-empty-list",
+        ],
+    )
+    def test_no_effective_term_reaches_the_walk_with_no_predicate(
+        self,
+        yaml_store: YamlEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+        metadata: dict[str, list[str]] | None,
+    ) -> None:
+        """Every "no effective term" spelling leaves ``_matches`` with no prefix.
+
+        ``{"tenant": []}`` and ``{"tenant": [""]}`` are the ones an outer
+        truthiness gate on ``metadata`` misses — the mapping itself is truthy.
+        """
+        acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
+        bare = make_process()
+        yaml_store.save_team(acme)
+        yaml_store.save_team(bare)
+
+        seen: list[list[list[str]]] = []
+        original = YamlEventStore._matches
+
+        def spy(
+            data: object, user_id: object, status: object, groups: list[list[str]]
+        ) -> bool:
+            seen.append(groups)
+            return bool(original(data, user_id, status, groups))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(YamlEventStore, "_matches", staticmethod(spy))
+
+        result = yaml_store.list_teams(metadata=metadata)
+
+        assert seen, "the walk must have run at all"
+        assert all(groups == [] for groups in seen), seen
+        assert {p.team_id for p in result} == {acme.team_id, bare.team_id}
+
+    def test_a_real_term_does_reach_the_walk(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mirror image, so the spec above cannot pass by spying on nothing."""
+        yaml_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+
+        seen: list[list[list[str]]] = []
+        original = YamlEventStore._matches
+
+        def spy(
+            data: object, user_id: object, status: object, groups: list[list[str]]
+        ) -> bool:
+            seen.append(groups)
+            return bool(original(data, user_id, status, groups))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(YamlEventStore, "_matches", staticmethod(spy))
+
+        yaml_store.list_teams(metadata={"tenant": ["AcM"], "case_ref": ["C-"]})
+
+        # One GROUP per key — not a flat list. The grouping is what carries the
+        # combination rule down to the predicate: terms inside a group OR,
+        # groups AND.
+        assert seen == [[["tenant|acm"], ["case_ref|c-"]]]
+
+    def test_a_key_whose_terms_render_away_reaches_the_walk_as_no_group(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An emptied key drops out entirely — not as an empty group.
+
+        An empty group is the YAML-side twin of Mongo's ``$or: []``. Here it
+        would not raise, it would quietly evaluate ``any(...)`` over nothing —
+        which is ``False`` — and so match no team at all, turning "I sent a
+        blank for this facet" into "return nothing".
+        """
+        yaml_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="acme")))
+
+        seen: list[list[list[str]]] = []
+        original = YamlEventStore._matches
+
+        def spy(
+            data: object, user_id: object, status: object, groups: list[list[str]]
+        ) -> bool:
+            seen.append(groups)
+            return bool(original(data, user_id, status, groups))  # type: ignore[arg-type]
+
+        monkeypatch.setattr(YamlEventStore, "_matches", staticmethod(spy))
+
+        yaml_store.list_teams(metadata={"tenant": [], "case_ref": ["C-"], "other": [""]})
+
+        assert seen == [[["case_ref|c-"]]]
+        assert all([] not in groups for groups in seen), seen
+
+    def test_a_bare_string_is_rejected_before_the_directory_is_read(
+        self, tmp_path: Path
+    ) -> None:
+        """The guard runs even when the data directory does not exist.
+
+        The early return for a missing directory is exactly where a lazily
+        rendered term would slip past and answer ``[]`` instead of raising.
+        """
+        store = YamlEventStore(tmp_path / "does-not-exist")
+
+        with pytest.raises(TypeError, match="tenant"):
+            store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from akgentic.team.models import (
@@ -95,7 +96,7 @@ class EventStore(Protocol):
         self,
         user_id: str | None = None,
         status: TeamStatus | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: Mapping[str, list[str]] | None = None,
     ) -> list[Process]:
         """Load team process snapshots.
 
@@ -105,16 +106,47 @@ class EventStore(Protocol):
             status: If provided, return only snapshots whose ``Process.status``
                 matches. If ``None`` (default), do not filter on the lifecycle
                 state — every status is returned, including ``DELETED``.
-            metadata: If provided, return only snapshots whose business metadata
-                carries EVERY given key/value pair. Each pair is translated to a
-                flattened ``"key|value"`` entry via
-                :func:`akgentic.team.metadata.make_index_entry` and matched
-                against ``Process.metadata_indexes`` by containment, so query
-                construction and derivation escape ``|`` the same way. Only
-                fields the metadata model marks indexed are matchable, and
-                matching is equality on the rendered string — a caller filtering
-                a typed field passes its rendered form. An empty dict is an empty
-                conjunction and therefore behaves exactly like ``None``.
+            metadata: Mapping of indexed field name to a list of **prefix
+                terms**. Each term is rendered to a flattened ``"key|value"``
+                form via :func:`akgentic.team.metadata.make_index_entry` — the
+                same helper the write path derived the stored index with — and a
+                snapshot matches when one of its ``Process.metadata_indexes``
+                entries *starts with* that rendered term. The direction is
+                always stored-starts-with-term, never the reverse, so a crafted
+                term cannot span two entries.
+
+                Matching is therefore an **anchored prefix**, not equality:
+                ``{"tenant": ["aze"]}`` reaches a team storing ``tenant|azefr``.
+                It is also **case-insensitive without a case-insensitive query**,
+                because ``make_index_entry`` casefolds the value half on both
+                sides — a term of ``AZE``, ``aze`` or ``AzE`` renders
+                identically. Only fields the metadata model marks indexed are
+                matchable; an unindexed field never reaches the index and so
+                matches nothing.
+
+                Terms for ONE key **OR**-combine; DISTINCT keys **AND**-combine.
+                That is ordinary faceted search — same field ORs, different
+                fields AND — and it is what repeating a query parameter means
+                everywhere else. ``{"tenant": ["acme", "contoso"]}`` returns the
+                teams matching *either* prefix, while
+                ``{"tenant": ["acme"], "case_ref": ["C-"]}`` returns only teams
+                matching *both* keys. Two terms on one key could not usefully
+                AND: under prefix matching either one is a prefix of the other,
+                making it redundant, or the pair is unsatisfiable.
+
+                An **empty term contributes no constraint** for its key, because
+                ``"k|"`` would otherwise prefix-match every entry under that key
+                — and under a disjunction that *widens* the answer to everything
+                rather than merely failing to narrow it. ``{}``,
+                ``{"tenant": []}``, ``{"tenant": [""]}`` and ``None`` are
+                therefore all equivalent, and an implementation MUST put no
+                metadata term on its query at all in those cases. A key whose
+                terms all render away contributes NO term — neither an empty
+                disjunction nor an empty conjunction, which backends variously
+                reject outright or read as "match nothing".
+
+                A bare ``str`` value raises ``TypeError`` rather than filtering
+                on one term per character.
 
         Every filter is an independent term and they combine as a conjunction:
         a filter left at ``None`` constrains nothing, and adding one can only
@@ -134,8 +166,12 @@ class EventStore(Protocol):
         applied server-side, because it is a trust boundary rather than an
         optimisation.
 
+        Raises:
+            TypeError: If a ``metadata`` value is a bare ``str`` instead of a
+                list of terms.
+
         See ADR-23 §1 and ADR-24 §D5 for the additive, backwards-compatible
-        Protocol changes.
+        Protocol changes, and ADR-28 for the move from equality to prefix.
         """
         ...
 

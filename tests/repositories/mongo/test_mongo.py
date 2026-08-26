@@ -536,7 +536,7 @@ class TestMongoEventStoreMongoSpecific:
         acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
         store.save_team(acme)
         store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="contoso")))
-        assert [p.team_id for p in store.list_teams(metadata={"tenant": "acme"})] == [
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": ["acme"]})] == [
             acme.team_id
         ]
 
@@ -706,11 +706,11 @@ class TestMongoEventStoreMongoSpecific:
     def test_list_teams_pushes_metadata_into_the_find_filter(
         self, mongo_store: MongoEventStore
     ) -> None:
-        """``metadata`` reaches MongoDB as an ``$all`` term, not a Python pass.
+        """``metadata`` reaches MongoDB as an anchored ``$regex``, not a Python pass.
 
         An in-memory filter returns the identical list, so the assertion bites
-        on the query dict handed to ``find``. The expected entry is written as
-        a literal rather than built through the helper, so a change to the
+        on the query dict handed to ``find``. The expected pattern is written
+        as a literal rather than built through the helper, so a change to the
         separator or to the key/value ordering fails here instead of passing
         symmetrically on both sides.
         """
@@ -721,11 +721,108 @@ class TestMongoEventStoreMongoSpecific:
         with patch.object(
             mongo_store._teams, "find", wraps=mongo_store._teams.find
         ) as spy_find:
-            result = mongo_store.list_teams(metadata={"tenant": "acme"})
+            result = mongo_store.list_teams(metadata={"tenant": ["acme"]})
 
         spy_find.assert_called_once()
-        assert spy_find.call_args.args[0] == {"metadata_indexes": {"$all": ["tenant|acme"]}}
+        assert spy_find.call_args.args[0] == {
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}]
+        }
         assert [p.team_id for p in result] == [acme.team_id]
+
+    def test_the_metadata_regex_is_anchored_and_case_sensitive(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """No ``$options`` and no inline ``(?i)`` — the seek depends on it.
+
+        A case-insensitive regex uses no index at all in MongoDB, which is the
+        entire reason ``make_index_entry`` casefolds on write. Asserted on the
+        constructed query rather than on rows, because ``$options: "i"`` returns
+        the SAME rows here and would leave every result-level assertion green
+        while quietly turning each query into a collection scan.
+        """
+        mongo_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="AzeFR")))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            mongo_store.list_teams(metadata={"tenant": ["AZE"], "case_ref": ["c"]})
+
+        groups = spy_find.call_args.args[0]["$and"]
+        assert len(groups) == 2
+        arms = [arm for group in groups for arm in group["$or"]]
+        assert len(arms) == 2
+        for arm in arms:
+            term = arm["metadata_indexes"]
+            assert set(term) == {"$regex"}, f"no option key may ride along: {term}"
+            assert term["$regex"].startswith("^")
+            assert "(?i)" not in term["$regex"]
+
+    def test_the_metadata_regex_matches_the_casefolded_index(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """The term folds on the query side too, so the anchored pattern still hits."""
+        aze = make_indexed_process(AcmeTeamMetadata(tenant="AzeFR"))
+        mongo_store.save_team(aze)
+        mongo_store.save_team(make_indexed_process(AcmeTeamMetadata(tenant="contoso")))
+
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            result = mongo_store.list_teams(metadata={"tenant": ["AzE"]})
+
+        assert spy_find.call_args.args[0] == {
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|aze"}}]}]
+        }
+        assert [p.team_id for p in result] == [aze.team_id]
+
+    def test_terms_nest_as_or_inside_and(self, mongo_store: MongoEventStore) -> None:
+        """One ``$or`` per KEY, those ``$and``-ed — the nesting IS the rule.
+
+        Terms for one key OR; distinct keys AND. Flattening the two levels into
+        a single ``$and`` of arms would quietly turn the tenant disjunction back
+        into a conjunction and return nothing for two distinct tenants; putting
+        both keys in one ``$or`` would widen instead. The nesting, not just the
+        arm count, is what this pins — and a single dict cannot carry two
+        ``metadata_indexes`` keys, which is why the grouping has to be explicit.
+        """
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            mongo_store.list_teams(metadata={"tenant": ["ac", "acm"], "case_ref": ["C-"]})
+
+        assert spy_find.call_args.args[0] == {
+            "$and": [
+                {
+                    "$or": [
+                        {"metadata_indexes": {"$regex": "^tenant\\|ac"}},
+                        {"metadata_indexes": {"$regex": "^tenant\\|acm"}},
+                    ]
+                },
+                # ``re.escape`` escapes ``-`` too — it is special inside a
+                # character class, so it is escaped unconditionally.
+                {"$or": [{"metadata_indexes": {"$regex": "^case_ref\\|c\\-"}}]},
+            ]
+        }
+
+    def test_an_emptied_key_contributes_no_arm_beside_a_real_one(
+        self, mongo_store: MongoEventStore
+    ) -> None:
+        """A key whose terms all render away drops out — never as an empty ``$or``.
+
+        This is the twin of the empty-``$and`` hazard and it is worse: MongoDB
+        rejects ``$or: []`` outright, so the failure is a query error rather
+        than a silently wrong result set. The whole-mapping-empty case is
+        covered above; this is the one where a REAL key sits beside the emptied
+        one, so the metadata clause survives and only the dead group must go.
+        """
+        with patch.object(
+            mongo_store._teams, "find", wraps=mongo_store._teams.find
+        ) as spy_find:
+            mongo_store.list_teams(metadata={"tenant": [], "case_ref": ["C-1"], "other": [""]})
+
+        assert spy_find.call_args.args[0] == {
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^case_ref\\|c\\-1"}}]}]
+        }
 
     def test_list_teams_pushes_user_id_and_metadata_into_one_find_filter(
         self, mongo_store: MongoEventStore
@@ -748,12 +845,12 @@ class TestMongoEventStoreMongoSpecific:
         with patch.object(
             mongo_store._teams, "find", wraps=mongo_store._teams.find
         ) as spy_find:
-            result = mongo_store.list_teams(user_id="u1", metadata={"tenant": "acme"})
+            result = mongo_store.list_teams(user_id="u1", metadata={"tenant": ["acme"]})
 
         spy_find.assert_called_once()
         assert spy_find.call_args.args[0] == {
             "user_id": "u1",
-            "metadata_indexes": {"$all": ["tenant|acme"]},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}],
         }
         assert [p.team_id for p in result] == [mine.team_id]
 
@@ -779,28 +876,52 @@ class TestMongoEventStoreMongoSpecific:
             mongo_store._teams, "find", wraps=mongo_store._teams.find
         ) as spy_find:
             result = mongo_store.list_teams(
-                user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": "acme"}
+                user_id="u1", status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]}
             )
 
         spy_find.assert_called_once()
         assert spy_find.call_args.args[0] == {
             "user_id": "u1",
             "status": "running",
-            "metadata_indexes": {"$all": ["tenant|acme"]},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}],
         }
         assert [p.team_id for p in result] == [wanted.team_id]
 
-    @pytest.mark.parametrize("metadata", [None, {}], ids=["none", "empty-dict"])
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"tenant": []},
+            {"tenant": [""]},
+            {"tenant": ["", ""]},
+            {"tenant": [""], "case_ref": []},
+        ],
+        ids=[
+            "none",
+            "empty-dict",
+            "empty-term-list",
+            "one-blank-term",
+            "two-blank-terms",
+            "blank-term-and-empty-list",
+        ],
+    )
     def test_list_teams_no_metadata_filter_carries_no_metadata_key(
-        self, mongo_store: MongoEventStore, metadata: dict[str, str] | None
+        self, mongo_store: MongoEventStore, metadata: dict[str, list[str]] | None
     ) -> None:
-        """``None`` and ``{}`` both leave the query dict without the key.
+        """Every "no effective term" spelling leaves the query dict clean.
 
-        ``{}`` is the dangerous one: ``$all`` over an EMPTY array matches ZERO
-        documents in MongoDB, so an ``is not None`` gate would turn "no
-        metadata filter" into "no results". Asserting the key is ABSENT — not
-        just that the rows look right — is what catches it, and the teams are
-        seeded so the result-level assertion has something to lose too.
+        None of ``metadata_indexes``, ``$and`` or ``$or`` may appear. All three
+        matter and for different reasons: ``$and: []`` AND ``$or: []`` are both
+        OperationFailure in MongoDB (and in mongomock), and the ``$all: []``
+        shape this replaced matched ZERO documents — so "no filter" silently
+        became "no results". Asserting the keys are ABSENT is what catches it;
+        a result-level assertion cannot tell "no term" from "a term that
+        happens to match everything", and over an empty store it cannot see
+        the regression at all.
+
+        ``{"tenant": []}`` and ``{"tenant": [""]}`` are the ones the outer
+        truthiness gate misses: the mapping itself is truthy.
         """
         acme = make_indexed_process(AcmeTeamMetadata(tenant="acme"))
         plain = make_indexed_process(None)
@@ -813,7 +934,10 @@ class TestMongoEventStoreMongoSpecific:
             result = mongo_store.list_teams(metadata=metadata)
 
         spy_find.assert_called_once()
-        assert "metadata_indexes" not in spy_find.call_args.args[0]
+        query = spy_find.call_args.args[0]
+        assert "metadata_indexes" not in query
+        assert "$and" not in query, f"an empty conjunction reached the query: {query}"
+        assert "$or" not in query, f"an empty disjunction reached the query: {query}"
         assert {p.team_id for p in result} == {acme.team_id, plain.team_id}
 
     def test_list_teams_does_not_filter_metadata_in_python(
@@ -833,7 +957,7 @@ class TestMongoEventStoreMongoSpecific:
 
         all_docs = list(mongo_store._teams.find({}))
         with patch.object(mongo_store._teams, "find", return_value=iter(all_docs)):
-            result = mongo_store.list_teams(metadata={"tenant": "acme"})
+            result = mongo_store.list_teams(metadata={"tenant": ["acme"]})
 
         assert {p.team_id for p in result} == {acme.team_id, contoso.team_id}
 
@@ -846,6 +970,11 @@ class TestMongoEventStoreMongoSpecific:
         ``tenant|acme\\|corp`` and matches the entry the write path derived. A
         hand-rolled ``f"{k}|{v}"`` would build ``tenant|acme|corp``, match
         nothing, and be invisible to any test that only used pipe-free values.
+
+        Two escaping layers meet here: the rendered prefix already carries the
+        backslash the separator escaping planted, and ``re.escape`` must carry
+        it into the pattern as a LITERAL backslash rather than let it pair up
+        with the following ``|`` into a regex alternation escape.
         """
         piped = make_indexed_process(AcmeTeamMetadata(tenant="acme|corp"))
         mongo_store.save_team(piped)
@@ -854,11 +983,14 @@ class TestMongoEventStoreMongoSpecific:
         with patch.object(
             mongo_store._teams, "find", wraps=mongo_store._teams.find
         ) as spy_find:
-            result = mongo_store.list_teams(metadata={"tenant": "acme|corp"})
+            result = mongo_store.list_teams(metadata={"tenant": ["acme|corp"]})
 
         spy_find.assert_called_once()
+        # Written raw so the backslashes are countable. The rendered prefix is
+        # `tenant|acme\|corp`; `re.escape` turns each `|` into `\|` and the
+        # separator escaping's own `\` into `\\`, giving `\\\|` in the middle.
         assert spy_find.call_args.args[0] == {
-            "metadata_indexes": {"$all": ["tenant|acme\\|corp"]}
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": r"^tenant\|acme\\\|corp"}}]}]
         }
         assert [p.team_id for p in result] == [piped.team_id]
 
@@ -905,7 +1037,7 @@ class TestMongoEventStoreMongoSpecific:
         # The load-bearing half: the query is built the same way either side of
         # the opt-out. This is a construction-level assertion, which is the
         # class of claim mongomock can actually support.
-        filters = {"tenant": "acme"}
+        filters = {"tenant": ["acme"]}
         with patch.object(bare._teams, "find", wraps=bare._teams.find) as bare_find:
             from_bare = {p.team_id for p in bare.list_teams(metadata=filters)}
         with patch.object(
@@ -917,7 +1049,7 @@ class TestMongoEventStoreMongoSpecific:
         indexed_find.assert_called_once()
         assert bare_find.call_args.args[0] == indexed_find.call_args.args[0]
         assert bare_find.call_args.args[0] == {
-            "metadata_indexes": {"$all": ["tenant|acme"]}
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}]
         }
         assert from_bare == from_indexed
         # Pinned absolutely too, so two equally broken stores cannot pass by
@@ -932,12 +1064,12 @@ class TestMongoEventStoreMongoSpecific:
     @pytest.mark.parametrize(
         "user_id,metadata,expected_indices",
         [
-            (None, {"tenant": "acme"}, {0, 1, 2}),
-            (None, {"tenant": "acme", "case_ref": "C-1"}, {0}),
-            (None, {"tenant": "nobody-has-this"}, set()),
-            (None, {"case_ref": "C|1234"}, {1}),
+            (None, {"tenant": ["acme"]}, {0, 1, 2}),
+            (None, {"tenant": ["acme"], "case_ref": ["C-1"]}, {0}),
+            (None, {"tenant": ["nobody-has-this"]}, set()),
+            (None, {"case_ref": ["C|1234"]}, {1}),
             (None, None, {0, 1, 2, 3, 4, 5}),
-            ("u1", {"tenant": "acme"}, {0, 1}),
+            ("u1", {"tenant": ["acme"]}, {0, 1}),
         ],
         ids=["one-key", "two-keys", "no-such-value", "literal-pipe", "no-filter", "with-user-id"],
     )
@@ -946,7 +1078,7 @@ class TestMongoEventStoreMongoSpecific:
         mongo_store: MongoEventStore,
         tmp_path: Path,
         user_id: str | None,
-        metadata: dict[str, str] | None,
+        metadata: dict[str, list[str]] | None,
         expected_indices: set[int],
     ) -> None:
         """The two backends return the same teams for the same filters.

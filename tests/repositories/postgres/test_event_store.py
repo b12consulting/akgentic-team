@@ -134,7 +134,9 @@ class TestMetadataIndexesColumnWritePath:
 
         stored = _read_metadata_indexes_column(postgres_clean_tables, process.team_id)
         assert stored is not None
-        assert set(stored) == {"tenant|acme", "case_ref|C-1"}
+        # The value half is casefolded at derivation, so ``C-1`` is stored
+        # ``c-1``. The seeded value itself is untouched — see the payload.
+        assert set(stored) == {"tenant|acme", "case_ref|c-1"}
 
     def test_save_team_updates_the_column_on_conflict(
         self, postgres_clean_tables: str
@@ -161,10 +163,10 @@ class TestMetadataIndexesColumnWritePath:
 
         stored = _read_metadata_indexes_column(postgres_clean_tables, team_id)
         assert stored is not None
-        assert set(stored) == {"tenant|contoso", "case_ref|C-9"}
+        assert set(stored) == {"tenant|contoso", "case_ref|c-9"}
         # And the filter agrees with the column: the old value is gone.
-        assert store.list_teams(metadata={"tenant": "acme"}) == []
-        assert [p.team_id for p in store.list_teams(metadata={"tenant": "contoso"})] == [
+        assert store.list_teams(metadata={"tenant": ["acme"]}) == []
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": ["contoso"]})] == [
             team_id
         ]
 
@@ -218,7 +220,7 @@ class TestMetadataFilterIsPushedDown:
                 (str(process.team_id), payload, []),
             )
 
-        assert store.list_teams(metadata={"tenant": "acme"}) == []
+        assert store.list_teams(metadata={"tenant": ["acme"]}) == []
         # ...and it is still an ordinary team for every other query.
         assert [p.team_id for p in store.list_teams()] == [process.team_id]
 
@@ -245,7 +247,7 @@ class TestMetadataFilterIsPushedDown:
                 (str(process.team_id), payload, ["tenant|acme"]),
             )
 
-        found = store.list_teams(metadata={"tenant": "acme"})
+        found = store.list_teams(metadata={"tenant": ["acme"]})
         assert [p.team_id for p in found] == [process.team_id]
         assert found[0].metadata_indexes == []
 
@@ -280,7 +282,7 @@ class TestMetadataFilterIsPushedDown:
         ] == [process.team_id]
         # Not returned by any non-empty metadata filter, even though its
         # payload carries the matching entry.
-        assert store.list_teams(metadata={"tenant": "acme"}) == []
+        assert store.list_teams(metadata={"tenant": ["acme"]}) == []
 
     def test_metadata_values_are_bound_never_interpolated(
         self, postgres_clean_tables: str
@@ -302,12 +304,21 @@ class TestMetadataFilterIsPushedDown:
         store.save_team(planted)
         store.save_team(ordinary)
 
-        # The value round-trips as data: it matches its own team and no other.
-        assert [p.team_id for p in store.list_teams(metadata={"tenant": hostile})] == [
+        # The value round-trips as data: the full term reaches only its own team.
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": [hostile]})] == [
             planted.team_id
         ]
-        assert [p.team_id for p in store.list_teams(metadata={"tenant": "acme"})] == [
-            ordinary.team_id
+        # The hostile value happens to START with ``acme``, so under prefix
+        # matching the short term legitimately reaches both. Kept deliberately:
+        # what this test pins is that the value is DATA, and a term that reaches
+        # a second row is a far better outcome than one that drops a table.
+        assert {p.team_id for p in store.list_teams(metadata={"tenant": ["acme"]})} == {
+            planted.team_id,
+            ordinary.team_id,
+        }
+        # A term the hostile value does not start with still excludes it.
+        assert [p.team_id for p in store.list_teams(metadata={"tenant": ["acme'"]})] == [
+            planted.team_id
         ]
         # ...and the table the value names is still there, with both rows in it.
         assert len({p.team_id for p in store.list_teams()}) == 2
@@ -340,21 +351,53 @@ class TestMetadataFilterIsPushedDown:
 
 # --- shared fixture set + filter matrix for the parity / index invariants ---
 
-_FilterCase = tuple[str, str | None, dict[str, str] | None, set[str]]
+_FilterCase = tuple[str, str | None, dict[str, list[str]] | None, set[str]]
+
+_EVERY_TEAM = {"acme_c1_u1", "acme_u2", "contoso_c1_u1", "piped_u1", "no_metadata_u2"}
+"""What a call that constrains nothing must answer."""
+
+_ACME_PREFIXED = {"acme_c1_u1", "acme_u2", "piped_u1"}
+"""Every team whose stored ``tenant`` entry starts with ``acme`` — ``piped_u1``
+included, since it stores ``tenant|acme\\|corp``."""
 
 _FILTER_MATRIX: list[_FilterCase] = [
-    ("single key", None, {"tenant": "acme"}, {"acme_c1_u1", "acme_u2"}),
-    ("two keys AND-combined", None, {"tenant": "acme", "case_ref": "C-1"}, {"acme_c1_u1"}),
-    ("pair no team carries", None, {"tenant": "acme", "case_ref": "C-9"}, set()),
-    ("value containing a literal separator", None, {"tenant": "acme|corp"}, {"piped_u1"}),
-    ("value spanning two entries", None, {"tenant": "acme|case_ref|C-1"}, set()),
+    # ``piped_u1`` stores ``tenant|acme\|corp``, which STARTS WITH ``tenant|acme``
+    # — so every short ``acme`` term now reaches it. That is the widening this
+    # story exists for, and the longer term below still separates the two.
+    ("single key", None, {"tenant": ["acme"]}, {"acme_c1_u1", "acme_u2", "piped_u1"}),
+    ("two keys AND-combined", None, {"tenant": ["acme"], "case_ref": ["C-1"]}, {"acme_c1_u1"}),
+    ("pair no team carries", None, {"tenant": ["acme"], "case_ref": ["C-9"]}, set()),
+    ("value containing a literal separator", None, {"tenant": ["acme|corp"]}, {"piped_u1"}),
+    ("value spanning two entries", None, {"tenant": ["acme|case_ref|C-1"]}, set()),
     (
         "no metadata filter",
         None,
         None,
         {"acme_c1_u1", "acme_u2", "contoso_c1_u1", "piped_u1", "no_metadata_u2"},
     ),
-    ("metadata AND user_id", "u1", {"tenant": "acme"}, {"acme_c1_u1"}),
+    ("metadata AND user_id", "u1", {"tenant": ["acme"]}, {"acme_c1_u1", "piped_u1"}),
+    ("prefix shorter than any stored value", None, {"tenant": ["ac"]}, _ACME_PREFIXED),
+    ("prefix is not a substring search", None, {"tenant": ["cme"]}, set()),
+    ("nested terms for one key are idempotent", None, {"tenant": ["ac", "acm"]}, _ACME_PREFIXED),
+    (
+        "terms for one key OR-combine",
+        None,
+        {"tenant": ["acme", "contoso"]},
+        _ACME_PREFIXED | {"contoso_c1_u1"},
+    ),
+    (
+        "keys AND while their own terms OR",
+        None,
+        {"tenant": ["acme", "contoso"], "case_ref": ["C-1"]},
+        {"acme_c1_u1", "contoso_c1_u1"},
+    ),
+    ("an emptied key beside a real one", None, {"tenant": [], "case_ref": ["C-1"]},
+     {"acme_c1_u1", "contoso_c1_u1"}),
+    ("case-insensitive term", None, {"tenant": ["ACME"]}, _ACME_PREFIXED),
+    ("an empty term constrains nothing", None, {"tenant": [""]}, _EVERY_TEAM),
+    ("an empty term list constrains nothing", None, {"tenant": []}, _EVERY_TEAM),
+    ("LIKE metacharacters are literal", None, {"tenant": ["a_m"]}, set()),
+    ("LIKE wildcard is literal", None, {"tenant": ["a%"]}, set()),
 ]
 """Label, ``user_id``, ``metadata``, and the labels of the teams expected back.
 
@@ -479,3 +522,207 @@ class TestCrossBackendParity:
             }
             for backend, found in results.items():
                 assert found == expected, f"{backend} disagrees on case: {label}"
+
+
+class _RecordingCursor:
+    """Cursor stub: the statement is the subject, the rows are irrelevant."""
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return []
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        return None
+
+
+class _RecordingTransaction:
+    """``Transaction`` stub that records the SQL and params it is handed.
+
+    Lets the statement-shape assertions run without Docker: what they check is
+    what ``list_teams`` BUILDS, which no amount of real querying can show —
+    a wrong ``ESCAPE`` clause or a stray metadata term returns plausible rows.
+    """
+
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def __init__(self, conn_string: str) -> None:
+        self._conn_string = conn_string
+
+    def __enter__(self) -> _RecordingTransaction:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple[object, ...] = ()) -> _RecordingCursor:
+        type(self).calls.append((sql, params))
+        return _RecordingCursor()
+
+
+@pytest.fixture
+def recorded_sql(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[object, ...]]]:
+    """Swap ``Transaction`` for the recorder and hand back its call log."""
+    from akgentic.team.repositories.postgres import event_store as event_store_module
+
+    _RecordingTransaction.calls = []
+    monkeypatch.setattr(event_store_module, "Transaction", _RecordingTransaction)
+    return _RecordingTransaction.calls
+
+
+class TestMetadataStatementShape:
+    """The statement ``list_teams`` builds, independent of what it returns."""
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            None,
+            {},
+            {"tenant": []},
+            {"tenant": [""]},
+            {"tenant": ["", ""]},
+            {"tenant": [""], "case_ref": []},
+        ],
+        ids=[
+            "none",
+            "empty-dict",
+            "empty-term-list",
+            "one-blank-term",
+            "two-blank-terms",
+            "blank-term-and-empty-list",
+        ],
+    )
+    def test_no_effective_term_carries_no_metadata_clause_and_no_parameter(
+        self,
+        recorded_sql: list[tuple[str, tuple[object, ...]]],
+        metadata: dict[str, list[str]] | None,
+    ) -> None:
+        """Every "no effective term" spelling leaves the SQL and the params clean.
+
+        ``{"tenant": []}`` and ``{"tenant": [""]}`` are the ones an outer
+        truthiness gate on ``metadata`` misses — the mapping is itself truthy.
+        Asserted on the statement because a result-level assertion cannot tell
+        "no clause" from "a clause that happens to match every row".
+        """
+        NagraEventStore("postgresql://recorded/none").list_teams(metadata=metadata)
+
+        sql, params = recorded_sql[-1]
+        assert "metadata_indexes" not in sql, sql
+        assert "LIKE" not in sql, sql
+        assert " OR " not in sql, f"an empty disjunction reached the SQL: {sql}"
+        assert "WHERE" not in sql, sql
+        assert params == ()
+
+    def test_an_emptied_key_contributes_no_clause_beside_a_real_one(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """A key whose terms all render away drops out, leaving no dangling ``OR``.
+
+        The whole-mapping-empty case is covered above; this is the one where a
+        REAL key sits beside the emptied one, so the metadata clause survives
+        and only the dead group must go. A group built with zero arms would
+        leave ``WHERE )`` — a syntax error rather than a wrong answer, but the
+        statement is only ever executed against a live database, so the shape
+        assertion is what catches it here.
+        """
+        NagraEventStore("postgresql://recorded/emptied").list_teams(
+            metadata={"tenant": [], "case_ref": ["C-1"], "other": [""]}
+        )
+
+        sql, params = recorded_sql[-1]
+        assert sql.count("EXISTS (SELECT 1 FROM unnest(metadata_indexes)") == 1
+        assert " OR " not in sql, sql
+        assert params == ("case!_ref|c-1%",)
+
+    def test_one_term_becomes_one_exists_over_unnest_with_a_bound_parameter(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """The term matches PER ELEMENT and its value travels bound, never inlined."""
+        NagraEventStore("postgresql://recorded/one").list_teams(metadata={"tenant": ["AcM"]})
+
+        sql, params = recorded_sql[-1]
+        assert sql == (
+            "SELECT data FROM team_process_entries WHERE "
+            "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) "
+            "WHERE entry LIKE %s ESCAPE '!')"
+        )
+        # Casefolded on the query side too, and a trailing % makes it a prefix.
+        assert params == ("tenant|acm%",)
+
+    def test_each_key_becomes_one_clause_whose_terms_are_ored(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """Two KEYS, two ``EXISTS`` clauses ANDed; the tenant's two terms OR inside one.
+
+        The ``OR`` sits INSIDE the ``EXISTS``, not between two of them, so the
+        disjunction is per-element. **This is a shape assertion and nothing
+        more**: hoisting the ``OR`` outside into one ``EXISTS`` per term was
+        mutation-tested and changed no behaviour, because indexed fields are
+        scalars and a key therefore contributes at most one entry per team. It
+        is pinned so the clause stays one-per-key, and so the reading that
+        survives a key ever carrying two entries is the one in the tree — not
+        because a behavioural spec is standing behind it.
+        """
+        NagraEventStore("postgresql://recorded/many").list_teams(
+            user_id="u1", metadata={"tenant": ["ac", "acm"], "case_ref": ["C-"]}
+        )
+
+        sql, params = recorded_sql[-1]
+        assert sql.count("EXISTS (SELECT 1 FROM unnest(metadata_indexes)") == 2
+        assert sql.count(" AND ") == 2  # user_id + two per-key clauses
+        assert sql.count(" OR ") == 1  # the tenant key's two terms
+        assert sql == (
+            "SELECT data FROM team_process_entries WHERE (data ->> 'user_id') = %s AND "
+            "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) WHERE "
+            "entry LIKE %s ESCAPE '!' OR entry LIKE %s ESCAPE '!') AND "
+            "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) WHERE "
+            "entry LIKE %s ESCAPE '!')"
+        )
+        # ``case!_ref``, not ``case_ref``: the escaping covers the WHOLE rendered
+        # prefix, key half included. An unescaped ``_`` there is a single-character
+        # wildcard, so ``case_ref|...`` would also reach a ``caseXref`` entry.
+        assert params == ("u1", "tenant|ac%", "tenant|acm%", "case!_ref|c-%")
+
+    @pytest.mark.parametrize(
+        "value,expected_pattern",
+        [
+            ("50%", "tenant|50!%%"),
+            ("a_b", "tenant|a!_b%"),
+            ("a!b", "tenant|a!!b%"),
+            ("a.b", "tenant|a.b%"),
+            ("a\\b", "tenant|a\\b%"),
+            ("acme|corp", "tenant|acme\\|corp%"),
+        ],
+        ids=["percent", "underscore", "escape-char", "regex-dot", "backslash", "separator"],
+    )
+    def test_like_metacharacters_are_escaped_for_the_declared_escape_character(
+        self,
+        recorded_sql: list[tuple[str, tuple[object, ...]]],
+        value: str,
+        expected_pattern: str,
+    ) -> None:
+        """Only ``!``, ``%`` and ``_`` are escaped — a backslash stays ordinary.
+
+        This is the whole reason the escape character is ``!`` rather than the
+        default backslash: the rendered prefix already carries backslashes from
+        the separator escaping, and ``re.escape`` emits more of them on the
+        Mongo side of the very same string. With ``ESCAPE '!'`` a backslash in
+        an entry is just a character, and the layers stop interacting.
+        """
+        NagraEventStore("postgresql://recorded/escape").list_teams(metadata={"tenant": [value]})
+
+        _, params = recorded_sql[-1]
+        assert params == (expected_pattern,)
+
+    def test_the_escape_clause_matches_the_character_actually_used(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """The declared ``ESCAPE`` and the escaping applied must be the same character.
+
+        Split between the two — escaping with ``!`` while declaring ``\\``, say —
+        and a term of ``50%`` silently becomes a wildcard again.
+        """
+        NagraEventStore("postgresql://recorded/agree").list_teams(metadata={"tenant": ["50%"]})
+
+        sql, params = recorded_sql[-1]
+        declared = sql.split("ESCAPE '")[1][0]
+        pattern = str(params[0])
+        assert pattern == f"tenant|50{declared}%%"
