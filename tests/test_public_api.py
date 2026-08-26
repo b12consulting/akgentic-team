@@ -42,6 +42,22 @@ def test_metadata_contract_is_exported() -> None:
         assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
 
 
+def test_the_query_side_helper_is_exported_alongside_the_entry_primitive() -> None:
+    """Both halves of the index contract are public, or out-of-package stores drift.
+
+    ``make_index_entry`` is public because query construction needs it;
+    ``make_index_prefix_groups`` is the same argument one level up. It carries
+    the combination rule, the empty-term rule and the bare-``str`` rejection,
+    and every ``EventStore`` implementation outside this package — the infra
+    tiers and the fakes each of them keeps — has to answer identically to the
+    three in here. ``EventStore`` is not ``@runtime_checkable``, so nothing
+    detects a hand-rolled reimplementation that gets one of those rules wrong;
+    the only defence is that the shared helper is reachable.
+    """
+    assert "make_index_prefix_groups" in akgentic.team.__all__
+    assert akgentic.team.make_index_prefix_groups({"tenant": ["AcM", ""]}) == [["tenant|acm"]]
+
+
 def test_module_is_importable() -> None:
     """akgentic.team is importable as a module."""
     mod = importlib.import_module("akgentic.team")

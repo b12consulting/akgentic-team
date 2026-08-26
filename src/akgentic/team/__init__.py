@@ -13,6 +13,7 @@ from akgentic.team.metadata import (
     TeamMetadata,
     derive_metadata_indexes,
     make_index_entry,
+    make_index_prefix_groups,
 )
 from akgentic.team.models import (
     AgentStateSnapshot,
@@ -59,6 +60,7 @@ __all__: list[str] = [
     "YamlEventStore",
     "derive_metadata_indexes",
     "make_index_entry",
+    "make_index_prefix_groups",
 ]
 
 _mongo_available = False
