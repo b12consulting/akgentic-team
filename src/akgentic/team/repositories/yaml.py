@@ -20,12 +20,13 @@ import logging
 import shutil
 import tempfile
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from akgentic.team.metadata import make_index_entry
+from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -145,7 +146,7 @@ class YamlEventStore:
         data: Any,
         user_id: str | None,
         status: TeamStatus | None,
-        entries: set[str] | None,
+        prefix_groups: list[list[str]],
     ) -> bool:
         """Test a RAW parsed team.yaml mapping against the requested filters.
 
@@ -165,9 +166,13 @@ class YamlEventStore:
             data: Raw parsed document as returned by ``_load_team_data``.
             user_id: Owning-user filter, or None for no user filter.
             status: Lifecycle-state filter, or None for no status filter.
-            entries: Flattened ``"key|value"`` metadata entries that the
-                stored index must contain ALL of, or None/empty for no
-                metadata filter. A stored ``metadata_indexes`` that is
+            prefix_groups: One group of rendered ``"key|value"`` prefixes per
+                filtered key; empty for no metadata filter. **Prefixes within a
+                group are a disjunction and the groups are a conjunction** —
+                same key ORs, different keys AND. Matching is anchored prefix in
+                the direction *stored entry starts with prefix*, never the
+                reverse, which would let a term crafted to span two entries
+                match (ADR-28 §D3). A stored ``metadata_indexes`` that is
                 missing or not a list is a non-match, never a raise: a team
                 written before the metadata contract existed simply carries
                 nothing to match (ADR-24 §D5).
@@ -175,7 +180,7 @@ class YamlEventStore:
         Returns:
             True if the document should be hydrated and returned.
         """
-        if user_id is None and status is None and not entries:
+        if user_id is None and status is None and not prefix_groups:
             return True
         if not isinstance(data, dict):
             return False
@@ -183,11 +188,14 @@ class YamlEventStore:
             return False
         if status is not None and data.get("status") != status:
             return False
-        if entries:
+        if prefix_groups:
             stored = data.get("metadata_indexes")
             if not isinstance(stored, list):
                 return False
-            if not entries.issubset({e for e in stored if isinstance(e, str)}):
+            entries = [e for e in stored if isinstance(e, str)]
+            if not all(
+                any(e.startswith(p) for p in group for e in entries) for group in prefix_groups
+            ):
                 return False
         return True
 
@@ -218,7 +226,7 @@ class YamlEventStore:
         self,
         user_id: str | None = None,
         status: TeamStatus | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: Mapping[str, list[str]] | None = None,
     ) -> list[Process]:
         """Load matching team process snapshots from the data directory.
 
@@ -243,10 +251,11 @@ class YamlEventStore:
                 ``Process.status`` matches. If ``None`` (default), every
                 lifecycle state is returned, including ``DELETED``. See
                 ADR-23 §1.
-            metadata: If provided, return only snapshots whose stored
-                ``metadata_indexes`` contains an entry for EVERY key/value
-                pair given. An empty dict is an empty conjunction and matches
-                everything, exactly like ``None``. See ADR-24 §D5.
+            metadata: Mapping of indexed field name to a list of prefix terms.
+                Terms for one key OR-combine; distinct keys AND-combine. Empty
+                terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
+                and ``None`` all behave alike and leave the walk with no metadata
+                predicate at all. See ADR-24 §D5 and ADR-28 §D3/§D7.
 
         The three filters are independent terms combining as a conjunction;
         one left at ``None`` constrains nothing.
@@ -254,12 +263,18 @@ class YamlEventStore:
         Returns:
             List of all loadable Process snapshots matching every filter
             that was provided.
+
+        Raises:
+            TypeError: If a ``metadata`` value is a bare ``str``.
         """
+        # Rendered BEFORE the early return, so a bare-``str`` value is rejected
+        # on an empty data directory exactly as it is on a populated one.
+        # Translated once, before the walk — never per team. An all-empty
+        # mapping renders to [], which is "no metadata filter", and a key whose
+        # terms all render away contributes no group rather than an empty one.
+        prefix_groups = make_index_prefix_groups(metadata)
         if not self._data_dir.exists():
             return []
-        # Translated once, before the walk — never per team. `if metadata`
-        # collapses both None and {} to "no metadata filter".
-        entries = {make_index_entry(k, v) for k, v in metadata.items()} if metadata else None
         teams: list[Process] = []
         for child in sorted(self._data_dir.iterdir()):
             if not child.is_dir():
@@ -270,7 +285,7 @@ class YamlEventStore:
                 logger.warning("Skipping non-team directory: %s", child.name)
                 continue
             data = self._load_team_data(team_id)
-            if data is None or not self._matches(data, user_id, status, entries):
+            if data is None or not self._matches(data, user_id, status, prefix_groups):
                 continue
             # A survivor that fails validation is still dropped rather than
             # raised on, exactly as it was when load_team returned None.

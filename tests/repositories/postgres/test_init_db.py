@@ -252,7 +252,7 @@ class TestInitDbIntegration:
         assert surviving == [(None,)], "the pre-existing row must survive on NULL"
         store = NagraEventStore(postgres_clean_tables)
         assert [p.team_id for p in store.list_teams()] == [existing.team_id]
-        assert store.list_teams(metadata={"tenant": "acme"}) == []
+        assert store.list_teams(metadata={"tenant": ["acme"]}) == []
 
     def test_init_db_creates_metadata_indexes_gin_index(
         self, postgres_initialized: str

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
-from akgentic.team.metadata import make_index_entry
+from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -97,7 +98,7 @@ class InMemoryEventStore:
         self,
         user_id: str | None = None,
         status: TeamStatus | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: Mapping[str, list[str]] | None = None,
     ) -> list[Process]:
         """Load team process snapshots, honouring every Protocol filter.
 
@@ -105,21 +106,33 @@ class InMemoryEventStore:
         from the real backends it stands in for: ``user_id``, ``status`` and
         ``metadata`` are independent and combine with AND, and ``None`` on
         any of them means "do not filter on that dimension" — so the no-arg
-        call still returns every team, ``DELETED`` ones included. An empty
-        ``metadata`` dict is an empty conjunction and matches everything.
+        call still returns every team, ``DELETED`` ones included.
 
-        Metadata entries go through ``make_index_entry`` rather than being
-        formatted here, so the fake escapes ``|`` exactly as the derivation
-        path does and cannot pass a test the real backends would fail.
+        The metadata term is an **anchored prefix** on the stored entry, in the
+        direction *stored starts with term*. Terms for one key OR-combine and
+        distinct keys AND-combine, and empty terms drop out — so ``{}``,
+        ``{"tenant": []}`` and ``{"tenant": [""]}`` all behave like ``None``.
+        Terms go through ``make_index_prefix_groups`` rather than being grouped
+        here, so the fake folds, escapes and combines exactly as the real
+        backends do — and rejects a bare ``str`` — and cannot pass a test they
+        would fail. ``EventStore`` is not ``@runtime_checkable`` and CI mypy does
+        not cover ``tests/``, so nothing but this catches a drift.
         """
         teams = list(self.teams.values())
         if user_id is not None:
             teams = [t for t in teams if t.user_id == user_id]
         if status is not None:
             teams = [t for t in teams if t.status == status]
-        if metadata:
-            entries = {make_index_entry(k, v) for k, v in metadata.items()}
-            teams = [t for t in teams if entries.issubset(set(t.metadata_indexes))]
+        prefix_groups = make_index_prefix_groups(metadata)
+        if prefix_groups:
+            teams = [
+                t
+                for t in teams
+                if all(
+                    any(e.startswith(p) for p in group for e in t.metadata_indexes)
+                    for group in prefix_groups
+                )
+            ]
         return teams
 
     def get_max_sequence(self, team_id: uuid.UUID) -> int:

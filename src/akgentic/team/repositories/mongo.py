@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 try:
@@ -27,7 +29,7 @@ except ImportError as exc:
 
 from pymongo.errors import PyMongoError
 
-from akgentic.team.metadata import make_index_entry
+from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
 
@@ -86,9 +88,10 @@ def ensure_indexes(
     ``teams_metadata_indexes_idx`` is a **multikey** index. That is not a
     distinct index type to request: MongoDB derives it automatically from an
     array-valued field, storing one entry per array element, which is exactly
-    what the ``$all`` containment query in :meth:`MongoEventStore.list_teams`
-    reads. Hence a plain single-field ascending spec here and no option to
-    pass (ADR-24 §D5).
+    what the anchored ``$regex`` terms in :meth:`MongoEventStore.list_teams`
+    seek on. Hence a plain single-field ascending spec here and no option to
+    pass (ADR-24 §D5). The name and key spec are unchanged by the move from
+    equality to prefix — deployment tooling probes for the literal name.
 
     Idempotent — ``create_index`` returns silently when an index of the same
     name and key spec already exists, so this is safe across redeploys and safe
@@ -236,18 +239,30 @@ class MongoEventStore:
         self,
         user_id: str | None = None,
         status: TeamStatus | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: Mapping[str, list[str]] | None = None,
     ) -> list[Process]:
         """Load team process snapshots from the teams collection.
 
         All three filters are pushed into the same Mongo ``find`` filter dict
-        — ``{"user_id": ...}``, ``{"status": ...}`` and
-        ``{"metadata_indexes": {"$all": [...]}}``. A parameter left at
-        ``None`` contributes no key, so ``list_teams()`` issues ``find({})``
-        and returns every team; supplying several yields one query whose
-        terms AND. The selection happens in MongoDB, never in Python after
-        hydration, so a team that will not be returned is never transferred
-        or validated.
+        — ``{"user_id": ...}``, ``{"status": ...}`` and, per filtered metadata
+        key, one ``$or`` of anchored ``{"metadata_indexes": {"$regex": "^..."}}``
+        arms, those ``$or`` groups collected under ``$and``. A parameter left at
+        ``None`` contributes no key, so ``list_teams()`` issues ``find({})`` and
+        returns every team. The selection happens in MongoDB, never in Python
+        after hydration, so a team that will not be returned is never
+        transferred or validated.
+
+        The ``$or``-inside-``$and`` nesting **is** the combination rule: terms
+        for one key OR, distinct keys AND (ADR-28 §D7). The outer ``$and`` is
+        also what keeps two keys apart at all, since a single dict cannot carry
+        two ``metadata_indexes`` keys.
+
+        The regex is **anchored and case-sensitive**, deliberately: ``$options:
+        "i"`` disables index use entirely, which is precisely why
+        :func:`~akgentic.team.metadata.make_index_entry` casefolds the value
+        half on write instead (ADR-28 §D2). Neither ``$and: []`` nor ``$or: []``
+        is ever emitted — MongoDB rejects both — because a key that renders no
+        term yields no group at all.
 
         The indexes (``teams_user_id_idx``, ``teams_status_idx`` and the
         multikey ``teams_metadata_indexes_idx``, all provisioned by
@@ -269,32 +284,48 @@ class MongoEventStore:
                 ``Process.status`` matches. If ``None`` (default), every
                 lifecycle state is returned, including ``DELETED``. See
                 ADR-23 §1.
-            metadata: If provided, return only snapshots whose
-                ``metadata_indexes`` contains an entry for EVERY key/value
-                pair given. An empty dict matches everything, like ``None``.
-                See ADR-24 §D5.
+            metadata: Mapping of indexed field name to a list of prefix terms.
+                Terms for one key OR-combine; distinct keys AND-combine. Empty
+                terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
+                and ``None`` all leave the query without a metadata key. See
+                ADR-24 §D5 and ADR-28 §D3/§D7.
 
         Returns:
             List of loadable Process snapshots matching every filter given.
+
+        Raises:
+            TypeError: If a ``metadata`` value is a bare ``str``.
         """
         query: dict[str, object] = {}
         if user_id is not None:
             query["user_id"] = user_id
         if status is not None:
             query["status"] = status
-        # Truthiness, not `is not None`: `$all` over an EMPTY array matches
-        # zero documents in MongoDB, so an empty mapping arriving as "no
-        # filter" would leave as "no results" — a regression no result-level
-        # assertion over an empty store can see.
-        if metadata:
-            # Equality-only containment, one entry per key, AND-combined.
-            # Entries go through the same helper the write path derived with,
-            # so the `|` escaping cannot drift between the two sides and a
-            # value holding a literal `|` matches instead of forging a second
-            # entry.
-            query["metadata_indexes"] = {
-                "$all": [make_index_entry(key, value) for key, value in metadata.items()]
-            }
+        # Gate on the RENDERED groups, not on `metadata` truthiness: FR4 lets a
+        # key carry an empty term list, so `{"tenant": []}` is truthy and still
+        # has to add nothing. `$and: []` and `$or: []` are both OperationFailure
+        # in MongoDB, and the older `$all: []` shape matched zero documents —
+        # every way, a mapping meaning "no filter" must not reach the query.
+        # `make_index_prefix_groups` never returns an empty group, so neither
+        # emptiness is reachable from here by construction.
+        prefix_groups = make_index_prefix_groups(metadata)
+        if prefix_groups:
+            # One `$or` per key, those `$and`-ed: same key ORs, different keys
+            # AND. The nesting is also what keeps two keys apart at all — a
+            # single dict cannot hold two `metadata_indexes` keys.
+            # `re.escape` because the rendered prefix is a literal, not a
+            # pattern — it may hold `.`, `*` or the `\|` the separator escaping
+            # planted, and the backslash must survive into the pattern as a
+            # literal backslash.
+            query["$and"] = [
+                {
+                    "$or": [
+                        {"metadata_indexes": {"$regex": "^" + re.escape(prefix)}}
+                        for prefix in group
+                    ]
+                }
+                for group in prefix_groups
+            ]
         teams: list[Process] = []
         for doc in self._teams.find(query):
             doc.pop("_id", None)
