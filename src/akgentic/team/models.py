@@ -198,12 +198,15 @@ class TeamRuntime(SerializableBaseModel):
     ``model_dump()`` / ``model_validate()`` round-trips while ephemeral
     proxies are excluded from serialization.
 
-    Carries no ``TeamCard``. Everything it used to read off one is either a
-    plain value it can hold itself (``team_name``, ``message_types``) or a
-    question the orchestrator's role catalog answers (the entry point's agent
-    class, whether a target is a ``UserProxy``). That is what lets the restore
-    path build a runtime from the stored projection alone, once story 31-3
-    stops reading ``Process.team_card`` (ADR-26 §Decision 6).
+    Carries no ``TeamCard``. Everything it used to read off one is answered
+    elsewhere, and by three different things: ``team_name`` and
+    ``message_types`` are plain values it holds itself; the entry point's agent
+    class comes from the orchestrator's role catalog, keyed by the entry
+    address's own role; and whether a target is a ``UserProxy`` comes from that
+    target's ``ActorAddress`` — the actor's actual type, never a card's
+    declaration, so the catalog is not on that path at all. That is what lets
+    the restore path build a runtime from the stored projection alone, once
+    story 31-3 stops reading ``Process.team_card`` (ADR-26 §Decision 6).
 
     Attributes:
         id: Externally assigned unique identifier for this runtime instance.
@@ -447,8 +450,12 @@ class TeamRuntime(SerializableBaseModel):
             message: The original message from the requesting agent.
 
         Raises:
-            ValueError: If the message has no recipient, the recipient
-                cannot be rehydrated, or the target is not a UserProxy.
+            ValueError: If the message has no recipient, the recipient cannot
+                be rehydrated, the recipient name is absent from the team's
+                live roster, or the target actor is not a ``UserProxy``. The
+                last two carry distinct messages on purpose: before the check
+                moved onto the address, an unknown name had no card and so
+                reported the type error, hiding which of the two had happened.
         """
         if message.recipient is None:
             msg = "Cannot route human input: message has no recipient"
