@@ -432,6 +432,10 @@ class TestYamlEventStoreYamlSpecific:
         escapes the store's handler: ``list_teams`` walks every team directory
         through the same validation, so an escaping error would turn a one-team
         problem into a broken listing for the whole store.
+
+        Pinned for YAML, and Mongo catches the same pair — Postgres validates
+        inline and has no such handler, which is a backend-parity gap recorded
+        in ``backlog.md`` rather than something this story changes.
         """
         store = YamlEventStore(tmp_path)
         healthy = make_process()

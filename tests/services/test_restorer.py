@@ -2968,6 +2968,10 @@ def _sent_recipients(
     orchestrator notification is asynchronous, so the count is polled rather
     than read once. Returning early on the expected count keeps a passing test
     fast; the deadline is what makes a failing one finite.
+
+    On timeout this returns whatever DID arrive rather than failing, so every
+    caller pins ``len(...)`` as well as the recipients or contents — a set
+    comparison alone cannot tell a full delivery from a partial one.
     """
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
@@ -3037,6 +3041,11 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         runtime.send(UserMessage(content="preformed"))
 
         sent = _sent_recipients(recording, baseline, expected=2)
+        # The count is pinned as well as the content: a set of one value is
+        # equal to a set of two identical ones, so without this a half-delivered
+        # send reads as a pass.
+        assert len(sent) == 2
+        assert all(type(m.message) is UserMessage for m in sent)
         assert {m.message.content for m in sent} == {"preformed"}
 
     def test_a_str_is_wrapped_in_the_projections_message_type(
@@ -3055,7 +3064,7 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         runtime.send("wrap me")
 
         sent = _sent_recipients(recording, baseline, expected=2)
-        assert sent
+        assert len(sent) == 2
         assert all(isinstance(m.message, UserMessage) for m in sent)
         assert all(m.message.content == "wrap me" for m in sent)
 
@@ -3083,6 +3092,7 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         baseline = len(recording.messages)
         runtime.send(UserMessage(content="explicit"))
         sent = _sent_recipients(recording, baseline, expected=2)
+        assert len(sent) == 2
         assert {m.message.content for m in sent} == {"explicit"}
 
     def test_a_supervisor_that_was_not_rebuilt_is_skipped_not_fatal(
@@ -3109,6 +3119,7 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         baseline = len(recording.messages)
         runtime.send("still routable")
         sent = _sent_recipients(recording, baseline, expected=1)
+        assert len(sent) == 1
         assert {m.recipient.name for m in sent} == {"alpha"}
 
     def test_a_runtime_hire_is_restored_and_its_role_is_in_the_catalog(
@@ -3179,14 +3190,22 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         assert entry_profile.get_agent_class() is not _make_card("lead", "Lead").get_agent_class()
         tc = _projection_team_card(message_types=[UserMessage], profiles=[entry_profile])
 
-        # Create path.
-        built = TeamFactory.build(tc, actor_system)
+        # Create path. The send is RECORDED, not merely called: ``send`` routes
+        # through a fire-and-forget proxy that ignores the class it is typed on
+        # (``ActorSystem.proxy_tell`` casts and discards it), so a call that
+        # does not raise proves nothing on its own.
+        built_recording = RecordingSubscriber()
+        built = TeamFactory.build(tc, actor_system, [built_recording])
         built_catalog = built.orchestrator_proxy.get_agent_catalog()
         assert next(c for c in built_catalog if c.role == "Lead").description == (
             entry_profile.description
         )
         assert set(built.supervisor_addrs) == {"alpha", "beta"}
+        built_baseline = len(built_recording.messages)
         built.send("after a create")
+        built_sent = _sent_recipients(built_recording, built_baseline, expected=2)
+        assert len(built_sent) == 2
+        assert {m.recipient.name for m in built_sent} == {"alpha", "beta"}
         built.orchestrator_proxy.stop(GRACE_TIMEOUT_SECONDS).wait()
 
         # Resume path.
@@ -3200,4 +3219,5 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         baseline = len(recording.messages)
         resumed.send("after a resume")
         sent = _sent_recipients(recording, baseline, expected=2)
+        assert len(sent) == 2
         assert {m.recipient.name for m in sent} == {"alpha", "beta"}

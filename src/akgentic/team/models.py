@@ -663,10 +663,11 @@ class Process(SerializableBaseModel):
         """Refuse a stored document written before the structural projection.
 
         ``mode="before"`` is the ONLY place the legacy marker is still visible.
-        Once ``team_card`` stopped being a field, the model's ``extra="ignore"``
-        drops the key silently, and what reaches the caller is Pydantic's
-        generic "Field required" for ``entry_point`` — which names neither the
-        cause nor the remedy. This says both.
+        Once ``team_card`` stopped being a field, Pydantic's default
+        ``extra="ignore"`` drops the key silently — the model declares no
+        ``extra`` of its own, so nothing here would flag it — and what reaches
+        the caller is Pydantic's generic "Field required" for ``entry_point``,
+        which names neither the cause nor the remedy. This says both.
 
         The shape is recognised by BOTH halves: the mapping carries
         ``team_card`` AND lacks ``entry_point``. A migrated document carries no
@@ -674,11 +675,20 @@ class Process(SerializableBaseModel):
         the guard from firing on a hybrid a migration might produce mid-write.
 
         Deliberately raises ``ValueError`` (as Pydantic wraps it) rather than a
-        ``LookupError`` subclass. The backends catch ``ValueError`` from
-        validation, log it and skip the document, so ``load_team`` still returns
-        ``None`` and ``resume_team`` still raises ``Team {id} not found``. An
-        escaping error would also escape ``list_teams``, turning one unmigrated
-        team into a broken listing for the whole store.
+        ``LookupError`` subclass. The YAML and Mongo backends catch
+        ``ValueError`` from validation, log it and skip the document, so
+        ``load_team`` still returns ``None`` and ``resume_team`` still raises
+        ``Team {id} not found``. A ``LookupError`` would escape those handlers
+        and so escape ``list_teams`` too, turning one unmigrated team into a
+        broken listing for the whole store.
+
+        The Postgres backend does NOT have that handler: it validates inline
+        (``repositories/postgres/event_store.py``), so on that tier any
+        validation failure — this one and every one that predates it —
+        propagates out of ``load_team`` and ``list_teams``. The message is at
+        least legible there too, which is what this validator is for; whether
+        Postgres should log-and-skip like its siblings is a backend-parity
+        decision of its own, recorded in ``backlog.md``.
 
         Args:
             data: Whatever Pydantic hands the validator. Only a mapping — the
