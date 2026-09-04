@@ -128,14 +128,25 @@ class TeamCard(SerializableBaseModel):
     def supervisors(self) -> list[AgentCard]:
         """Return AgentCards for the first layer of ``members`` only.
 
-        Supervisors are the agents that receive external messages routed
-        through the entry point.  The entry point itself is excluded --
-        it is the *sender*, not a recipient.  Deeper members (children
-        of first-layer members) are also excluded -- they are internal
-        to their supervisor's subtree.
+        One card per DECLARED SLOT, not per spawned actor. A member declared
+        with ``headcount=3`` is a single card here and three live agents named
+        ``<name>_0..2`` in the running team, so the names on these cards are
+        **not** the names of the agents that receive anything. Reading
+        ``config.name`` off this list to address a recipient is precisely the
+        mistake that dropped every multi-instance supervisor out of
+        ``TeamRuntime.send``'s fan-out; use :func:`spawned_names` for names,
+        and ``TeamRuntime.supervisor_addrs`` for who is actually reachable.
+
+        The entry point is excluded -- it is the *sender*, not a recipient.
+        Deeper members (children of first-layer members) are also excluded --
+        they are internal to their supervisor's subtree.
+
+        Nothing in the framework reads this property: ``TeamFactory.build``
+        was its last caller and now keys ``supervisor_addrs`` off the spawn
+        result instead.
 
         Returns:
-            List of AgentCards for each top-level member.
+            List of AgentCards for each top-level member slot.
         """
         return [m.card for m in self.members]
 
