@@ -94,7 +94,7 @@ class EventStore(Protocol):
         Called by TeamManager to retrieve team state. Returns None if no
         snapshot exists for the given team ID.
 
-        **An unloadable document also returns ``None``**, logged at ERROR
+        **An unloadable document also returns ``None``**, logged at ERROR and
         naming the ``team_id``. Implementations MUST NOT let a validation
         failure escape: a stored document that does not validate — corrupted,
         or written before a model change, such as the pre-projection shape
@@ -185,10 +185,14 @@ class EventStore(Protocol):
         another owner's teams.
 
         **An unloadable document is skipped, never raised**, logged at WARNING
-        naming the ``team_id``. One corrupted or unmigrated document must not
-        empty the listing for every team in the store — the blast radius of
-        failing loud here is a whole fleet, and it is tier-independent. The
-        counterpart of the same rule on :meth:`load_team`.
+        or above and naming the ``team_id`` — the id is the only thing that
+        lets an operator find the offending document. WARNING is the floor, not
+        the exact level: the YAML backend reports its skips at ERROR on both
+        read paths, which is louder rather than divergent. One corrupted or
+        unmigrated document must not empty the listing for every team in the
+        store — the blast radius of failing loud here is a whole fleet, and it
+        is tier-independent. The counterpart of the same rule on
+        :meth:`load_team`.
 
         Results MUST be identical whatever strategy an implementation uses;
         where the filter runs is a performance property, not a semantic one.

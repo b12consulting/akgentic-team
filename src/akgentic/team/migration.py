@@ -137,6 +137,10 @@ def migrate_document(document: Mapping[str, Any], store: EventStore) -> None:
             derived document does not validate as a ``Process``. Pydantic's
             ``ValidationError`` is a ``ValueError``.
         TypeError: If the stored ``team_card`` is not a shape Pydantic can read.
+        KeyError: If *document* carries no ``team_card`` at all. Callers reach
+            this through :func:`migrate_documents`, which classifies such a
+            document as skipped before it gets here; a direct caller sees the
+            ``KeyError``, which is why the loop's clause names it too.
     """
     team_card = TeamCard.model_validate(document[LEGACY_CARD_KEY])
     projection = derive_team_projection(team_card)

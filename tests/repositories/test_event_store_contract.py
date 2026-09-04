@@ -983,6 +983,10 @@ class TestEventStoreContract:
         assert any(record.levelno >= logging.WARNING for record in caplog.records), (
             "an unloadable document must be logged, not silently dropped"
         )
+        # The id, not merely a log line. Naming the row is the whole reason the
+        # Postgres statement grew an ``id`` column; without this assertion that
+        # column could be dropped again and every test would stay green.
+        assert str(unloadable_id) in caplog.text
 
     def test_load_team_returns_none_for_an_unloadable_document(
         self,
@@ -1003,6 +1007,7 @@ class TestEventStoreContract:
             assert event_store.load_team(unloadable_id) is None
 
         assert any(record.levelno >= logging.WARNING for record in caplog.records)
+        assert str(unloadable_id) in caplog.text
 
     # --- Validation failure on corrupted payload --------------------------
 

@@ -73,7 +73,13 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
-markers = ["integration: Full lifecycle tests requiring real LLM and API keys"]
+markers = [
+    """\
+integration: Needs a service this machine may not have — a real LLM and API keys \
+for the full lifecycle suite, a running Docker daemon for the container-backed \
+ones. Deselected by the default addopts.\
+""",
+]
 # --ignore: integration tests import akgentic.agent (not a dependency of
 # akgentic-team); skip collecting them so the import does not error before the
 # 'not integration' marker filter is applied.

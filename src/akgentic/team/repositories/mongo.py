@@ -372,7 +372,14 @@ class MongoEventStore:
             try:
                 teams.append(Process.model_validate(doc))
             except (ValueError, TypeError) as exc:
-                logger.warning("Skipping corrupted team document: %s", exc)
+                # Named, not just counted: the id is the only thing that lets an
+                # operator find the offending document, and the port states the
+                # skipped row is logged with it.
+                logger.warning(
+                    "Skipping corrupted team document for team %s: %s",
+                    doc.get("team_id", "<unknown>"),
+                    exc,
+                )
         logger.debug("Listed %d teams", len(teams))
         return teams
 
