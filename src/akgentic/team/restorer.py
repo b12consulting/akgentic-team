@@ -726,7 +726,10 @@ class TeamRestorer:
 
         runtime = TeamRuntime(
             id=team_id,
-            team=team_card,
+            # Still read off the team_card this method already holds; story 31-3
+            # switches the source to the stored projection.
+            team_name=team_card.name,
+            message_types=list(team_card.message_types),
             actor_system=self._actor_system,
             orchestrator_addr=orchestrator_addr,
             entry_addr=entry_addr,

@@ -14,6 +14,7 @@ from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.core.orchestrator import STOP_TIMEOUT, EventSubscriber, Orchestrator
 from akgentic.team.messages import WelcomeMessage
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.projection import derive_team_projection
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,9 @@ class TeamFactory:
     """Build running teams from TeamCard + ActorSystem.
 
     Static builder: TeamFactory.build(team_card, actor_system, subscribers) -> TeamRuntime.
-    Creates Orchestrator, spawns agents, wires routes_to, registers subscribers.
-    Rollback on partial failure (tear down spawned actors if build fails).
+    Creates the Orchestrator, spawns the member tree, registers the team's whole
+    role-keyed card set with the orchestrator, registers subscribers, and rolls
+    back on partial failure (tearing down every actor spawned so far).
     """
 
     @staticmethod
@@ -42,8 +44,12 @@ class TeamFactory:
         """Build a running team from a declarative TeamCard.
 
         Creates an Orchestrator actor, spawns all agents defined in the TeamCard
-        member tree, registers subscribers and agent profiles, and returns a
-        TeamRuntime handle to the running team.
+        member tree, registers subscribers and the team's whole role catalog,
+        and returns a TeamRuntime handle to the running team.
+
+        Catalog registration precedes the ``TeamRuntime`` construction and may
+        not be reordered: the runtime resolves its entry-point agent class out
+        of the catalog on construction.
 
         Args:
             team_card: Declarative team definition with entry point and members.
@@ -110,12 +116,8 @@ class TeamFactory:
                 )
                 addrs.update(member_addrs)
 
-            # 4. Register hireable agent profiles with orchestrator
-            # Only profiles listed in agent_profiles are available for runtime
-            # hiring. Instantiated members are already live — registering them
-            # would cause the LLM to hire duplicates via role names.
-            if team_card.agent_profiles:
-                orchestrator_proxy.register_agent_profiles(team_card.agent_profiles)
+            # 4. Register the team's whole role catalog with the orchestrator.
+            TeamFactory._register_role_catalog(orchestrator_proxy, team_card)
 
             # 5. Build supervisor_addrs
             supervisor_addrs: dict[str, ActorAddress] = {}
@@ -145,7 +147,8 @@ class TeamFactory:
             # 6. Build and return TeamRuntime
             return TeamRuntime(
                 id=team_id,
-                team=team_card,
+                team_name=team_card.name,
+                message_types=list(team_card.message_types),
                 actor_system=actor_system,
                 orchestrator_addr=orchestrator_addr,
                 entry_addr=entry_addr,
@@ -156,6 +159,46 @@ class TeamFactory:
         except Exception:
             TeamFactory._rollback_spawned(actor_system, spawned_addrs)
             raise
+
+    @staticmethod
+    def _register_role_catalog(
+        orchestrator_proxy: Orchestrator,
+        team_card: TeamCard,
+    ) -> None:
+        """Register one card per role reachable from *team_card*.
+
+        The WHOLE roster — entry point, every member of the tree at every depth,
+        and ``agent_profiles`` — not just the hireable subset the previous
+        ``team_card.agent_profiles`` registration carried. That is the intended
+        change (ADR-26 §Decision 5, FR1/FR2): an agent can only read a
+        colleague's description and skills if the colleague is in the catalog,
+        and ``TeamRuntime`` now resolves its entry-point agent class here too.
+
+        It is NOT hireability-neutral today, and that is worth stating plainly
+        rather than assuming. Each registered card carries the ``can_be_hired``
+        value ``derive_team_projection`` gave it, but NOTHING in the framework
+        reads that flag: the hire path takes any catalog card whose role matches
+        (`akgentic-tool`, ``team/team.py``) and ``get_available_roles()``
+        advertises every registered role back to the model. So until a hire
+        guard exists, a team's already-live members are hirable by role and the
+        model can spawn duplicates of them — exactly what the narrow
+        registration this replaces was avoiding. The guard belongs to
+        `akgentic-tool` (issue #321); Golden Rule 4 bars fixing it here.
+        ``TeamRestorer._rebuild_agents`` carries the same note for the restore
+        path, where the widening landed first.
+
+        Derived through ``derive_team_projection`` rather than by a second walk
+        of the card here: ``TeamManager.create_team`` derives the same
+        projection for the ``Process`` it persists, and one pure function is
+        what keeps the registered catalog and the stored record from
+        disagreeing. Deliberately not threaded in from ``create_team`` — a
+        direct ``TeamFactory.build`` caller must get a catalog too.
+
+        Args:
+            orchestrator_proxy: Proxy to the orchestrator actor.
+            team_card: The declarative definition whose roles to register.
+        """
+        orchestrator_proxy.register_agent_profiles(derive_team_projection(team_card).cards)
 
     @staticmethod
     def _rollback_spawned(

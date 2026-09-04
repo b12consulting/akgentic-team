@@ -198,9 +198,19 @@ class TeamRuntime(SerializableBaseModel):
     ``model_dump()`` / ``model_validate()`` round-trips while ephemeral
     proxies are excluded from serialization.
 
+    Carries no ``TeamCard``. Everything it used to read off one is either a
+    plain value it can hold itself (``team_name``, ``message_types``) or a
+    question the orchestrator's role catalog answers (the entry point's agent
+    class, whether a target is a ``UserProxy``). That is what lets the restore
+    path build a runtime from the stored projection alone, once story 31-3
+    stops reading ``Process.team_card`` (ADR-26 §Decision 6).
+
     Attributes:
         id: Externally assigned unique identifier for this runtime instance.
-        team: The declarative team definition this runtime is based on.
+        team_name: The team's name, used in error messages. ``None`` for an
+            unnamed team.
+        message_types: Message classes the team handles; the first is the type
+            a ``str`` sent through ``send`` / ``send_to`` is wrapped in.
         actor_system: The actor system hosting this team's actors.
         orchestrator_addr: Persistent address of the orchestrator actor.
         entry_addr: Persistent address of the team's entry-point actor.
@@ -209,7 +219,13 @@ class TeamRuntime(SerializableBaseModel):
     """
 
     id: uuid.UUID = Field(description="Externally assigned unique identifier for this runtime")
-    team: TeamCard = Field(description="Declarative team definition this runtime is based on")
+    team_name: str | None = Field(
+        default=None, description="The team's name, used in error messages"
+    )
+    message_types: list[type] = Field(
+        default_factory=list,
+        description="Message classes the team handles; first is the default",
+    )
     actor_system: ActorSystem = Field(
         exclude=True,
         description="Actor system hosting this team's actors",
@@ -241,17 +257,35 @@ class TeamRuntime(SerializableBaseModel):
         Always overwrites all ephemeral fields completely to ensure
         idempotency — safe to call multiple times.
 
+        The entry point's agent class comes from the orchestrator's role
+        catalog, keyed by the entry address's own ``role``. The catalog is
+        therefore a construction-time dependency: both call sites register it
+        before building a runtime (``TeamFactory.build`` step 4, and the
+        restorer's rebuild phase 2f).
+
         Args:
             __context: Pydantic validation context (unused).
+
+        Raises:
+            ValueError: If the catalog holds no card for the entry point's role.
         """
         self._orchestrator_proxy = self.actor_system.proxy_ask(self.orchestrator_addr, Orchestrator)
         self._orchestrator_proxy_tell = self.actor_system.proxy_tell(
             self.orchestrator_addr, Orchestrator
         )
-        entry_agent_class = self.team.entry_point.card.get_agent_class()
-        self._entry_proxy = self.actor_system.proxy_tell(self.entry_addr, entry_agent_class)
+        entry_role = self.entry_addr.role
+        entry_card = self._orchestrator_proxy.get_agent_profile(entry_role)
+        if entry_card is None:
+            msg = (
+                f"No agent card registered for entry point role '{entry_role}' "
+                f"in team '{self.team_name}'"
+            )
+            raise ValueError(msg)
+        self._entry_proxy = self.actor_system.proxy_tell(
+            self.entry_addr, entry_card.get_agent_class()
+        )
 
-        self._message_cls = self.team.message_types[0] if self.team.message_types else None
+        self._message_cls = self.message_types[0] if self.message_types else None
 
     def _make_message(self, content: str) -> Message:
         """Create a message from the team's declared message type.
@@ -344,7 +378,7 @@ class TeamRuntime(SerializableBaseModel):
         """
         addr = self._orchestrator_proxy.get_team_member(agent_name)
         if addr is None:
-            msg = f"Agent '{agent_name}' not found in team '{self.team.name}'"
+            msg = f"Agent '{agent_name}' not found in team '{self.team_name}'"
             raise ValueError(msg)
         return self._resolve_addr(agent_name, addr)
 
@@ -400,6 +434,14 @@ class TeamRuntime(SerializableBaseModel):
         ``ActorAddressProxy`` references via the orchestrator, then
         routes by ``message.recipient.name`` to the correct ``UserProxy``.
 
+        The target is qualified by ``ActorAddress.is_user_proxy`` — the actor's
+        **actual** type, cached at address construction — rather than by the
+        agent class a card declares. Two consequences worth stating: an agent
+        hired at runtime routes like any other (it is in the live roster and in
+        no card list on the ``Process``), and a "not found" recipient stays
+        distinguishable from a found one that is not a ``UserProxy``. They are
+        different bugs to whoever reads the log.
+
         Args:
             content: The human's text response.
             message: The original message from the requesting agent.
@@ -427,8 +469,7 @@ class TeamRuntime(SerializableBaseModel):
         target_name = live_message.recipient.name  # type: ignore[union-attr]
         target_addr = self._lookup_member(target_name)
 
-        card = self.team.agent_cards.get(target_name)
-        if card is None or not issubclass(card.get_agent_class(), UserProxy):
+        if not target_addr.is_user_proxy:
             msg = f"Agent '{target_name}' is not a UserProxy"
             raise ValueError(msg)
 
@@ -604,6 +645,40 @@ class Process(SerializableBaseModel):
         default=None,
         description="Model class describing this team's business metadata, or None",
     )
+
+    @model_validator(mode="after")
+    def reject_duplicate_card_roles(self) -> Process:
+        """Reject a projection holding two ``AgentCardRef``s for one role.
+
+        ``mode="after"`` for the same reason as
+        :meth:`require_resolvable_agent_refs`: ``model_validate`` of a stored
+        document is the path a hand-written or half-migrated record takes, and
+        it is the only path that can produce a duplicate —
+        ``derive_team_projection`` dedups by role, so this constrains nothing it
+        writes.
+
+        Tolerating a duplicate would not be neutral.
+        ``Orchestrator.register_agent_profile`` keys the catalog by
+        ``card.role``, so two refs sharing a role resolve to one catalog entry
+        with no signal about which card won.
+
+        Raises:
+            ValueError: If any role appears twice in ``agent_cards``. Every
+                duplicated role is named.
+        """
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for ref in self.agent_cards:
+            if ref.role in seen:
+                duplicates.add(ref.role)
+            seen.add(ref.role)
+        if duplicates:
+            msg = (
+                f"Process agent_cards holds more than one ref for role(s) "
+                f"{sorted(duplicates)}; roles are the catalog key and must be unique."
+            )
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def require_resolvable_agent_refs(self) -> Process:

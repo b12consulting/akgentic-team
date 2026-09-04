@@ -19,6 +19,7 @@ from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.team.factory import GRACE_TIMEOUT_SECONDS, TeamFactory
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime, spawned_names
+from akgentic.team.projection import derive_team_projection
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -215,33 +216,19 @@ class TestTeamFactoryBuild:
         assert runtime.orchestrator_addr.team_id == runtime.id
         assert runtime.entry_addr.team_id == runtime.id
 
-    # -- 3.8: Agent profiles registered with orchestrator ----------------
+    # -- 3.8: The full role catalog registered with the orchestrator -----
 
-    def test_agent_profiles_registered(self, actor_system: ActorSystem) -> None:
-        """AC 6: orchestrator.get_agent_catalog() returns only agent_profiles."""
+    def test_declared_profiles_are_in_the_catalog(self, actor_system: ActorSystem) -> None:
+        """The roles named in agent_profiles reach the catalog, flagged hireable."""
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
-        # Explicitly register profiles for hiring
         tc.agent_profiles = list(tc.agent_cards.values())
 
         runtime = TeamFactory.build(tc, actor_system)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        roles = {c.role for c in catalog}
-        assert "Lead" in roles
-        assert "Worker" in roles
-        assert len(catalog) == 2
-
-    def test_no_profiles_means_empty_catalog(self, actor_system: ActorSystem) -> None:
-        """Default agent_profiles (empty) results in empty hiring catalog."""
-        worker = _make_member("worker", "Worker")
-        tc = _make_team_card(members=[worker])
-        # agent_profiles defaults to empty — no roles available for hiring
-
-        runtime = TeamFactory.build(tc, actor_system)
-
-        catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        assert len(catalog) == 0
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert all(c.can_be_hired for c in catalog)
 
     # -- Additional edge-case tests --------------------------------------
 
@@ -505,6 +492,133 @@ class TestFactoryRollbackWaitsOnOrchestrator:
         assert events.index("orchestrator-wait") == len(events) - 1, (
             f"orchestrator wait must be last (after agent stops): {events}"
         )
+
+
+class TestBuildRegistersTheWholeRoleCatalog:
+    """AC 1, 3-8 (31-2): the catalog is the team's full roster, not a subset.
+
+    Note what these tests do NOT assert: nothing in the framework reads
+    ``can_be_hired`` yet, so a card carrying it is carried, not enforced. The
+    flag's value is asserted as a value.
+    """
+
+    @staticmethod
+    def _three_level_card_with_two_profiles() -> TeamCard:
+        """Entry point, a three-level tree, and two roles only in agent_profiles."""
+        junior = _make_member("junior", "Junior")
+        worker = _make_member("worker", "Worker", members=[junior])
+        supervisor = _make_member("supervisor", "Supervisor", members=[worker])
+        tc = _make_team_card(members=[supervisor])
+        tc.agent_profiles = [
+            _make_card("analyst", "Analyst"),
+            _make_card("scribe", "Scribe"),
+        ]
+        return tc
+
+    def test_every_reachable_role_gets_exactly_one_entry(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC1: entry point + every tree depth + every profile, one entry per role."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        roles = [c.role for c in catalog]
+        assert sorted(roles) == [
+            "Analyst",
+            "Junior",
+            "Lead",
+            "Scribe",
+            "Supervisor",
+            "Worker",
+        ]
+        assert len(roles) == len(set(roles))
+
+    def test_a_role_in_both_the_tree_and_the_profiles_yields_one_hireable_entry(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC3: no duplicate entry, and the surviving one is flagged hireable."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        tc.agent_profiles = [_make_card("worker-profile", "Worker")]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        workers = [c for c in catalog if c.role == "Worker"]
+        assert len(workers) == 1
+        assert workers[0].can_be_hired is True
+
+    def test_only_profile_roles_carry_the_hireable_flag(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC4: every tree-only role in the catalog reads can_be_hired=False."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        flags = {c.role: c.can_be_hired for c in runtime.orchestrator_proxy.get_agent_catalog()}
+        assert flags == {
+            "Lead": False,
+            "Supervisor": False,
+            "Worker": False,
+            "Junior": False,
+            "Analyst": True,
+            "Scribe": True,
+        }
+
+    def test_a_team_with_no_profiles_still_registers_its_roster(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC5: the replaced code skipped registration entirely for such a team."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        assert tc.agent_profiles == []
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert not any(c.can_be_hired for c in catalog)
+
+    def test_the_registered_cards_are_the_derivation_functions_own_output(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC6: a second walk of the card inside factory.py fails here."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert runtime.orchestrator_proxy.get_agent_catalog() == derive_team_projection(tc).cards
+
+    def test_the_callers_cards_are_never_flagged(self, actor_system: ActorSystem) -> None:
+        """AC7: every card reachable from the INPUT card still reads False."""
+        tc = self._three_level_card_with_two_profiles()
+
+        TeamFactory.build(tc, actor_system)
+
+        reachable = [
+            tc.entry_point.card,
+            *tc.agent_cards.values(),
+            *tc.agent_profiles,
+        ]
+        assert [c.can_be_hired for c in reachable] == [False] * len(reachable)
+
+    def test_a_hireable_catalog_entry_is_a_copy_not_the_callers_object(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC8: the flag is applied to a model_copy, never written back."""
+        tc = self._three_level_card_with_two_profiles()
+        analyst_input = tc.agent_profiles[0]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        analyst_registered = next(c for c in catalog if c.role == "Analyst")
+        assert analyst_registered is not analyst_input
+        assert analyst_registered.can_be_hired is True
+        assert analyst_input.can_be_hired is False
 
 
 class TestSpawnedNamesMatchesTheFactory:

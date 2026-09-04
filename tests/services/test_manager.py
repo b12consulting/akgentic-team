@@ -249,6 +249,29 @@ class TestTeamManagerCreate:
         assert process is not None
         assert process.team_id == runtime.id
 
+    def test_create_team_registers_the_whole_role_catalog(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC2 (31-2): the caller-facing path gets the catalog, not only the factory.
+
+        The registered set and the persisted refs come from one derivation, so
+        they agree by construction — asserted here on the roles they share.
+        """
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        tc.agent_profiles = [_make_card("analyst", "Analyst")]
+
+        runtime = manager.create_team(tc)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert {c.role for c in catalog} == {"Lead", "Worker", "Analyst"}
+        assert {c.role: c.can_be_hired for c in catalog} == {
+            "Lead": False,
+            "Worker": False,
+            "Analyst": True,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_team

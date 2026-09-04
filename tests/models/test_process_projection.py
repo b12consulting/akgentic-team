@@ -212,3 +212,66 @@ class TestProcessReferentialIntegrity:
 
         with pytest.raises(ValidationError, match="Worker"):
             Process.model_validate(payload)
+
+
+class TestProcessRejectsDuplicateCardRoles:
+    """AC17, AC18 (31-2): the role is the catalog key, so it must be unique.
+
+    ``register_agent_profile`` writes ``agent_cards[card.role] = card``, so two
+    refs sharing a role resolve to one catalog entry with nothing saying which
+    card won.
+    """
+
+    _process_kwargs = staticmethod(TestProcessReferentialIntegrity._process_kwargs)
+
+    def test_a_duplicate_role_is_rejected_on_construction_and_named(self) -> None:
+        with pytest.raises(ValidationError, match="Worker"):
+            Process(
+                **self._process_kwargs(),  # type: ignore[arg-type]
+                entry_point=AgentRef(name="@Lead", role="Lead"),
+                agent_cards=[
+                    AgentCardRef(role="Lead", card_hash="h1"),
+                    AgentCardRef(role="Worker", card_hash="h2"),
+                    AgentCardRef(role="Worker", card_hash="h3"),
+                ],
+            )
+
+    def test_the_duplicate_check_fires_on_model_validate_too(self) -> None:
+        """The read path is where a hand-written or corrupted document arrives."""
+        good = Process(
+            **self._process_kwargs(),  # type: ignore[arg-type]
+            entry_point=AgentRef(name="@Lead", role="Lead"),
+            agent_cards=[AgentCardRef(role="Lead", card_hash="h1")],
+        )
+        payload = good.model_dump()
+        payload["agent_cards"] = [
+            *payload["agent_cards"],
+            {"role": "Lead", "card_hash": "h9", "can_be_hired": False},
+        ]
+
+        with pytest.raises(ValidationError, match="Lead"):
+            Process.model_validate(payload)
+
+    def test_two_distinct_roles_are_untouched(self) -> None:
+        process = Process(
+            **self._process_kwargs(),  # type: ignore[arg-type]
+            entry_point=AgentRef(name="@Lead", role="Lead"),
+            agent_cards=[
+                AgentCardRef(role="Lead", card_hash="h1"),
+                AgentCardRef(role="Worker", card_hash="h2"),
+            ],
+        )
+        assert [ref.role for ref in process.agent_cards] == ["Lead", "Worker"]
+
+    def test_every_derived_projection_still_validates(self) -> None:
+        """AC18: the derivation dedups by role, so it can never trip this."""
+        tc = make_team_card(
+            member_names=["worker", "scribe"],
+            member_roles=["Worker", "Worker"],
+        )
+        tc.agent_profiles = [make_agent_card(name="analyst", role="Worker")]
+
+        process = make_process(team_card=tc)
+
+        roles = [ref.role for ref in process.agent_cards]
+        assert roles == ["Lead", "Worker"]
