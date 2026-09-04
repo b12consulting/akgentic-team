@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 import yaml
@@ -77,7 +77,7 @@ class TestMigrateYamlScriptConfiguration:
         data_dir = tmp_path / "store"
         data_dir.mkdir()
 
-        def _refuse(self: Path) -> Any:
+        def _refuse(self: Path) -> NoReturn:
             raise PermissionError(f"Permission denied: {self}")
 
         monkeypatch.setattr(Path, "iterdir", _refuse)
