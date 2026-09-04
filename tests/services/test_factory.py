@@ -68,7 +68,6 @@ def _make_card(
     name: str,
     role: str = "TestRole",
     agent_class: type[Akgent[Any, Any]] = StubAgent,
-    routes_to: list[str] | None = None,
 ) -> AgentCard:
     return AgentCard(
         role=role,
@@ -76,7 +75,6 @@ def _make_card(
         skills=["testing"],
         agent_class=agent_class,
         config=BaseConfig(name=name, role=role),
-        routes_to=routes_to or [],
     )
 
 
@@ -86,10 +84,9 @@ def _make_member(
     agent_class: type[Akgent[Any, Any]] = StubAgent,
     headcount: int = 1,
     members: list[TeamCardMember] | None = None,
-    routes_to: list[str] | None = None,
 ) -> TeamCardMember:
     return TeamCardMember(
-        card=_make_card(name, role, agent_class, routes_to),
+        card=_make_card(name, role, agent_class),
         headcount=headcount,
         members=members or [],
     )
@@ -195,28 +192,6 @@ class TestTeamFactoryBuild:
         while runtime.orchestrator_addr.is_alive() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert sub.stopped is True
-
-    # -- 3.5: routes_to wiring ------------------------------------------
-
-    def test_routes_to_registered(self, actor_system: ActorSystem) -> None:
-        """AC 4,6: Agent profiles with routes_to are registered with orchestrator."""
-        worker = _make_member("worker", "Worker")
-        ep = _make_member("lead", "Lead", routes_to=["Worker"])
-        tc = _make_team_card(entry_point=ep, members=[worker])
-        # Explicitly register profiles for hiring
-        tc.agent_profiles = list(tc.agent_cards.values())
-
-        runtime = TeamFactory.build(tc, actor_system)
-
-        # Verify agent profiles are registered
-        catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        roles = {c.role for c in catalog}
-        assert "Lead" in roles
-        assert "Worker" in roles
-
-        # Verify routes_to is preserved
-        lead_card = next(c for c in catalog if c.role == "Lead")
-        assert "Worker" in lead_card.routes_to
 
     # -- 3.6: Partial failure rollback -----------------------------------
 

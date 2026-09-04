@@ -75,9 +75,7 @@ class TestSpawnedNames:
         assert spawned_names(member) == ["@Lead"]
 
     def test_headcount_three_yields_three_indexed_names_in_order(self) -> None:
-        member = TeamCardMember(
-            card=make_agent_card(name="@Worker", role="Worker"), headcount=3
-        )
+        member = TeamCardMember(card=make_agent_card(name="@Worker", role="Worker"), headcount=3)
         assert spawned_names(member) == ["@Worker_0", "@Worker_1", "@Worker_2"]
 
 

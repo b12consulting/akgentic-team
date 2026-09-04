@@ -32,7 +32,6 @@ from tests.conftest import projection_kwargs
 def make_agent_card(
     name: str = "test-agent",
     role: str = "TestAgent",
-    routes_to: list[str] | None = None,
     agent_class: str | type = "tests.fixtures.MockAgent",
 ) -> AgentCard:
     """Create a minimal AgentCard for testing.
@@ -40,7 +39,6 @@ def make_agent_card(
     Args:
         name: Config name for the agent.
         role: Agent role.
-        routes_to: List of agent names this agent routes to.
         agent_class: Agent class or FQCN string.
 
     Returns:
@@ -52,7 +50,6 @@ def make_agent_card(
         skills=["testing"],
         agent_class=agent_class,
         config=BaseConfig(name=name, role=role),
-        routes_to=routes_to or [],
     )
 
 

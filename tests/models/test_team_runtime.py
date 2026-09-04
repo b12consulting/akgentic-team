@@ -105,7 +105,7 @@ class TestTeamRuntimeConstruction:
         assert runtime.supervisor_addrs == {"supervisor": sup_addr}
 
     def test_model_post_init_builds_orchestrator_proxy_tell(self) -> None:
-        """AC1: model_post_init builds _orchestrator_proxy_tell via proxy_tell(orchestrator_addr)."""
+        """AC1: model_post_init builds _orchestrator_proxy_tell via proxy_tell."""
         runtime = make_team_runtime()
         assert runtime._orchestrator_proxy_tell is not None
         runtime.actor_system.proxy_tell.assert_any_call(runtime.orchestrator_addr, Orchestrator)

@@ -37,10 +37,14 @@ def hash_agent_card(card: AgentCard) -> str:
 
     Two canonicalisation decisions, both load-bearing:
 
-    * **Serialization mode is** ``mode="json"``. It renders every value —
-      including the ``{"__type__": ...}`` markers a ``type`` field becomes — to
-      JSON primitives, so the digest depends on the card's content rather than on
-      whichever Python objects happened to be in memory.
+    * **Serialization is whatever** ``SerializableBaseModel`` **produces**, asked
+      for with ``mode="json"``. The mode is belt-and-braces only: the framework's
+      ``@model_serializer`` takes no ``info`` argument, so it never sees the mode
+      and builds the payload itself — every value, including the
+      ``{"__type__": ...}`` marker a ``type`` field becomes, is already a JSON
+      primitive by the time Pydantic sees it. The mode is kept so the digest
+      still lands on primitives if that serializer is ever narrowed; nothing here
+      may *depend* on it.
     * **Field ordering is sorted by key** (``sort_keys=True``), with the compact
       separators. Pydantic emits fields in declaration order, so two equal cards
       built through different code paths would otherwise hash differently the day
@@ -189,6 +193,10 @@ def derive_team_projection(team_card: TeamCard) -> TeamProjection:
     return TeamProjection(
         team_name=team_card.name,
         team_description=None,
+        # One ref, not a list: TeamFactory.build rejects an entry point whose
+        # headcount is not 1 before any of this runs, so the expansion below can
+        # only ever yield a single name. Indexing states that invariant rather
+        # than quietly discarding names.
         entry_point=_member_refs(team_card.entry_point)[0],
         supervisors=supervisors,
         agent_cards=refs,
