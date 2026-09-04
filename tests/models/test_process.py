@@ -62,7 +62,6 @@ class TestProcess:
         now = datetime.now(UTC)
         process = Process(
             team_id=tid,
-            team_card=tc,
             status=TeamStatus.RUNNING,
             user_id="admin",
             user_email="admin@example.com",
@@ -71,7 +70,7 @@ class TestProcess:
             **projection_kwargs(tc),
         )
         assert process.team_id == tid
-        assert process.team_card.name == tc.name
+        assert process.team_name == tc.name
         assert process.status == TeamStatus.RUNNING
         assert process.user_id == "admin"
         assert process.user_email == "admin@example.com"
@@ -88,7 +87,7 @@ class TestProcess:
         data = process.model_dump()
         restored = Process.model_validate(data)
         assert restored.team_id == process.team_id
-        assert restored.team_card.name == process.team_card.name
+        assert restored.team_name == process.team_name
         assert restored.status == process.status
         assert restored.user_id == process.user_id
         assert restored.user_email == process.user_email
@@ -177,11 +176,11 @@ class TestProcessMetadata:
         data = process.model_dump()
         data.pop("metadata", None)
         data.pop("metadata_indexes", None)
-        data["team_card"].pop("metadata_type", None)
+        data.pop("metadata_type", None)
         restored = Process.model_validate(data)
         assert restored.metadata is None
         assert restored.metadata_indexes == []
-        assert restored.team_card.metadata_type is None
+        assert restored.metadata_type is None
 
 
 class TestPersistedEvent:

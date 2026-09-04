@@ -193,7 +193,6 @@ def _fully_populated_process() -> Process:
     tc = _make_team_card(name="acme-original")
     return Process(
         team_id=uuid.uuid4(),
-        team_card=tc,
         status=TeamStatus.STOPPED,
         user_id="u-1",
         user_email="u@acme.test",
@@ -626,7 +625,6 @@ class TestUpdateTeamMetadata:
         event_store.save_team(
             Process(
                 team_id=team_id,
-                team_card=tc,
                 status=TeamStatus.DELETED,
                 created_at=now,
                 updated_at=now,

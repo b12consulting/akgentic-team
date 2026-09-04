@@ -160,9 +160,14 @@ class TestCreateTeamWritesCardsFirst:
         bytes they write *different content* to it and last-write-wins decides
         what everyone reads back.
         """
+        # The profile is the tree card itself, not a same-role look-alike. A
+        # profile overrides the tree card of its role in the projection, so a
+        # differing one would make the two teams differ in card CONTENT as well
+        # as hireability — and this test would then pass or fail for the wrong
+        # reason.
         plain = manager.create_team(_make_team_card(name="plain"))
         hireable = manager.create_team(
-            _make_team_card(profiles=[_make_card("@AnotherWorker", "Worker")], name="hireable")
+            _make_team_card(profiles=[_make_card("@Worker", "Worker")], name="hireable")
         )
 
         stored = event_store.agent_cards

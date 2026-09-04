@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from akgentic.core.messages.message import UserMessage
@@ -93,15 +94,18 @@ class TestProcessProjectionFields:
         assert process.metadata_type is None
 
     def test_entry_point_is_required(self) -> None:
-        """An unmigrated document — nested card, no projection — fails loudly.
+        """A document with no projection fails loudly rather than half-loading.
 
         A default here would let such a document load half-formed and fail later
         inside a resume with a confusing error; the migration is mandatory.
+
+        Deliberately carries no ``team_card`` key: that shape has its own,
+        more specific guard (``TestUnmigratedDocument``), and mixing the two
+        into one fixture would let either check alone keep this green.
         """
         with pytest.raises(ValidationError, match="entry_point"):
             Process(
                 team_id=uuid.uuid4(),
-                team_card=make_team_card(),
                 status=TeamStatus.RUNNING,
                 created_at=datetime.now(UTC),
                 updated_at=datetime.now(UTC),
@@ -133,6 +137,96 @@ class TestProcessProjectionFields:
         assert restored.agent_cards == process.agent_cards
         hireable = {c.role: c.can_be_hired for c in restored.agent_cards}
         assert hireable == {"Lead": False, "Worker": False, "Helper": True}
+
+
+class TestProcessCarriesNoTeamCard:
+    """The projection REPLACED the nested card; it did not join it."""
+
+    def test_the_field_is_gone(self) -> None:
+        assert "team_card" not in Process.model_fields
+
+    def test_the_dump_has_no_team_card_key_and_the_projection_survives(self) -> None:
+        """AC 10: a full round-trip, with the nested card absent from the bytes."""
+        tc = make_team_card(member_names=["@Worker"], member_roles=["Worker"])
+        tc.agent_profiles = [make_agent_card(name="@Helper", role="Helper")]
+        process = make_process(team_card=tc)
+
+        data = process.model_dump()
+        assert "team_card" not in data
+
+        restored = Process.model_validate(data)
+        assert restored.team_name == process.team_name
+        assert restored.team_description == process.team_description
+        assert restored.entry_point == process.entry_point
+        assert restored.supervisors == process.supervisors
+        assert restored.agent_cards == process.agent_cards
+        assert restored.message_types == process.message_types
+        assert restored.metadata_type == process.metadata_type
+
+
+class TestUnmigratedDocument:
+    """A record written before the projection says so, in the log a resumer reads."""
+
+    @staticmethod
+    def _legacy_payload() -> dict[str, Any]:
+        """Return the pre-projection document shape: a nested card, no refs."""
+        return {
+            "team_id": str(uuid.uuid4()),
+            "team_card": make_team_card().model_dump(),
+            "status": TeamStatus.RUNNING,
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+        }
+
+    def test_the_legacy_shape_is_refused_and_names_the_migration(self) -> None:
+        """AC 11: not Pydantic's generic 'Field required' for entry_point."""
+        with pytest.raises(ValidationError) as exc_info:
+            Process.model_validate(self._legacy_payload())
+
+        message = str(exc_info.value)
+        assert "predates the structural projection" in message
+        assert "migration" in message
+
+    def test_a_migrated_document_passes_through_untouched(self) -> None:
+        """The guard needs BOTH halves, so a real document is unaffected."""
+        process = make_process()
+        assert Process.model_validate(process.model_dump()).team_id == process.team_id
+
+    def test_a_hybrid_carrying_both_is_not_caught_by_this_guard(self) -> None:
+        """Requiring entry_point to be ABSENT is what keeps a mid-write safe.
+
+        A migration that adds the projection before dropping the nested card
+        produces exactly this shape; it must load, not be refused as legacy.
+        """
+        payload = make_process().model_dump()
+        payload["team_card"] = make_team_card().model_dump()
+        assert Process.model_validate(payload).entry_point is not None
+
+    def test_a_non_mapping_input_passes_through(self) -> None:
+        """An existing Process is not a mapping and must reach the model intact."""
+        process = make_process()
+        assert Process.model_validate(process) == process
+
+    def test_the_two_messages_do_not_overlap(self) -> None:
+        """AC 12: 'predates the projection' and 'dangling ref' are different bugs.
+
+        Whoever reads the log gets one diagnosis, not a phrase that fits both.
+        """
+        with pytest.raises(ValidationError) as legacy_exc:
+            Process.model_validate(self._legacy_payload())
+
+        dangling = make_process().model_dump()
+        dangling["entry_point"]["role"] = "Ghost"
+        with pytest.raises(ValidationError) as dangling_exc:
+            Process.model_validate(dangling)
+
+        legacy = str(legacy_exc.value)
+        ref = str(dangling_exc.value)
+
+        assert "predates the structural projection" in legacy
+        assert "predates the structural projection" not in ref
+        assert "has no entry in agent_cards" in ref
+        assert "has no entry in agent_cards" not in legacy
 
 
 class TestProcessReferentialIntegrity:

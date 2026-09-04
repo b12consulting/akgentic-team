@@ -550,6 +550,30 @@ class TestBuildRegistersTheWholeRoleCatalog:
         assert len(workers) == 1
         assert workers[0].can_be_hired is True
 
+    def test_the_profiles_card_reaches_the_catalog_for_a_dual_listed_role(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 16, create path: WHICH card the catalog holds, not how many.
+
+        The profile and the tree card for ``Worker`` differ in description and
+        skills, so this fails under tree-wins precedence rather than passing
+        either way — which the count-and-flag spec above cannot do.
+        """
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        profile = _make_card("worker-profile", "Worker")
+        profile.description = "Hired to work, not the one already working"
+        profile.skills = ["onboarding"]
+        tc.agent_profiles = [profile]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        entry = next(c for c in catalog if c.role == "Worker")
+        assert entry.description == profile.description
+        assert entry.skills == profile.skills
+        assert entry.description != worker.card.description
+
     def test_only_profile_roles_carry_the_hireable_flag(
         self, actor_system: ActorSystem
     ) -> None:

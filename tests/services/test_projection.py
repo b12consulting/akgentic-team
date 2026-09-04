@@ -230,6 +230,53 @@ class TestDeriveTeamProjection:
         assert writers[0].can_be_hired is True
         assert len(projection.cards) == len(projection.agent_cards)
 
+    def test_the_profiles_card_is_the_one_that_survives_the_dedup(self) -> None:
+        """AC 15: WHICH card wins, not how many are left.
+
+        The two cards for ``Writer`` differ in ``description`` and ``skills``, so
+        the surviving one is identifiable by content rather than by a count. A
+        spec that only pins ``len(writers) == 1`` and the hireable flag stays
+        green under either precedence — which is exactly how the tree-wins
+        behaviour survived unnoticed.
+        """
+        tc = _three_level_card()
+        profile = _make_card("@AnotherWriter", "Writer")
+        profile.description = "Hired to write, not the one already writing"
+        profile.skills = ["ghostwriting"]
+        tc.agent_profiles = [profile]
+
+        tree_card = tc.agent_cards["@Writer"]
+        assert tree_card.description != profile.description
+        assert tree_card.skills != profile.skills
+
+        projection = derive_team_projection(tc)
+
+        survivor = next(c for c in projection.cards if c.role == "Writer")
+        assert survivor.description == profile.description
+        assert survivor.skills == profile.skills
+
+        ref = next(r for r in projection.agent_cards if r.role == "Writer")
+        assert ref.card_hash == hash_agent_card(
+            profile.model_copy(update={"can_be_hired": True})
+        )
+        assert ref.card_hash != hash_agent_card(tree_card)
+
+    def test_the_overriding_profile_keeps_the_role_at_its_tree_position(self) -> None:
+        """AC 14: only the card behind the role changes, never its position.
+
+        Assignment on an existing dict key does not move it, so ``agent_cards``
+        keeps its discovery order — entry point, tree, then profiles-only roles.
+        """
+        tc = _three_level_card()
+        tc.agent_profiles = [
+            _make_card("@AnotherWriter", "Writer"),
+            _make_card("@Specialist", "Specialist"),
+        ]
+
+        roles = [r.role for r in derive_team_projection(tc).agent_cards]
+
+        assert roles == ["Lead", "Analyst", "Junior", "Writer", "Specialist"]
+
     def test_two_members_sharing_a_role_give_two_refs_and_one_card(self) -> None:
         """AC 12: both identities are addressable; the card behind them is one."""
         tc = TeamCard(

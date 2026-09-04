@@ -211,13 +211,25 @@ def _collect_cards_by_role(team_card: TeamCard) -> tuple[dict[str, AgentCard], s
     """Collect one card per role, plus the set of roles that may be hired.
 
     Discovery order is entry point, then the member tree, then ``agent_profiles``
-    — ``TeamCard.agent_cards`` already walks the first two in that order. The
-    first card seen for a role wins; a role reachable from both the tree and
-    ``agent_profiles`` therefore yields one entry, marked hireable.
+    — ``TeamCard.agent_cards`` already walks the first two in that order — and it
+    fixes each role's POSITION in the result. Within the tree the first card seen
+    for a role wins.
+
+    **An ``agent_profiles`` card overrides a tree card of the same role.** The
+    profiles loop assigns rather than ``setdefault``s, so a role reachable from
+    both yields one entry carrying the PROFILE's card, at the position the tree
+    gave it (assignment on an existing key does not move it). The profile is the
+    author's declaration of what a newly hired agent of this role should be,
+    while the tree's card is what an already-instantiated member was built from;
+    the catalog describes the former. It is also the pre-epic behaviour — the
+    catalog used to hold profiles alone, so a hire of a dual-listed role has
+    always produced the profile's card, and widening what the catalog *describes*
+    was never meant to change what a hire *produces*.
 
     Note that ``AgentCard.role`` is a read-only property over ``config.role``,
     which is validated non-empty, while ``TeamCard.agent_cards`` is keyed by
-    ``config.name``. The two keys are not interchangeable.
+    ``config.name``. The two keys are not interchangeable — a profile card may
+    freely carry a different ``config.name`` than the tree card it overrides.
 
     Args:
         team_card: The card to walk.
@@ -232,7 +244,7 @@ def _collect_cards_by_role(team_card: TeamCard) -> tuple[dict[str, AgentCard], s
     hireable: set[str] = set()
     for card in team_card.agent_profiles:
         hireable.add(card.role)
-        by_role.setdefault(card.role, card)
+        by_role[card.role] = card
 
     return by_role, hireable
 

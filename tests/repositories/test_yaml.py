@@ -389,6 +389,72 @@ class TestYamlEventStoreYamlSpecific:
         (team_dir / "team.yaml").write_text("{{invalid: yaml: [}")
         assert store.load_team(team_id) is None
 
+    def test_an_unmigrated_team_yaml_logs_the_legible_reason(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC 13: the log line is the only place a resumer learns what happened.
+
+        ``load_team`` swallows any ``ValueError`` from validation into a
+        log-and-skip, so the caller sees ``None`` either way. The ``caplog``
+        assertion is the point of this test, not decoration: without the
+        before-validator the same line carries Pydantic's generic
+        "Field required" for ``entry_point``, which names neither the cause nor
+        the remedy.
+        """
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "team.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "team_id": str(team_id),
+                    "team_card": {"name": "pre-projection-team"},
+                    "status": TeamStatus.STOPPED.value,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
+            assert store.load_team(team_id) is None
+
+        corrupted = [r for r in caplog.records if "Corrupted team.yaml" in r.getMessage()]
+        assert corrupted
+        assert any("predates the structural projection" in r.getMessage() for r in corrupted)
+
+    def test_an_unmigrated_team_yaml_does_not_break_list_teams(self, tmp_path: Path) -> None:
+        """One unmigrated document must not take the whole listing down.
+
+        This is why the guard raises ``ValueError`` rather than something that
+        escapes the store's handler: ``list_teams`` walks every team directory
+        through the same validation, so an escaping error would turn a one-team
+        problem into a broken listing for the whole store.
+        """
+        store = YamlEventStore(tmp_path)
+        healthy = make_process()
+        store.save_team(healthy)
+
+        stale_id = uuid.uuid4()
+        stale_dir = tmp_path / str(stale_id)
+        stale_dir.mkdir()
+        (stale_dir / "team.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "team_id": str(stale_id),
+                    "team_card": {"name": "pre-projection-team"},
+                    "status": TeamStatus.STOPPED.value,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+
+        listed = store.list_teams()
+        assert [p.team_id for p in listed] == [healthy.team_id]
+
     def test_load_team_returns_none_for_undecodable_bytes(self, tmp_path: Path) -> None:
         """A ``team.yaml`` that is not valid UTF-8 returns None instead of raising.
 

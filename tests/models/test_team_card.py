@@ -356,8 +356,8 @@ class TestTeamCardSerialization:
         """TeamCard is a plain model, never Generic[...].
 
         A parameterised TeamCard[X] is a Pydantic-generated class with no stable
-        importable dotted path, which breaks the tagged-dict round-trip that
-        Process.team_card depends on to rebuild a team on resume.
+        importable dotted path, which breaks the tagged-dict round-trip every
+        stored copy of this card depends on — a catalog entry, the CLI's YAML.
         """
         assert TeamCard.__pydantic_generic_metadata__["parameters"] == ()
         assert TeamCard.__pydantic_generic_metadata__["origin"] is None

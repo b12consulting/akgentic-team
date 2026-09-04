@@ -25,7 +25,6 @@ from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
     Process,
-    TeamCard,
     TeamRuntime,
 )
 from akgentic.team.ports import EventStore
@@ -134,8 +133,7 @@ class TeamRestorer:
 
             # Build and return TeamRuntime
             runtime = self._build_team_runtime(
-                team_id,
-                process.team_card,
+                process,
                 result.orchestrator_addr,
                 result.addrs,
                 addr_map,
@@ -689,17 +687,22 @@ class TeamRestorer:
 
     def _build_team_runtime(
         self,
-        team_id: uuid.UUID,
-        team_card: TeamCard,
+        process: Process,
         orchestrator_addr: ActorAddress,
         addrs: dict[str, ActorAddress],
         addr_map: dict[uuid.UUID, ActorAddress],
     ) -> TeamRuntime:
         """Construct a TeamRuntime from restored components.
 
+        Every value comes off the stored structural projection — the record of
+        what was actually spawned — rather than off a nested ``TeamCard``
+        (ADR-26 §Decision 6). The supervisor names on ``process.supervisors``
+        are already the spawned ones: ``derive_team_projection`` expands
+        ``headcount`` when it builds each ref, so there is no expansion step
+        left here to forget.
+
         Args:
-            team_id: The team identifier.
-            team_card: The declarative team definition.
+            process: The persisted team record, carrying the projection.
             orchestrator_addr: Address of the restored orchestrator.
             addrs: Map of agent names to their actor addresses.
             addr_map: Pre-built mapping of agent_id to live ActorAddress
@@ -711,25 +714,25 @@ class TeamRestorer:
         Raises:
             ValueError: If the entry point agent is not found in addrs.
         """
-        entry_name = team_card.entry_point.card.config.name
+        entry_name = process.entry_point.name
 
         entry_addr = addrs.get(entry_name)
         if entry_addr is None:
             msg = f"Entry point agent '{entry_name}' not found after restore"
             raise ValueError(msg)
 
+        # A supervisor absent from addrs was fired during the team's life: its
+        # StopMessage is in the log, so it is deliberately not respawned. Skip
+        # it rather than failing — that is what keeps such a team resumable.
         supervisor_addrs: dict[str, ActorAddress] = {}
-        for card in team_card.supervisors:
-            name = card.config.name
-            if name in addrs:
-                supervisor_addrs[name] = addrs[name]
+        for ref in process.supervisors:
+            if ref.name in addrs:
+                supervisor_addrs[ref.name] = addrs[ref.name]
 
         runtime = TeamRuntime(
-            id=team_id,
-            # Still read off the team_card this method already holds; story 31-3
-            # switches the source to the stored projection.
-            team_name=team_card.name,
-            message_types=list(team_card.message_types),
+            id=process.team_id,
+            team_name=process.team_name,
+            message_types=list(process.message_types),
             actor_system=self._actor_system,
             orchestrator_addr=orchestrator_addr,
             entry_addr=entry_addr,

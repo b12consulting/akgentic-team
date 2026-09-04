@@ -187,14 +187,15 @@ class TeamFactory:
         ``TeamRestorer._rebuild_agents`` carries the same note for the restore
         path, where the widening landed first.
 
-        One precedence consequence, which changes here rather than in the
-        derivation: a role reachable from BOTH the member tree and
-        ``agent_profiles`` dedups to a single entry, and discovery order makes
-        the TREE's card the survivor. The registration this replaces carried
-        only ``agent_profiles``, so for such a role it carried the profile's
-        card. The catalog now describes the live member instead. Same role,
-        same hireable value, different card — and nothing reads the difference
-        today, because nothing reads the catalog to hire yet.
+        One precedence consequence, decided in the derivation and merely carried
+        here: a role reachable from BOTH the member tree and ``agent_profiles``
+        dedups to a single entry, and the PROFILE's card is the survivor. The
+        registration this replaces carried only ``agent_profiles``, so for such a
+        role it carried the profile's card too — the precedence is deliberately
+        the pre-epic one. A profile declares what a newly hired agent of that
+        role should be; the tree's card only records what one already-running
+        member was built from, and it would be the wrong thing to hand to
+        whoever asks the catalog what the role is.
 
         Derived through ``derive_team_projection`` rather than by a second walk
         of the card here: ``TeamManager.create_team`` derives the same

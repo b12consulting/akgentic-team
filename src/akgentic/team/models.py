@@ -7,6 +7,7 @@ Process, PersistedEvent, AgentStateSnapshot.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
@@ -63,7 +64,10 @@ class TeamCard(SerializableBaseModel):
             ``None`` when the team carries none. Declared as a field rather than
             a type parameter on purpose -- a parameterised ``TeamCard[X]`` has no
             importable dotted path, which would break the ``__model__``
-            round-trip ``Process.team_card`` exists to perform.
+            round-trip every ``SerializableBaseModel`` performs, and this card is
+            round-tripped wherever it is stored (a catalog entry, the CLI's YAML).
+            ``Process.metadata_type`` carries the same class for the same reason,
+            projected off this field at creation.
         welcome_message: Optional static greeting announced on the team's event
             stream when the team is first created. ``None`` disables it.
     """
@@ -205,8 +209,8 @@ class TeamRuntime(SerializableBaseModel):
     address's own role; and whether a target is a ``UserProxy`` comes from that
     target's ``ActorAddress`` — the actor's actual type, never a card's
     declaration, so the catalog is not on that path at all. That is what lets
-    the restore path build a runtime from the stored projection alone, once
-    story 31-3 stops reading ``Process.team_card`` (ADR-26 §Decision 6).
+    the restore path build a runtime from the stored projection alone: it does,
+    and ``Process`` no longer carries a card for it to read (ADR-26 §Decision 6).
 
     Attributes:
         id: Externally assigned unique identifier for this runtime instance.
@@ -558,12 +562,13 @@ class Process(SerializableBaseModel):
     never disagree with what a fresh team would produce (ADR-26). This is NOT the
     TeamRuntime -- addresses are stale after stop/crash.
 
-    ``team_card`` is still stored alongside the projection while the restore path
-    reads it; story 31-3 removes the field once it is the last reader.
+    The projection **replaced** the nested ``TeamCard`` rather than joining it:
+    the document no longer carries a second, drifting copy of the input the team
+    was built from. A record written before that change does not load — see
+    :meth:`reject_unmigrated_document`.
 
     Attributes:
         team_id: Unique identifier for this team instance.
-        team_card: Declarative team definition for rebuilding on resume.
         status: Current lifecycle state of the team.
         user_id: Identifier of the user who owns this team.
         user_email: Email of the user who owns this team.
@@ -595,7 +600,6 @@ class Process(SerializableBaseModel):
     """
 
     team_id: uuid.UUID = Field(description="Unique identifier for this team instance")
-    team_card: TeamCard = Field(description="Declarative team definition for rebuilding on resume")
     status: TeamStatus = Field(description="Current lifecycle state of the team")
     user_id: str = Field(default="cli", description="Identifier of the user who owns this team")
     user_email: str = Field(default="", description="Email of the user who owns this team")
@@ -652,6 +656,49 @@ class Process(SerializableBaseModel):
         default=None,
         description="Model class describing this team's business metadata, or None",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_unmigrated_document(cls, data: Any) -> Any:
+        """Refuse a stored document written before the structural projection.
+
+        ``mode="before"`` is the ONLY place the legacy marker is still visible.
+        Once ``team_card`` stopped being a field, the model's ``extra="ignore"``
+        drops the key silently, and what reaches the caller is Pydantic's
+        generic "Field required" for ``entry_point`` — which names neither the
+        cause nor the remedy. This says both.
+
+        The shape is recognised by BOTH halves: the mapping carries
+        ``team_card`` AND lacks ``entry_point``. A migrated document carries no
+        ``team_card`` at all, and requiring ``entry_point`` to be absent keeps
+        the guard from firing on a hybrid a migration might produce mid-write.
+
+        Deliberately raises ``ValueError`` (as Pydantic wraps it) rather than a
+        ``LookupError`` subclass. The backends catch ``ValueError`` from
+        validation, log it and skip the document, so ``load_team`` still returns
+        ``None`` and ``resume_team`` still raises ``Team {id} not found``. An
+        escaping error would also escape ``list_teams``, turning one unmigrated
+        team into a broken listing for the whole store.
+
+        Args:
+            data: Whatever Pydantic hands the validator. Only a mapping — the
+                stored-document path — is inspected; an existing ``Process`` or
+                any other input passes through untouched.
+
+        Returns:
+            *data* unchanged.
+
+        Raises:
+            ValueError: If *data* has the pre-projection shape.
+        """
+        if isinstance(data, Mapping) and "team_card" in data and "entry_point" not in data:
+            msg = (
+                "Process record predates the structural projection: it carries a "
+                "nested 'team_card' and no 'entry_point'. Run the projection "
+                "migration over this store before resuming its teams."
+            )
+            raise ValueError(msg)
+        return data
 
     @model_validator(mode="after")
     def reject_duplicate_card_roles(self) -> Process:

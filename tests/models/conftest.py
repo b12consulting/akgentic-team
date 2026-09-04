@@ -247,7 +247,6 @@ def make_process(
     optional: dict[str, Any] = {} if user_id is None else {"user_id": user_id}
     return Process(
         team_id=team_id or uuid.uuid4(),
-        team_card=tc,
         status=status,
         created_at=now,
         updated_at=now,

@@ -5,10 +5,12 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -30,6 +32,7 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.ports import NullServiceRegistry
+from akgentic.team.repositories.yaml import YamlEventStore
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
 from tests.conftest import projection_kwargs
@@ -188,7 +191,7 @@ class TestTeamManagerCreate:
         assert process.status == TeamStatus.RUNNING
         assert process.user_id == "test-user"
         assert process.user_email == "u@test.com"
-        assert process.team_card.name == "test-team"
+        assert process.team_name == "test-team"
 
         # Timestamps are set to reasonable values
         assert before - timedelta(seconds=1) <= process.created_at <= after + timedelta(seconds=1)
@@ -360,7 +363,6 @@ class TestTeamManagerStateMachine:
         tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
@@ -421,7 +423,6 @@ class TestTeamManagerServiceRegistry:
         tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.STOPPED,
             user_id="cli",
             user_email="",
@@ -571,7 +572,6 @@ class TestTeamManagerResume:
         tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
@@ -591,6 +591,40 @@ class TestTeamManagerResume:
         """AC 4: resume_team on non-existent team raises ValueError."""
         with pytest.raises(ValueError, match="not found"):
             manager.resume_team(uuid.uuid4())
+
+    def test_resume_of_an_unmigrated_team_still_reports_not_found(
+        self,
+        actor_system: ActorSystem,
+        tmp_path: Path,
+    ) -> None:
+        """AC 13: the caller-visible surface is deliberately UNCHANGED.
+
+        The legible reason reaches the store's log; the caller still gets the
+        same ``Team {id} not found`` it got before, because ``load_team``
+        log-and-skips any ``ValueError`` from validation. Pinned here so that
+        widening it — which would also change ``list_teams`` — has to be a
+        deliberate act rather than a side effect.
+        """
+        store = YamlEventStore(tmp_path)
+        mgr = TeamManager(actor_system=actor_system, event_store=store)
+
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "team.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "team_id": str(team_id),
+                    "team_card": {"name": "pre-projection-team"},
+                    "status": TeamStatus.STOPPED.value,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="not found"):
+            mgr.resume_team(team_id)
 
     def test_resume_registers_with_service_registry(
         self,
@@ -955,7 +989,6 @@ class TestTeamManagerStop:
         tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",

@@ -130,12 +130,11 @@ class TestInspectCommand:
         could never supply: ``TeamCard.agent_cards`` is a property and so is
         absent from its dump, leaving the old row permanently reading 0.
         """
-        process = make_process(
-            team_card=make_team_card(
-                member_names=["worker-a", "worker-b"],
-                member_roles=["WorkerA", "WorkerB"],
-            )
+        card = make_team_card(
+            member_names=["worker-a", "worker-b"],
+            member_roles=["WorkerA", "WorkerB"],
         )
+        process = make_process(team_card=card)
         assert process.team_description is None
         yaml_store.save_team(process)
 
@@ -147,9 +146,11 @@ class TestInspectCommand:
         assert "member_count" in result.output
         assert str(len(process.agent_cards)) in result.output
         assert len(process.agent_cards) == 3
-        # The blueprint's description must not leak into the team's own row.
-        assert process.team_card.description is not None
-        assert process.team_card.description not in result.output
+        # The blueprint's description must not leak into the team's own row. The
+        # card is held locally: the Process no longer carries one, which is the
+        # structural half of the same point.
+        assert card.description is not None
+        assert card.description not in result.output
 
     def test_inspect_nonexistent_team(
         self, cli_runner: CliRunner, data_dir: object

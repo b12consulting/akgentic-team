@@ -17,7 +17,7 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.core.messages.message import Message
+from akgentic.core.messages.message import Message, UserMessage
 from akgentic.core.messages.orchestrator import (
     ErrorMessage,
     EventMessage,
@@ -32,6 +32,7 @@ from akgentic.core.orchestrator import EventSubscriber, Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import Field
 
+from akgentic.team.factory import TeamFactory
 from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import (
     AgentStateSnapshot,
@@ -55,6 +56,10 @@ class StubAgent(Akgent[BaseConfig, BaseState]):
     """Minimal agent for restorer tests."""
 
     pass
+
+
+class _OtherStubAgent(Akgent[BaseConfig, BaseState]):
+    """A second agent class, so a card can declare one the live actor is not."""
 
 
 class _MarkerState(BaseState):
@@ -228,6 +233,7 @@ def _populate_stopped_team(
     team_card: TeamCard | None = None,
     extra_members: list[tuple[str, str]] | None = None,
     fired_members: list[tuple[str, str, uuid.UUID]] | None = None,
+    stopped_tree_members: list[str] | None = None,
     orchestrator_config: BaseConfig | None = None,
 ) -> tuple[uuid.UUID, Process]:
     """Populate InMemoryEventStore with events simulating a stopped team.
@@ -237,6 +243,11 @@ def _populate_stopped_team(
     leaves behind -- nothing deletes it).
 
     Args:
+        extra_members: ``(name, role)`` pairs given a StartMessage and no card —
+            the trace a runtime hire leaves in the log.
+        stopped_tree_members: Names of TREE members given a StopMessage, so the
+            restore path does not rebuild them although the projection still
+            carries a ref.
         orchestrator_config: Config persisted on the orchestrator's StartMessage.
             Defaults to ``BaseConfig(name="@Orchestrator", role="Orchestrator")``,
             which carries no squad -- so the default fixture cannot express a
@@ -278,6 +289,7 @@ def _populate_stopped_team(
 
     # Agent StartMessages -- from TeamCard tree
     agent_names: list[str] = []
+    tree_agent_ids: dict[str, uuid.UUID] = {}
 
     def _walk_member(
         member: TeamCardMember,
@@ -311,12 +323,48 @@ def _populate_stopped_team(
             )
         )
         agent_names.append(name)
+        tree_agent_ids[name] = agent_id
         for child in member.members:
             _walk_member(child, parent_agent_id=agent_id, parent_name=name, parent_role=role)
 
     _walk_member(tc.entry_point)
     for member in tc.members:
         _walk_member(member)
+
+    # Extra members: a StartMessage and NOTHING else — the trace a runtime hire
+    # leaves behind. The agent is in the event log and in no member tree, so it
+    # is rebuilt from the log while its ROLE reaches the catalog through
+    # agent_profiles. The two halves are independent, which is the point.
+    if extra_members:
+        for xname, xrole in extra_members:
+            seq += 1
+            xsm = _make_start_message(uuid.uuid4(), xname, xrole, team_id)
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=xsm,
+                    timestamp=datetime.now(UTC),
+                )
+            )
+
+    # Tree members fired during the team's life: a StopMessage against the
+    # agent_id its StartMessage already carried, so the restore path's filter
+    # matches. Unlike ``fired_members`` these ARE in the card, so the stored
+    # projection still carries a supervisor ref for them — which is exactly the
+    # shape that must resume rather than fail.
+    if stopped_tree_members:
+        for sname in stopped_tree_members:
+            sid = tree_agent_ids[sname]
+            seq += 1
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=_make_stop_message(sid, sname, "unused", team_id),
+                    timestamp=datetime.now(UTC),
+                )
+            )
 
     # Fired members: StartMessage + StopMessage, plus the snapshot that outlives
     # them. Omitting the snapshot made every fired-agent test vacuous: the restore
@@ -358,7 +406,6 @@ def _populate_stopped_team(
     now = datetime.now(UTC)
     process = Process(
         team_id=team_id,
-        team_card=tc,
         status=TeamStatus.STOPPED,
         user_id="test-user",
         user_email="test@test.com",
@@ -1412,7 +1459,6 @@ class TestRestorerOrphanFallback:
         now = datetime.now(UTC)
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.STOPPED,
             user_id="test-user",
             user_email="test@test.com",
@@ -1960,7 +2006,6 @@ class TestRestorerToolActorSpawnOrder:
         now = datetime.now(UTC)
         process = Process(
             team_id=team_id,
-            team_card=tc,
             status=TeamStatus.STOPPED,
             user_id="test-user",
             user_email="test@test.com",
@@ -2892,3 +2937,267 @@ class TestRestorerOrchestratorConfigPreserved:
         restored_config = actor_system.proxy_ask(runtime.orchestrator_addr, Orchestrator).config
         assert isinstance(restored_config, _ConfigWithExtraField)
         assert restored_config.extra_field == "sentinel"
+
+
+# ---------------------------------------------------------------------------
+# Tests: the runtime is built from the stored projection (FR6)
+# ---------------------------------------------------------------------------
+
+
+def _projection_team_card(
+    message_types: list[type] | None = None,
+    profiles: list[AgentCard] | None = None,
+) -> TeamCard:
+    """An entry point and two supervisors, with the fields FR6 now reads."""
+    return TeamCard(
+        name="projection-team",
+        description="Two supervisors and an entry point",
+        entry_point=_make_member("lead", "Lead"),
+        members=[_make_member("alpha", "Alpha"), _make_member("beta", "Beta")],
+        message_types=message_types or [],
+        agent_profiles=profiles or [],
+    )
+
+
+def _sent_recipients(
+    recording: RecordingSubscriber, since: int, expected: int
+) -> list[SentMessage]:
+    """Return the ``SentMessage``s recorded after *since*, once *expected* arrive.
+
+    ``TeamRuntime.send`` routes through a ``proxy_tell`` entry proxy and the
+    orchestrator notification is asynchronous, so the count is polled rather
+    than read once. Returning early on the expected count keeps a passing test
+    fast; the deadline is what makes a failing one finite.
+    """
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        sent = [m for m in recording.messages[since:] if isinstance(m, SentMessage)]
+        if len(sent) >= expected:
+            return sent
+        time.sleep(0.01)
+    return [m for m in recording.messages[since:] if isinstance(m, SentMessage)]
+
+
+class TestRestoreBuildsTheRuntimeFromTheProjection:
+    """FR6: ``_build_team_runtime`` reads the ``Process``, never a ``TeamCard``.
+
+    These tests assert what the restored runtime DOES. Nothing here claims that
+    hireability is enforced anywhere: ``can_be_hired`` is asserted as a value
+    the catalog carries, which is all it is.
+    """
+
+    def test_the_entry_point_and_every_supervisor_come_off_the_projection(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 2: name, entry point and supervisors, keyed by their spawned names."""
+        tc = _projection_team_card(message_types=[UserMessage])
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        runtime = TeamRestorer(actor_system, event_store).restore(process)
+
+        assert runtime.id == team_id
+        assert runtime.team_name == "projection-team"
+        assert runtime.message_types == [UserMessage]
+        assert runtime.entry_addr == runtime.addrs["lead"]
+        assert set(runtime.supervisor_addrs) == {"alpha", "beta"}
+        assert runtime.supervisor_addrs["alpha"] == runtime.addrs["alpha"]
+        assert runtime.supervisor_addrs["beta"] == runtime.addrs["beta"]
+
+    def test_send_reaches_every_supervisor_after_a_resume(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 2: the addresses are not merely present, they are routable."""
+        tc = _projection_team_card(message_types=[UserMessage])
+        _team_id, process = _populate_stopped_team(event_store, tc)
+
+        recording = RecordingSubscriber()
+        runtime = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        baseline = len(recording.messages)
+        runtime.send("hello")
+
+        sent = _sent_recipients(recording, baseline, expected=2)
+        assert {m.recipient.name for m in sent} == {"alpha", "beta"}
+
+    def test_a_preformed_message_is_passed_through_unwrapped(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 2: ``send(Message)`` still bypasses the default-type wrapping."""
+        tc = _projection_team_card(message_types=[UserMessage])
+        _team_id, process = _populate_stopped_team(event_store, tc)
+
+        recording = RecordingSubscriber()
+        runtime = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        baseline = len(recording.messages)
+        runtime.send(UserMessage(content="preformed"))
+
+        sent = _sent_recipients(recording, baseline, expected=2)
+        assert {m.message.content for m in sent} == {"preformed"}
+
+    def test_a_str_is_wrapped_in_the_projections_message_type(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 3: the stored ``message_types`` decides what a ``str`` becomes."""
+        tc = _projection_team_card(message_types=[UserMessage])
+        _team_id, process = _populate_stopped_team(event_store, tc)
+
+        recording = RecordingSubscriber()
+        runtime = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        baseline = len(recording.messages)
+        runtime.send("wrap me")
+
+        sent = _sent_recipients(recording, baseline, expected=2)
+        assert sent
+        assert all(isinstance(m.message, UserMessage) for m in sent)
+        assert all(m.message.content == "wrap me" for m in sent)
+
+    def test_an_empty_message_types_refuses_a_str_but_takes_a_message(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 3: the other half — no declared type is a real, distinct state.
+
+        Together with the spec above this is what makes the field's SOURCE
+        observable: one team wraps, one refuses, and only ``process.message_types``
+        tells them apart.
+        """
+        tc = _projection_team_card()
+        _team_id, process = _populate_stopped_team(event_store, tc)
+        assert process.message_types == []
+
+        recording = RecordingSubscriber()
+        runtime = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        with pytest.raises(RuntimeError, match="No message type declared for this team"):
+            runtime.send("hi")
+
+        baseline = len(recording.messages)
+        runtime.send(UserMessage(content="explicit"))
+        sent = _sent_recipients(recording, baseline, expected=2)
+        assert {m.message.content for m in sent} == {"explicit"}
+
+    def test_a_supervisor_that_was_not_rebuilt_is_skipped_not_fatal(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 4: a fired supervisor keeps its ref; the team must still resume."""
+        tc = _projection_team_card(message_types=[UserMessage])
+        _team_id, process = _populate_stopped_team(
+            event_store, tc, stopped_tree_members=["beta"]
+        )
+
+        # The projection still carries the ref — that is what makes the skip
+        # necessary rather than academic.
+        assert {r.name for r in process.supervisors} == {"alpha", "beta"}
+
+        recording = RecordingSubscriber()
+        runtime = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        assert "beta" not in runtime.addrs
+        assert set(runtime.supervisor_addrs) == {"alpha"}
+
+        baseline = len(recording.messages)
+        runtime.send("still routable")
+        sent = _sent_recipients(recording, baseline, expected=1)
+        assert {m.recipient.name for m in sent} == {"alpha"}
+
+    def test_a_runtime_hire_is_restored_and_its_role_is_in_the_catalog(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 5: the AGENT comes from the log, its ROLE from ``agent_profiles``.
+
+        The hired agent appears in no member tree — a hire leaves only a
+        StartMessage behind. Its card was never projected as a member, so the
+        catalog entry for ``Specialist`` is the profile's, which is precisely
+        where the hired card came from. ``can_be_hired`` is asserted as the
+        value the catalog carries; nothing reads it.
+        """
+        tc = _projection_team_card(
+            message_types=[UserMessage],
+            profiles=[_make_card("specialist-profile", "Specialist")],
+        )
+        _team_id, process = _populate_stopped_team(
+            event_store, tc, extra_members=[("hired-one", "Specialist")]
+        )
+
+        runtime = TeamRestorer(actor_system, event_store).restore(process)
+
+        # Half one: the agent, rebuilt from the event log (NFR4, unchanged).
+        assert "hired-one" in runtime.addrs
+        assert runtime.addrs["hired-one"].is_alive()
+        assert runtime.orchestrator_proxy.get_team_member("hired-one") is not None
+
+        # Half two: the role, in the catalog, alongside every tree role.
+        flags = {c.role: c.can_be_hired for c in runtime.orchestrator_proxy.get_agent_catalog()}
+        assert flags == {
+            "Lead": False,
+            "Alpha": False,
+            "Beta": False,
+            "Specialist": True,
+        }
+
+    def test_the_profiles_card_reaches_the_restored_catalog(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 16, resume path: the same precedence the create path applies."""
+        profile = _make_card("alpha-profile", "Alpha")
+        profile.description = "Hired to be Alpha, not the one already being Alpha"
+        profile.skills = ["substitution"]
+        tc = _projection_team_card(message_types=[UserMessage], profiles=[profile])
+        _team_id, process = _populate_stopped_team(event_store, tc)
+
+        runtime = TeamRestorer(actor_system, event_store).restore(process)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        entry = next(c for c in catalog if c.role == "Alpha")
+        assert entry.description == profile.description
+        assert entry.skills == profile.skills
+
+    def test_a_profile_naming_the_entry_points_role_leaves_send_working(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """AC 18: the trap — the profile's card becomes what _entry_proxy resolves.
+
+        ``TeamRuntime.model_post_init`` looks the entry point's agent class up in
+        the catalog by role, so a profile that names the entry point's role
+        supplies it — including a DIFFERENT ``agent_class`` than the live entry
+        member was spawned with, which is the sharp form of the trap. Measured on
+        BOTH paths rather than special-cased inside the dedup.
+        """
+        entry_profile = _make_card("lead-profile", "Lead", agent_class=_OtherStubAgent)
+        entry_profile.description = "The role a new Lead would be hired into"
+        assert entry_profile.get_agent_class() is not _make_card("lead", "Lead").get_agent_class()
+        tc = _projection_team_card(message_types=[UserMessage], profiles=[entry_profile])
+
+        # Create path.
+        built = TeamFactory.build(tc, actor_system)
+        built_catalog = built.orchestrator_proxy.get_agent_catalog()
+        assert next(c for c in built_catalog if c.role == "Lead").description == (
+            entry_profile.description
+        )
+        assert set(built.supervisor_addrs) == {"alpha", "beta"}
+        built.send("after a create")
+        built.orchestrator_proxy.stop(GRACE_TIMEOUT_SECONDS).wait()
+
+        # Resume path.
+        _team_id, process = _populate_stopped_team(event_store, tc)
+        recording = RecordingSubscriber()
+        resumed = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        assert set(resumed.supervisor_addrs) == {"alpha", "beta"}
+        baseline = len(recording.messages)
+        resumed.send("after a resume")
+        sent = _sent_recipients(recording, baseline, expected=2)
+        assert {m.recipient.name for m in sent} == {"alpha", "beta"}

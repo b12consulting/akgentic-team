@@ -236,7 +236,6 @@ class TeamManager:
         now = datetime.now(UTC)
         process = Process(
             team_id=team_id,
-            team_card=team_card,
             status=TeamStatus.RUNNING,
             user_id=user_id,
             user_email=user_email,

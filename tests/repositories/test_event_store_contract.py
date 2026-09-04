@@ -177,7 +177,7 @@ class TestEventStoreContract:
         assert loaded is not None
         assert loaded.team_id == process.team_id
         assert loaded.status == process.status
-        assert loaded.team_card.name == process.team_card.name
+        assert loaded.team_name == process.team_name
         assert loaded.created_at == process.created_at
 
     def test_load_team_returns_none_when_missing(self, event_store: EventStore) -> None:
