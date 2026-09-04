@@ -30,6 +30,7 @@ from akgentic.team.models import (
     TeamCardMember,
     TeamRuntime,
     TeamStatus,
+    spawned_names,
 )
 from akgentic.team.ports import NullServiceRegistry
 from akgentic.team.repositories.yaml import YamlEventStore
@@ -275,6 +276,31 @@ class TestTeamManagerCreate:
             "Analyst": True,
         }
 
+    def test_the_stored_supervisors_and_the_runtime_agree_on_a_headcount_member(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """FR7 (31-4): the persisted record and the live fan-out are keyed alike.
+
+        The ``Process`` half of this is a NON-REGRESSION pin, not a reproduction:
+        ``derive_team_projection`` has expanded ``headcount`` through
+        ``spawned_names`` since 31-1 (FR3a), so the three refs were already
+        correct before this story. What 31-4 changes is the other side of the
+        equality — ``supervisor_addrs`` — and asserting them equal is what stops
+        the two records drifting apart again.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+
+        runtime = manager.create_team(tc, user_id="test-user")
+
+        process = event_store.load_team(runtime.id)
+        assert process is not None
+        stored = {ref.name for ref in process.supervisors}
+        assert stored == {"worker_0", "worker_1", "worker_2"}
+        assert stored == set(runtime.supervisor_addrs)
+
 
 # ---------------------------------------------------------------------------
 # Tests: get_team
@@ -492,29 +518,39 @@ def _create_and_stop_team(
 
     # Inject StartMessages for all agents in the TeamCard tree
     def _inject_member(member: TeamCardMember) -> None:
+        """Inject one StartMessage per SPAWNED actor, not one per member slot.
+
+        A member declared ``headcount=3`` is three live actors named
+        ``<name>_0..2``. Under the bare declared name the lookup below missed,
+        fell back to a random UUID belonging to no live actor, and the synthetic
+        log described an agent the factory never spawned. The expansion is a
+        no-op for every ``headcount == 1`` member.
+        """
         nonlocal seq
-        name = member.card.config.name
         role = member.card.config.role
         agent_class = member.card.get_agent_class()
-        addr = runtime.addrs.get(name)
-        agent_id = addr.agent_id if addr else uuid.uuid4()
-        seq += 1
-        addr_dict: ActorAddressDict = {
-            "__actor_address__": True,
-            "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
-            "agent_id": str(agent_id),
-            "name": name,
-            "role": role,
-            "team_id": str(team_id),
-            "squad_id": str(uuid.uuid4()),
-            "user_message": False,
-        }
-        sm = StartMessage(config=member.card.get_config_copy())
-        sm.sender = ActorAddressProxy(addr_dict)
-        sm.team_id = team_id
-        event_store.save_event(PersistedEvent(
-            team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
-        ))
+        for name in spawned_names(member):
+            addr = runtime.addrs.get(name)
+            agent_id = addr.agent_id if addr else uuid.uuid4()
+            config = member.card.get_config_copy()
+            config.name = name
+            seq += 1
+            addr_dict: ActorAddressDict = {
+                "__actor_address__": True,
+                "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
+                "agent_id": str(agent_id),
+                "name": name,
+                "role": role,
+                "team_id": str(team_id),
+                "squad_id": str(uuid.uuid4()),
+                "user_message": False,
+            }
+            sm = StartMessage(config=config)
+            sm.sender = ActorAddressProxy(addr_dict)
+            sm.team_id = team_id
+            event_store.save_event(PersistedEvent(
+                team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
+            ))
         for child in member.members:
             _inject_member(child)
 
@@ -1461,34 +1497,37 @@ def _create_and_stop_team_with_namespace(
     )
 
     def _inject_member(member: TeamCardMember) -> None:
+        """One StartMessage per SPAWNED actor — see ``_create_and_stop_team``."""
         nonlocal seq
-        name = member.card.config.name
         role = member.card.config.role
         agent_class = member.card.get_agent_class()
-        addr = runtime.addrs.get(name)
-        agent_id = addr.agent_id if addr else uuid.uuid4()
-        seq += 1
-        addr_dict: ActorAddressDict = {
-            "__actor_address__": True,
-            "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
-            "agent_id": str(agent_id),
-            "name": name,
-            "role": role,
-            "team_id": str(team_id),
-            "squad_id": str(uuid.uuid4()),
-            "user_message": False,
-        }
-        sm = StartMessage(config=member.card.get_config_copy())
-        sm.sender = ActorAddressProxy(addr_dict)
-        sm.team_id = team_id
-        event_store.save_event(
-            PersistedEvent(
-                team_id=team_id,
-                sequence=seq,
-                event=sm,
-                timestamp=datetime.now(UTC),
+        for name in spawned_names(member):
+            addr = runtime.addrs.get(name)
+            agent_id = addr.agent_id if addr else uuid.uuid4()
+            config = member.card.get_config_copy()
+            config.name = name
+            seq += 1
+            addr_dict: ActorAddressDict = {
+                "__actor_address__": True,
+                "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
+                "agent_id": str(agent_id),
+                "name": name,
+                "role": role,
+                "team_id": str(team_id),
+                "squad_id": str(uuid.uuid4()),
+                "user_message": False,
+            }
+            sm = StartMessage(config=config)
+            sm.sender = ActorAddressProxy(addr_dict)
+            sm.team_id = team_id
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=sm,
+                    timestamp=datetime.now(UTC),
+                )
             )
-        )
         for child in member.members:
             _inject_member(child)
 

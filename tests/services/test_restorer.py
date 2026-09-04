@@ -42,6 +42,7 @@ from akgentic.team.models import (
     TeamCardMember,
     TeamRuntime,
     TeamStatus,
+    spawned_names,
 )
 from akgentic.team.restorer import GRACE_TIMEOUT_SECONDS, TeamRestorer
 from tests.conftest import projection_kwargs, seed_agent_cards
@@ -228,6 +229,61 @@ def _make_stop_message(
     return msg
 
 
+def _emit_member_instances(
+    event_store: InMemoryEventStore,
+    member: TeamCardMember,
+    team_id: uuid.UUID,
+    first_seq: int,
+    parent_id: uuid.UUID,
+    parent_name: str,
+    parent_role: str,
+) -> dict[str, uuid.UUID]:
+    """Save one StartMessage per SPAWNED actor of *member*, not one per slot.
+
+    A real team's log holds one StartMessage per actor, and a member declared
+    ``headcount=3`` is three actors named ``<name>_0..2``. A single event under
+    the bare declared name describes an agent no factory would ever spawn, so
+    the restore rebuilds THAT while the projection asks for the indexed names —
+    a resume failure with a fixture cause that looks exactly like a production
+    one. The expansion is a no-op for every ``headcount == 1`` member.
+
+    Args:
+        first_seq: Sequence number of the FIRST event saved here; each further
+            instance takes the next one.
+
+    Returns:
+        The ``agent_id`` minted for each spawned name, in spawn order.
+    """
+    role = member.card.config.role
+    agent_class = member.card.get_agent_class()
+    instance_ids: dict[str, uuid.UUID] = {}
+    for offset, name in enumerate(spawned_names(member)):
+        agent_id = uuid.uuid4()
+        config = member.card.get_config_copy()
+        config.name = name
+        sm = _make_start_message(
+            agent_id,
+            name,
+            role,
+            team_id,
+            agent_class=agent_class,
+            config=config,
+            parent_id=parent_id,
+            parent_name=parent_name,
+            parent_role=parent_role,
+        )
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=first_seq + offset,
+                event=sm,
+                timestamp=datetime.now(UTC),
+            )
+        )
+        instance_ids[name] = agent_id
+    return instance_ids
+
+
 def _populate_stopped_team(
     event_store: InMemoryEventStore,
     team_card: TeamCard | None = None,
@@ -298,34 +354,28 @@ def _populate_stopped_team(
         parent_role: str = "Orchestrator",
     ) -> None:
         nonlocal seq
-        name = member.card.config.name
-        role = member.card.config.role
-        agent_id = uuid.uuid4()
-        agent_class = member.card.get_agent_class()
-        seq += 1
-        sm = _make_start_message(
-            agent_id,
-            name,
-            role,
+        instance_ids = _emit_member_instances(
+            event_store,
+            member,
             team_id,
-            agent_class=agent_class,
-            config=member.card.get_config_copy(),
+            first_seq=seq + 1,
             parent_id=parent_agent_id or orch_id,
             parent_name=parent_name,
             parent_role=parent_role,
         )
-        event_store.save_event(
-            PersistedEvent(
-                team_id=team_id,
-                sequence=seq,
-                event=sm,
-                timestamp=datetime.now(UTC),
-            )
-        )
-        agent_names.append(name)
-        tree_agent_ids[name] = agent_id
+        seq += len(instance_ids)
+        agent_names.extend(instance_ids)
+        tree_agent_ids.update(instance_ids)
+        # Subordinates hang off the LAST spawned instance, mirroring
+        # ``TeamFactory._spawn_member``.
+        last_name = next(reversed(instance_ids))
         for child in member.members:
-            _walk_member(child, parent_agent_id=agent_id, parent_name=name, parent_role=role)
+            _walk_member(
+                child,
+                parent_agent_id=instance_ids[last_name],
+                parent_name=last_name,
+                parent_role=member.card.config.role,
+            )
 
     _walk_member(tc.entry_point)
     for member in tc.members:
@@ -3221,3 +3271,52 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         sent = _sent_recipients(recording, baseline, expected=2)
         assert len(sent) == 2
         assert {m.recipient.name for m in sent} == {"alpha", "beta"}
+
+    def test_a_headcount_supervisor_survives_create_stop_resume(
+        self, actor_system: ActorSystem, event_store: InMemoryEventStore
+    ) -> None:
+        """FR7 (31-4): the restore path needs no expansion of its own.
+
+        ``_build_team_runtime`` iterates ``process.supervisors`` and keys on
+        ``ref.name``, and those refs have been SPAWNED names since 31-1 — there
+        is no declared name left on that path to mismatch. So this is a
+        non-regression pin measured on both paths, not a second fix:
+        ``restorer.py`` is unchanged by this story. Its surviving
+        ``if ref.name in addrs`` guard is a different one — a supervisor fired
+        during the team's life is deliberately not respawned — and stays.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = TeamCard(
+            name="headcount-team",
+            description="One multi-instance supervisor",
+            entry_point=_make_member("lead", "Lead"),
+            members=[crew],
+            message_types=[UserMessage],
+        )
+        expected = {"worker_0", "worker_1", "worker_2"}
+
+        # Create path.
+        built_recording = RecordingSubscriber()
+        built = TeamFactory.build(tc, actor_system, [built_recording])
+        assert set(built.supervisor_addrs) == expected
+        built_baseline = len(built_recording.messages)
+        built.send("after a create")
+        built_sent = _sent_recipients(built_recording, built_baseline, expected=3)
+        assert len(built_sent) == 3
+        assert {m.recipient.name for m in built_sent} == expected
+        built.orchestrator_proxy.stop(GRACE_TIMEOUT_SECONDS).wait()
+
+        # Resume path.
+        _team_id, process = _populate_stopped_team(event_store, tc)
+        assert {ref.name for ref in process.supervisors} == expected
+        recording = RecordingSubscriber()
+        resumed = TeamRestorer(actor_system, event_store).restore(
+            process, subscribers=[recording]
+        )
+
+        assert set(resumed.supervisor_addrs) == expected
+        baseline = len(recording.messages)
+        resumed.send("after a resume")
+        sent = _sent_recipients(recording, baseline, expected=3)
+        assert len(sent) == 3
+        assert {m.recipient.name for m in sent} == expected

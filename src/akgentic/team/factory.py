@@ -13,7 +13,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.core.orchestrator import STOP_TIMEOUT, EventSubscriber, Orchestrator
 from akgentic.team.messages import WelcomeMessage
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime, spawned_names
 from akgentic.team.projection import derive_team_projection
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,14 @@ class TeamFactory:
         Catalog registration precedes the ``TeamRuntime`` construction and may
         not be reordered: the runtime resolves its entry-point agent class out
         of the catalog on construction.
+
+        Every name the returned runtime records — ``entry_addr``, the keys of
+        ``supervisor_addrs`` — comes from :func:`spawned_names`, the single
+        statement of the naming rule ``_spawn_member`` performs. A supervisor
+        declared with ``headcount=3`` therefore contributes its three spawned
+        names to ``supervisor_addrs``, so ``TeamRuntime.send`` reaches all
+        three, and those keys equal the ``Process.supervisors`` names
+        ``derive_team_projection`` builds through the same function.
 
         Args:
             team_card: Declarative team definition with entry point and members.
@@ -91,8 +99,14 @@ class TeamFactory:
             )
             TeamFactory._register_subscribers(orchestrator_proxy, subscribers)
 
-            # 3. Walk TeamCard tree and spawn all agents
+            # 3. Walk TeamCard tree and spawn all agents, recording the first
+            #    layer as it goes. ``supervisor_addrs`` is keyed by the names
+            #    the spawn actually used, which ``spawned_names`` states once
+            #    for both this and ``derive_team_projection``: matching on the
+            #    DECLARED ``config.name`` dropped every ``headcount > 1``
+            #    supervisor out of ``send()``'s fan-out silently.
             addrs: dict[str, ActorAddress] = {}
+            supervisor_addrs: dict[str, ActorAddress] = {}
             entry_addr: ActorAddress | None = None
 
             # Spawn entry point through orchestrator
@@ -103,8 +117,7 @@ class TeamFactory:
                 spawned_addrs,
             )
             addrs.update(entry_addrs)
-            # Entry point always has headcount=1, so use the card name
-            entry_addr = entry_addrs[team_card.entry_point.card.config.name]
+            entry_addr = entry_addrs[spawned_names(team_card.entry_point)[0]]
 
             # Spawn top-level members through orchestrator
             for member in team_card.members:
@@ -115,18 +128,18 @@ class TeamFactory:
                     spawned_addrs,
                 )
                 addrs.update(member_addrs)
+                # Index the member's OWN result: ``_spawn_member`` returns the
+                # member plus its whole subtree, and the first layer is what
+                # ``supervisor_addrs`` is. Unguarded on purpose — a name the
+                # rule produces that the spawn did not is a defect, not an
+                # entry to skip.
+                for name in spawned_names(member):
+                    supervisor_addrs[name] = member_addrs[name]
 
             # 4. Register the team's whole role catalog with the orchestrator.
             TeamFactory._register_role_catalog(orchestrator_proxy, team_card)
 
-            # 5. Build supervisor_addrs
-            supervisor_addrs: dict[str, ActorAddress] = {}
-            for card in team_card.supervisors:
-                name = card.config.name
-                if name in addrs:
-                    supervisor_addrs[name] = addrs[name]
-
-            # 5.b Announce the team's welcome message
+            # 5. Announce the team's welcome message
             # Hand the orchestrator a SentMessage wrapping a WelcomeMessage.
             # The orchestrator's receiveMsg_SentMessage records it on the event
             # log and broadcasts it to every subscriber (CLI printer,

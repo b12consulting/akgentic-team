@@ -14,7 +14,8 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.core.messages.message import Message
+from akgentic.core.messages.message import Message, UserMessage
+from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.team.factory import GRACE_TIMEOUT_SECONDS, TeamFactory
@@ -673,3 +674,102 @@ class TestSpawnedNamesMatchesTheFactory:
                     f"spawned: {sorted(runtime.addrs)}"
                 )
         assert spawned_names(crew) == ["worker_0", "worker_1", "worker_2"]
+
+
+def _sent_recipients(
+    subscriber: StubSubscriber, since: int, expected: int
+) -> list[SentMessage]:
+    """Return the ``SentMessage``s recorded after *since*, once *expected* arrive.
+
+    ``TeamRuntime.send`` routes through a fire-and-forget ``proxy_tell`` entry
+    proxy and the orchestrator notification is asynchronous, so the count is
+    polled rather than read once. Returning early on the expected count keeps a
+    passing test fast; the deadline is what makes a failing one finite.
+
+    On timeout this returns whatever DID arrive rather than failing, so every
+    caller pins ``len(...)`` as well as the recipients — a set of one value is
+    equal to a set of three identical ones, so a partial delivery reads as a
+    pass without the count.
+    """
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        sent = [m for m in subscriber.messages[since:] if isinstance(m, SentMessage)]
+        if len(sent) >= expected:
+            return sent
+        time.sleep(0.01)
+    return [m for m in subscriber.messages[since:] if isinstance(m, SentMessage)]
+
+
+class TestASupervisorDeclaredWithHeadcountReachesTheFanOut:
+    """FR7: ``supervisor_addrs`` is keyed by SPAWNED names, not declared ones.
+
+    A supervisor declared ``headcount=3`` is spawned as ``worker_0..2``, so a
+    construction that matches the bare ``config.name`` never finds it and
+    ``send()`` silently never reaches it.
+    """
+
+    def test_a_headcount_supervisor_contributes_one_entry_per_instance(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The three spawned names are the keys; the declared name is nowhere."""
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert set(runtime.supervisor_addrs) == {"worker_0", "worker_1", "worker_2"}
+        for name in ("worker_0", "worker_1", "worker_2"):
+            assert runtime.supervisor_addrs[name] == runtime.addrs[name]
+        assert "worker" not in runtime.supervisor_addrs
+        assert "worker" not in runtime.addrs
+
+    def test_the_expansion_leaves_the_layer_boundary_where_it_was(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """Expanded, ``supervisor_addrs`` is still the first layer of members.
+
+        The entry point is the sender, not a recipient, and a second-layer
+        subordinate is internal to its supervisor's subtree. Neither joins the
+        fan-out because a sibling member happens to be multi-instance.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        junior = _make_member("junior", "Junior")
+        solo = _make_member("scribe", "Scribe", members=[junior])
+        tc = _make_team_card(members=[crew, solo])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert set(runtime.supervisor_addrs) == {
+            "worker_0",
+            "worker_1",
+            "worker_2",
+            "scribe",
+        }
+        assert "lead" not in runtime.supervisor_addrs
+        assert "junior" not in runtime.supervisor_addrs
+        # The subordinate WAS spawned — it is excluded by layer, not missing.
+        assert "junior" in runtime.addrs
+
+    def test_send_reaches_every_instance_of_a_headcount_supervisor(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The symptom: the send is RECORDED, not merely called.
+
+        ``send`` routes through ``ActorSystem.proxy_tell``, which casts and
+        discards the actor type it is handed, so a call that does not raise
+        proves nothing. ``len(sent)`` is pinned alongside the recipient set
+        because a set comparison alone cannot tell a full delivery from a
+        partial one.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+        tc.message_types = [UserMessage]
+        recording = StubSubscriber()
+
+        runtime = TeamFactory.build(tc, actor_system, subscribers=[recording])
+        baseline = len(recording.messages)
+        runtime.send("staff the whole crew")
+
+        sent = _sent_recipients(recording, baseline, expected=3)
+        assert len(sent) == 3
+        assert {m.recipient.name for m in sent} == {"worker_0", "worker_1", "worker_2"}
