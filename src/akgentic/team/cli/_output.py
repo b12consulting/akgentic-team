@@ -27,7 +27,7 @@ console = Console()
 # Column definitions for Process list view: (field_path, header_label)
 _TABLE_COLUMNS: list[tuple[str, str]] = [
     ("team_id", "Team ID"),
-    ("team_card.name", "Name"),
+    ("team_name", "Name"),
     ("status", "Status"),
     ("created_at", "Created"),
     ("updated_at", "Updated"),
@@ -47,7 +47,7 @@ def _get_field_value(model: BaseModel, dotted_path: str) -> str:
 
     Args:
         model: The Pydantic model instance.
-        dotted_path: A dot-separated field path (e.g. ``"team_card.name"``).
+        dotted_path: A dot-separated field path (e.g. ``"metadata.tenant"``).
 
     Returns:
         String representation of the resolved value.
@@ -109,12 +109,13 @@ def _render_detail_table(
     table.add_column("Value")
 
     data = entry.model_dump(mode="json")
-    team_card = data.get("team_card", {})
-    agent_cards = team_card.get("agent_cards", {})
+    # Read the Process projection, not the nested card: the projection records
+    # what the team actually is, and the card is on its way out (story 31-3).
+    agent_cards = data.get("agent_cards", [])
 
     table.add_row("team_id", str(data.get("team_id", "")))
-    table.add_row("name", str(team_card.get("name", "")))
-    table.add_row("description", str(team_card.get("description", "")))
+    table.add_row("name", str(data.get("team_name") or ""))
+    table.add_row("description", str(data.get("team_description") or ""))
     table.add_row("status", str(data.get("status", "")))
     table.add_row("user_id", str(data.get("user_id", "")))
     table.add_row("user_email", str(data.get("user_email", "")))

@@ -18,7 +18,7 @@ from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.team.factory import GRACE_TIMEOUT_SECONDS, TeamFactory
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime, spawned_names
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -530,3 +530,33 @@ class TestFactoryRollbackWaitsOnOrchestrator:
         assert events.index("orchestrator-wait") == len(events) - 1, (
             f"orchestrator wait must be last (after agent stops): {events}"
         )
+
+
+class TestSpawnedNamesMatchesTheFactory:
+    """AC 15: the projection's naming rule and the factory's spawning agree."""
+
+    def test_every_name_the_rule_produces_is_a_live_agent(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The projection records spawned names; a divergence must go red here.
+
+        ``spawned_names`` states the ``headcount`` expansion once, and
+        ``TeamFactory._spawn_member`` performs it. Nothing but this test holds
+        the two together — 31-4 makes the factory call the function, and until
+        then a drift would only surface as a supervisor silently missing from
+        ``send()``'s fan-out at runtime.
+        """
+        entry = _make_member("lead", "Lead")
+        crew = _make_member("worker", "Worker", headcount=3)
+        solo = _make_member("scribe", "Scribe")
+        tc = _make_team_card(entry_point=entry, members=[crew, solo])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        for member in (entry, crew, solo):
+            for name in spawned_names(member):
+                assert name in runtime.addrs, (
+                    f"spawned_names produced '{name}', which the factory never "
+                    f"spawned: {sorted(runtime.addrs)}"
+                )
+        assert spawned_names(crew) == ["worker_0", "worker_1", "worker_2"]

@@ -32,6 +32,7 @@ from akgentic.team.models import (
 from akgentic.team.ports import NullServiceRegistry
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
+from tests.conftest import projection_kwargs
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -308,15 +309,7 @@ class TestTeamManagerStateMachine:
         # Manually transition to STOPPED
         process = event_store.load_team(runtime.id)
         assert process is not None
-        stopped_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.STOPPED,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=process.updated_at,
-        )
+        stopped_process = process.model_copy(update={"status": TeamStatus.STOPPED})
         event_store.save_team(stopped_process)
 
         manager.delete_team(runtime.id)
@@ -341,14 +334,16 @@ class TestTeamManagerStateMachine:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
+            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -400,14 +395,16 @@ class TestTeamManagerServiceRegistry:
             instance_id=instance_id,
         )
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
+            team_card=tc,
             status=TeamStatus.STOPPED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -548,14 +545,16 @@ class TestTeamManagerResume:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
+            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -930,14 +929,16 @@ class TestTeamManagerStop:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
+            team_card=tc,
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 

@@ -29,6 +29,7 @@ from akgentic.team.manager import TeamManager
 from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamCardMember, TeamRuntime, TeamStatus
 from akgentic.team.ports import NullServiceRegistry
+from tests.conftest import projection_kwargs
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -189,9 +190,10 @@ def _fully_populated_process() -> Process:
     path off the orchestrator push, which this record has no live actors for.
     """
     metadata = AcmeCaseMetadata(tenant="acme", channel="email", case_ref="c-1", note="n-1")
+    tc = _make_team_card(name="acme-original")
     return Process(
         team_id=uuid.uuid4(),
-        team_card=_make_team_card(name="acme-original"),
+        team_card=tc,
         status=TeamStatus.STOPPED,
         user_id="u-1",
         user_email="u@acme.test",
@@ -200,6 +202,7 @@ def _fully_populated_process() -> Process:
         catalog_namespace="ns-1",
         metadata=metadata,
         metadata_indexes=derive_metadata_indexes(metadata),
+        **projection_kwargs(tc),
     )
 
 
@@ -619,13 +622,15 @@ class TestUpdateTeamMetadata:
         """AC 16: a deleted team cannot be resurrected through the metadata path."""
         team_id = uuid.uuid4()
         now = datetime.now(UTC)
+        tc = _make_team_card()
         event_store.save_team(
             Process(
                 team_id=team_id,
-                team_card=_make_team_card(),
+                team_card=tc,
                 status=TeamStatus.DELETED,
                 created_at=now,
                 updated_at=now,
+                **projection_kwargs(tc),
             )
         )
         writes_before = event_store.save_team_calls

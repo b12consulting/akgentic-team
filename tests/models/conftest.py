@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock
 
 from akgentic.core.actor_address import ActorAddress
@@ -25,6 +26,7 @@ from akgentic.team.models import (
     TeamRuntime,
     TeamStatus,
 )
+from tests.conftest import projection_kwargs
 
 
 def make_agent_card(
@@ -208,28 +210,20 @@ def make_process(
         A Process with the specified or default configuration.
     """
     now = datetime.now(UTC)
-    if user_id is None:
-        # Omit user_id so the field defaults to "cli" per Process.user_id.
-        return Process(
-            team_id=team_id or uuid.uuid4(),
-            team_card=team_card or make_team_card(),
-            status=status,
-            created_at=now,
-            updated_at=now,
-            catalog_namespace=catalog_namespace,
-            metadata=metadata,
-            metadata_indexes=metadata_indexes or [],
-        )
+    tc = team_card or make_team_card()
+    # Omit user_id when None so the field falls back to its model default.
+    optional: dict[str, Any] = {} if user_id is None else {"user_id": user_id}
     return Process(
         team_id=team_id or uuid.uuid4(),
-        team_card=team_card or make_team_card(),
+        team_card=tc,
         status=status,
-        user_id=user_id,
         created_at=now,
         updated_at=now,
         catalog_namespace=catalog_namespace,
         metadata=metadata,
         metadata_indexes=metadata_indexes or [],
+        **projection_kwargs(tc),
+        **optional,
     )
 
 

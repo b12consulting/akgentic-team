@@ -43,6 +43,7 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.restorer import GRACE_TIMEOUT_SECONDS, TeamRestorer
+from tests.conftest import projection_kwargs
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -363,6 +364,7 @@ def _populate_stopped_team(
         user_email="test@test.com",
         created_at=now,
         updated_at=now,
+        **projection_kwargs(tc),
     )
     event_store.save_team(process)
 
@@ -1385,6 +1387,7 @@ class TestRestorerOrphanFallback:
             user_email="test@test.com",
             created_at=now,
             updated_at=now,
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -1931,6 +1934,7 @@ class TestRestorerToolActorSpawnOrder:
             user_email="test@test.com",
             created_at=now,
             updated_at=now,
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 

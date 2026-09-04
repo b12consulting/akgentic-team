@@ -1,7 +1,7 @@
 """Domain models for team lifecycle management.
 
-TeamCard, TeamCardMember, TeamRuntime, TeamStatus, Process, PersistedEvent,
-AgentStateSnapshot.
+TeamCard, TeamCardMember, TeamRuntime, TeamStatus, AgentRef, AgentCardRef,
+Process, PersistedEvent, AgentStateSnapshot.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressProxy
@@ -159,6 +159,32 @@ class TeamCard(SerializableBaseModel):
         result[name] = member.card
         for child in member.members:
             TeamCard._collect_cards(child, result)
+
+
+def spawned_names(member: TeamCardMember) -> list[str]:
+    """Return the names ``TeamFactory`` gives the actors it spawns for *member*.
+
+    The single statement of the naming rule, mirroring
+    ``TeamFactory._spawn_member``: a member with ``headcount == 1`` keeps the
+    bare ``card.config.name``, and any higher headcount is expanded into
+    ``"<name>_<i>"`` for each index. The bare name is therefore **never** a live
+    agent name for a multi-instance member — which is precisely the trap
+    ``supervisor_addrs`` falls into by matching on it (see ADR-26).
+
+    Callers that record who was spawned must go through this function rather
+    than reading ``card.config.name``, so the recorded name and the spawned
+    actor can never disagree.
+
+    Args:
+        member: The member slot to expand.
+
+    Returns:
+        One name per instance, in spawn (index) order.
+    """
+    name = member.card.config.name
+    if member.headcount == 1:
+        return [name]
+    return [f"{name}_{i}" for i in range(member.headcount)]
 
 
 # --- TeamRuntime ---
@@ -431,12 +457,61 @@ class TeamStatus(StrEnum):
     DELETED = "deleted"
 
 
+class AgentRef(SerializableBaseModel):
+    """One spawned agent identity, and the role it was spawned from.
+
+    Attributes:
+        name: The agent's **spawned** name — the key into ``TeamRuntime.addrs``
+            and ``TeamRuntime.supervisor_addrs``. Already expanded for
+            ``headcount`` by :func:`spawned_names`, so a member declared with
+            ``headcount=3`` contributes three refs named ``"@Name_0"`` …
+            ``"@Name_2"`` and the bare ``"@Name"`` appears nowhere. There is
+            deliberately no expansion step left for a reader to forget.
+        role: The agent's role — the key into ``Process.agent_cards``, where the
+            card it was built from is referenced.
+    """
+
+    name: str = Field(description="Spawned agent name; the key into TeamRuntime.addrs")
+    role: str = Field(description="Agent role; the key into Process.agent_cards")
+
+
+class AgentCardRef(SerializableBaseModel):
+    """A reference to the ``AgentCard`` behind one role.
+
+    Attributes:
+        role: The role this card defines — the key ``AgentRef.role`` resolves
+            against, and the key of the role catalog.
+        card_hash: Content hash of the card, produced by
+            ``akgentic.team.projection.hash_agent_card``. It is the key into the
+            content-addressed card store that story 31-7 adds; until then it
+            resolves against nothing, which is an accepted intermediate state.
+        can_be_hired: Whether an agent may hire this role at runtime. Excluded
+            from ``card_hash`` on purpose: hireability is a property of the team
+            that names the role, not of the card's content, so the same card
+            reached through ``agent_profiles`` and through the member tree
+            addresses one stored blob.
+    """
+
+    role: str = Field(description="Role this card defines; the catalog key")
+    card_hash: str = Field(description="Content hash of the AgentCard this ref points at")
+    can_be_hired: bool = Field(
+        default=False,
+        description="Whether an agent may hire this role at runtime",
+    )
+
+
 class Process(SerializableBaseModel):
     """Persisted team metadata for crash recovery.
 
-    Stores the TeamCard blueprint so the team can be rebuilt on resume,
-    along with lifecycle status and audit fields. This is NOT the
+    Carries a flat **structural projection** of the team — what was actually
+    spawned — rather than only the declarative card it was asked for. The
+    projection is derived by exactly one function,
+    ``akgentic.team.projection.derive_team_projection``, so the stored record can
+    never disagree with what a fresh team would produce (ADR-26). This is NOT the
     TeamRuntime -- addresses are stale after stop/crash.
+
+    ``team_card`` is still stored alongside the projection while the restore path
+    reads it; story 31-3 removes the field once it is the last reader.
 
     Attributes:
         team_id: Unique identifier for this team instance.
@@ -452,6 +527,23 @@ class Process(SerializableBaseModel):
         metadata_indexes: Flattened ``"key|value"`` entries derived from
             ``metadata``. Derived on write by ``derive_metadata_indexes``, never
             accepted from a caller, and never written apart from ``metadata``.
+        team_name: The team's name, projected off the card at creation.
+        team_description: A mutable human-readable description of *this team
+            instance*. ``None`` at creation and deliberately **not** seeded from
+            the card's description: the card describes a blueprint, this
+            describes one running team, and conflating the two makes a
+            user-edited description snap back to the blueprint's text.
+        entry_point: Ref to the agent that receives external messages.
+        supervisors: Refs to the first-layer members, in declaration order,
+            already expanded for ``headcount`` — two instances of one role are
+            two refs here, because both identities are addressable.
+        agent_cards: One ref per **role** reachable from the team: the entry
+            point, the whole member tree, and ``agent_profiles``. Keyed by role,
+            unlike ``TeamCard.agent_cards`` which is keyed by ``config.name``.
+        message_types: Message classes the team handles; first is the default.
+        metadata_type: Model class describing this team's business metadata,
+            ``None`` when the team carries none. The contract ``metadata`` is
+            validated against, read here rather than off the nested card.
     """
 
     team_id: uuid.UUID = Field(description="Unique identifier for this team instance")
@@ -483,6 +575,61 @@ class Process(SerializableBaseModel):
             "derivation would mask a write path that forgot to update it."
         ),
     )
+    team_name: str | None = Field(
+        default=None, description="The team's name, projected off the card at creation"
+    )
+    team_description: str | None = Field(
+        default=None,
+        description=(
+            "Mutable description of this team instance. None at creation and "
+            "never seeded from the card's description."
+        ),
+    )
+    entry_point: AgentRef = Field(
+        description="Ref to the agent that receives external messages",
+    )
+    supervisors: list[AgentRef] = Field(
+        default_factory=list,
+        description="Refs to the first-layer members, headcount already expanded",
+    )
+    agent_cards: list[AgentCardRef] = Field(
+        default_factory=list,
+        description="One ref per role reachable from the team, including agent_profiles",
+    )
+    message_types: list[type] = Field(
+        default_factory=list,
+        description="Message classes the team handles; first is the default",
+    )
+    metadata_type: type[SerializableBaseModel] | None = Field(
+        default=None,
+        description="Model class describing this team's business metadata, or None",
+    )
+
+    @model_validator(mode="after")
+    def require_resolvable_agent_refs(self) -> Process:
+        """Reject a projection whose refs do not resolve against ``agent_cards``.
+
+        ``mode="after"`` so the check fires on ``Process(...)`` **and** on
+        ``Process.model_validate(...)``. Validating only on construction would
+        leave the read path — the one a corrupted or half-migrated document
+        actually takes — unguarded, and the record would fail much later, inside
+        a resume, with an error naming neither the role nor the document.
+
+        Raises:
+            ValueError: If ``entry_point`` or any supervisor names a role that
+                has no entry in ``agent_cards``. The offending role is named.
+        """
+        known = {ref.role for ref in self.agent_cards}
+        checked: list[tuple[str, AgentRef]] = [("entry_point", self.entry_point)]
+        checked += [("supervisor", ref) for ref in self.supervisors]
+        for label, ref in checked:
+            if ref.role not in known:
+                msg = (
+                    f"Process {label} ref '{ref.name}' names role '{ref.role}', "
+                    f"which has no entry in agent_cards (roles: {sorted(known)})."
+                )
+                raise ValueError(msg)
+        return self
 
 
 class PersistedEvent(SerializableBaseModel):

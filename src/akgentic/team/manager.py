@@ -13,6 +13,7 @@ from akgentic.team.factory import TeamFactory
 from akgentic.team.metadata import derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
+from akgentic.team.projection import derive_team_projection
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
 
@@ -70,43 +71,45 @@ class TeamManager:
 
     @staticmethod
     def _validate_metadata(
-        team_card: TeamCard,
+        metadata_type: type[SerializableBaseModel] | None,
         metadata: SerializableBaseModel | None,
+        team_name: str | None,
     ) -> SerializableBaseModel | None:
-        """Validate a metadata value against the card's declared ``metadata_type``.
+        """Validate a metadata value against the team's declared ``metadata_type``.
 
         The single validation site for both write paths, so create and update can
         never diverge on what a team's metadata is allowed to be (ADR-24 §D7).
 
-        ``None`` is always accepted, including on a card that declares a type:
+        ``None`` is always accepted, including on a team that declares a type:
         metadata is optional, and a declared type constrains its shape, not its
         presence.
 
         Args:
-            team_card: The card whose ``metadata_type`` is the contract. On the
-                update path this is the card read back off the persisted
+            metadata_type: The declared contract, or ``None``. Create reads it
+                off the incoming ``TeamCard``; update reads it off the persisted
                 ``Process`` — the type declared at creation, never an argument,
-                so ``metadata_type`` cannot change for a live team.
+                so it cannot change for a live team.
             metadata: The candidate value, or ``None``.
+            team_name: The team's name, for the error message only.
 
         Returns:
             The validated value as an instance of the declared type, or ``None``.
 
         Raises:
-            ValueError: If a value is supplied but the card declares no
+            ValueError: If a value is supplied but the team declares no
                 ``metadata_type``.
             pydantic.ValidationError: If the value does not validate against the
                 declared type — propagates unchanged.
         """
         if metadata is None:
             return None
-        if team_card.metadata_type is None:
+        if metadata_type is None:
             msg = (
-                f"Team card '{team_card.name}' declares no metadata_type; "
+                f"Team card '{team_name}' declares no metadata_type; "
                 f"metadata cannot be supplied"
             )
             raise ValueError(msg)
-        return team_card.metadata_type.model_validate(metadata)
+        return metadata_type.model_validate(metadata)
 
     def _push_metadata(
         self,
@@ -185,7 +188,9 @@ class TeamManager:
             Exception: Any exception from TeamFactory.build propagates unchanged.
         """
         # Validate before anything is built or written — no half-created team.
-        validated_metadata = self._validate_metadata(team_card, metadata)
+        validated_metadata = self._validate_metadata(
+            team_card.metadata_type, metadata, team_card.name
+        )
 
         if team_id is None:
             team_id = uuid.uuid4()
@@ -215,7 +220,10 @@ class TeamManager:
         # Track runtime for stop_team
         self._runtimes[team_id] = runtime
 
-        # Persist Process metadata
+        # Persist Process metadata. The structural projection comes from the one
+        # derivation function, never from a second walk of the card here — the
+        # same reason metadata_indexes goes through derive_metadata_indexes.
+        projection = derive_team_projection(team_card)
         now = datetime.now(UTC)
         process = Process(
             team_id=team_id,
@@ -228,6 +236,13 @@ class TeamManager:
             catalog_namespace=catalog_namespace,
             metadata=validated_metadata,
             metadata_indexes=derive_metadata_indexes(validated_metadata),
+            team_name=projection.team_name,
+            team_description=projection.team_description,
+            entry_point=projection.entry_point,
+            supervisors=projection.supervisors,
+            agent_cards=projection.agent_cards,
+            message_types=projection.message_types,
+            metadata_type=projection.metadata_type,
         )
         self._event_store.save_team(process)
 
@@ -366,7 +381,7 @@ class TeamManager:
 
         self._service_registry.register_team(self._instance_id, team_id)
 
-        logger.info("Team '%s' (%s) resumed successfully", process.team_card.name, team_id)
+        logger.info("Team '%s' (%s) resumed successfully", process.team_name, team_id)
         return runtime
 
     def _teardown_team(self, team_id: uuid.UUID, runtime: TeamRuntime) -> None:
@@ -511,7 +526,9 @@ class TeamManager:
             msg = f"Cannot update metadata for team {team_id}: team has been deleted"
             raise ValueError(msg)
 
-        validated_metadata = self._validate_metadata(process.team_card, metadata)
+        validated_metadata = self._validate_metadata(
+            process.metadata_type, metadata, process.team_name
+        )
 
         # Copy-with-override, as resume_team and stop_team already do: only the
         # three fields this path owns are named, so every other field — including

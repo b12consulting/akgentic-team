@@ -51,7 +51,8 @@ class TestListCommand:
         for t in teams:
             # Table truncates to 8 chars
             assert str(t.team_id)[:8] in result.output
-            assert t.team_card.name in result.output
+            assert t.team_name is not None
+            assert t.team_name in result.output
 
     def test_list_status_filter_running(
         self, cli_runner: CliRunner, data_dir: object, yaml_store: YamlEventStore
@@ -114,7 +115,41 @@ class TestInspectCommand:
         )
         assert result.exit_code == 0
         assert str(process.team_id) in result.output
-        assert process.team_card.name in result.output
+        assert process.team_name is not None
+        assert process.team_name in result.output
+
+    def test_inspect_reads_the_projection_not_the_nested_card(
+        self, cli_runner: CliRunner, data_dir: object, yaml_store: YamlEventStore
+    ) -> None:
+        """AC 21: name, description and member_count come off the Process.
+
+        ``description`` is blank for a freshly created team by design —
+        ``team_description`` starts ``None`` and is never seeded from the card's
+        blueprint description, which belongs to the card and not to this team.
+        ``member_count`` is the size of the role catalog, which the nested card
+        could never supply: ``TeamCard.agent_cards`` is a property and so is
+        absent from its dump, leaving the old row permanently reading 0.
+        """
+        process = make_process(
+            team_card=make_team_card(
+                member_names=["worker-a", "worker-b"],
+                member_roles=["WorkerA", "WorkerB"],
+            )
+        )
+        assert process.team_description is None
+        yaml_store.save_team(process)
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "inspect", str(process.team_id)]
+        )
+
+        assert result.exit_code == 0
+        assert "member_count" in result.output
+        assert str(len(process.agent_cards)) in result.output
+        assert len(process.agent_cards) == 3
+        # The blueprint's description must not leak into the team's own row.
+        assert process.team_card.description is not None
+        assert process.team_card.description not in result.output
 
     def test_inspect_nonexistent_team(
         self, cli_runner: CliRunner, data_dir: object

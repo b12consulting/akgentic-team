@@ -14,6 +14,7 @@ from akgentic.team.models import (
     Process,
     TeamStatus,
 )
+from tests.conftest import projection_kwargs
 
 from .conftest import (
     AcmeTeamMetadata,
@@ -67,6 +68,7 @@ class TestProcess:
             user_email="admin@example.com",
             created_at=now,
             updated_at=now,
+            **projection_kwargs(tc),
         )
         assert process.team_id == tid
         assert process.team_card.name == tc.name
