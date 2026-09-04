@@ -224,6 +224,15 @@ class TeamManager:
         # derivation function, never from a second walk of the card here — the
         # same reason metadata_indexes goes through derive_metadata_indexes.
         projection = derive_team_projection(team_card)
+
+        # Cards FIRST, document second (FR13). A stored Process must never
+        # reference a blob that is not there, and the reverse order is
+        # indistinguishable from this one in the final state — only the call
+        # sequence tells them apart. The store normalises the hireable flag off
+        # each card; it belongs to the AgentCardRef on the Process, not to the
+        # shared blob.
+        self._event_store.save_agent_cards(projection.cards)
+
         now = datetime.now(UTC)
         process = Process(
             team_id=team_id,

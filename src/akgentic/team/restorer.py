@@ -29,6 +29,7 @@ from akgentic.team.models import (
     TeamRuntime,
 )
 from akgentic.team.ports import EventStore
+from akgentic.team.projection import resolve_agent_cards
 
 logger = logging.getLogger(__name__)
 
@@ -484,12 +485,21 @@ class TeamRestorer:
                 proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy_llm.init_llm_context(agent_events)
 
-        # 2f. Register hireable agent profiles with orchestrator
-        # Only profiles listed in agent_profiles are available for runtime
-        # hiring. Instantiated members are already live — registering them
-        # would cause the LLM to hire duplicates via role names.
-        if process.team_card.agent_profiles:
-            orchestrator_proxy.register_agent_profiles(process.team_card.agent_profiles)
+        # 2f. Register the team's resolved agent cards with the orchestrator.
+        # The WHOLE card set, not just the hireable subset the old
+        # `team_card.agent_profiles` registration carried: the orchestrator can
+        # then describe every colleague, while each card's own `can_be_hired` —
+        # taken from its AgentCardRef, the authoritative copy — still says which
+        # of them may be hired at runtime. That widening is the intended change
+        # (ADR-26 §Decision 5, FR2/FR11), not a regression.
+        #
+        # Resolved in ONE batch load through the single resolution site. A
+        # per-role read would return exactly this, which is why the call count
+        # rather than the result is what a test has to pin.
+        if process.agent_cards:
+            orchestrator_proxy.register_agent_profiles(
+                resolve_agent_cards(process.agent_cards, self._event_store)
+            )
 
         # 2g. Register subscribers last — ensures they only receive events
         # during Phase 3 replay, matching fresh-team event stream (ADR-014).

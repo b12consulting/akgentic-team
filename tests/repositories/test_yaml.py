@@ -24,15 +24,19 @@ from typing import TYPE_CHECKING
 
 import pytest
 import yaml
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_card import AgentCard
 
 from akgentic.team.models import Process, TeamStatus
-from akgentic.team.repositories.yaml import YamlEventStore
+from akgentic.team.projection import hash_agent_card
+from akgentic.team.repositories.yaml import CARDS_DIRNAME, YamlEventStore
 
 if TYPE_CHECKING:
     from akgentic.team.ports import EventStore
 
 from tests.models.conftest import (
     AcmeTeamMetadata,
+    make_agent_card,
     make_agent_state_snapshot,
     make_indexed_process,
     make_persisted_event,
@@ -46,6 +50,17 @@ A dedicated object rather than a string: the cases it sits beside ARE arbitrary
 values, one of them already a bare string, so a string token would share their
 value space and a future case could silently mean deletion instead.
 """
+
+
+def _card_fixture() -> AgentCard:
+    """An AgentCard whose ``agent_class`` resolves on the way back out of YAML.
+
+    ``AgentCard`` resolves ``agent_class`` only when ``config`` arrives as a
+    dict — that is, on the way out of storage — so the suite's default
+    ``tests.fixtures.MockAgent`` placeholder constructs fine and then fails to
+    read back. The card store reads cards back.
+    """
+    return make_agent_card(name="lead", role="Lead", agent_class=Akgent)
 
 
 @pytest.fixture
@@ -556,3 +571,126 @@ class TestYamlMetadataPredicateConstruction:
 
         with pytest.raises(TypeError, match="tenant"):
             store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]
+
+
+class TestYamlAgentCardStoreLayout:
+    """YAML-only invariants of the content-addressed card store."""
+
+    def test_cards_live_beside_the_team_directories_not_inside_them(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """FR13 is unsatisfiable by construction if the cards sit inside a team.
+
+        ``delete_team`` removes a team directory with ``shutil.rmtree``, so a
+        card store nested under one would go with the first team that
+        referenced it — however carefully ``delete_team`` were written.
+        """
+        card = _card_fixture()
+        process = make_process()
+
+        yaml_store.save_agent_cards([card])
+        yaml_store.save_team(process)
+
+        cards_dir = tmp_path / CARDS_DIRNAME
+        assert cards_dir.is_dir()
+        assert cards_dir.parent == tmp_path
+        assert not (tmp_path / str(process.team_id) / CARDS_DIRNAME).exists()
+
+    def test_each_card_is_one_file_named_by_its_hash(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        card = _card_fixture()
+        yaml_store.save_agent_cards([card])
+
+        files = sorted((tmp_path / CARDS_DIRNAME).iterdir())
+        assert [f.name for f in files] == [f"{hash_agent_card(card)}.yaml"]
+
+    def test_a_re_save_rewrites_rather_than_appends(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """A content-addressed file holds the bytes its name promises, once."""
+        card = _card_fixture()
+        yaml_store.save_agent_cards([card])
+        first = (tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml").read_text()
+
+        yaml_store.save_agent_cards([card])
+        second = (tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml").read_text()
+
+        assert first == second
+
+    def test_saving_no_cards_creates_no_directory(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        yaml_store.save_agent_cards([])
+        assert not (tmp_path / CARDS_DIRNAME).exists()
+
+    # --- list_teams must not warn about the card directory ------------------
+
+    def test_list_teams_does_not_warn_about_the_card_directory(
+        self,
+        yaml_store: YamlEventStore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The warning fires per CALL, not per team — it would log forever.
+
+        Asserting on the returned teams alone passes whether or not the warning
+        is emitted, which is exactly why this asserts on the log record.
+        """
+        yaml_store.save_agent_cards([_card_fixture()])
+        yaml_store.save_team(make_process())
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            teams = yaml_store.list_teams()
+
+        assert len(teams) == 1
+        assert [r for r in caplog.records if "non-team directory" in r.getMessage()] == []
+
+    def test_a_genuinely_unexpected_directory_still_warns(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The skip is by name, not a blanket silencing of the warning."""
+        (tmp_path / "not-a-team").mkdir()
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            yaml_store.list_teams()
+
+        assert [r for r in caplog.records if "non-team directory" in r.getMessage()]
+
+    def test_the_card_directory_is_not_mistaken_for_a_team(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        yaml_store.save_agent_cards([_card_fixture()])
+        assert yaml_store.list_teams() == []
+
+    # --- corrupted card files -----------------------------------------------
+
+    def test_a_corrupted_card_file_is_skipped_not_raised(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """It surfaces as FR14's loud failure at resolution, not as an escape.
+
+        The same treatment corrupted team and state files already get: logged,
+        absent from the result. Raising out of the store would bypass the error
+        that names the role.
+        """
+        card = _card_fixture()
+        card_hash = hash_agent_card(card)
+        yaml_store.save_agent_cards([card])
+        (tmp_path / CARDS_DIRNAME / f"{card_hash}.yaml").write_text("{[not: yaml")
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
+            loaded = yaml_store.load_agent_cards([card_hash])
+
+        assert loaded == {}
+        assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]
+
+    def test_loading_from_a_store_with_no_card_directory_returns_empty(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        assert yaml_store.load_agent_cards(["0" * 64]) == {}

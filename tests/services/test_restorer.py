@@ -43,7 +43,7 @@ from akgentic.team.models import (
     TeamStatus,
 )
 from akgentic.team.restorer import GRACE_TIMEOUT_SECONDS, TeamRestorer
-from tests.conftest import projection_kwargs
+from tests.conftest import projection_kwargs, seed_agent_cards
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -366,6 +366,8 @@ def _populate_stopped_team(
         updated_at=now,
         **projection_kwargs(tc),
     )
+    # Cards first, document second — the order create_team writes them in.
+    seed_agent_cards(event_store, tc)
     event_store.save_team(process)
 
     return team_id, process
@@ -788,12 +790,12 @@ class TestTeamRestorerRestore:
         assert init_state_calls == []
         assert runtime.addrs["lead"].is_alive()
 
-    def test_restore_agent_profiles_registered(
+    def test_restore_registers_the_hireable_roles(
         self,
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """AC 9: Only agent_profiles are registered with orchestrator after restore."""
+        """Every role a profile names comes back marked hireable."""
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
         # Explicitly register profiles for hiring
@@ -805,19 +807,25 @@ class TestTeamRestorerRestore:
         runtime = restorer.restore(process)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        roles = {c.role for c in catalog}
-        assert "Lead" in roles
-        assert "Worker" in roles
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert all(c.can_be_hired for c in catalog)
 
-    def test_restore_no_profiles_means_empty_catalog(
+    def test_restore_registers_the_whole_card_set_not_only_the_profiles(
         self,
         actor_system: ActorSystem,
         event_store: InMemoryEventStore,
     ) -> None:
-        """Default agent_profiles (empty) results in empty hiring catalog after restore."""
+        """The intended behaviour change of story 31-7, not a regression.
+
+        The restorer used to register ``team_card.agent_profiles`` alone, so a
+        team with no profiles left the orchestrator unable to describe a single
+        one of its own agents. It now registers the whole resolved card set, and
+        ``can_be_hired`` — taken from each ``AgentCardRef``, the authoritative
+        copy — is what still says which of them may be hired at runtime.
+        """
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
-        # agent_profiles defaults to empty — no roles available for hiring
+        # agent_profiles defaults to empty — nothing is hireable.
 
         team_id, process = _populate_stopped_team(event_store, tc)
 
@@ -825,7 +833,30 @@ class TestTeamRestorerRestore:
         runtime = restorer.restore(process)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        assert len(catalog) == 0
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert not any(c.can_be_hired for c in catalog)
+
+    def test_restore_marks_only_the_profiled_roles_hireable(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """The whole directory is registered; only some of it is hireable."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        tc.agent_profiles = [_make_card("specialist", "Specialist")]
+
+        team_id, process = _populate_stopped_team(event_store, tc)
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert {c.role: c.can_be_hired for c in catalog} == {
+            "Lead": False,
+            "Worker": False,
+            "Specialist": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1420,7 @@ class TestRestorerOrphanFallback:
             updated_at=now,
             **projection_kwargs(tc),
         )
+        seed_agent_cards(event_store, tc)
         event_store.save_team(process)
 
         restorer = TeamRestorer(actor_system, event_store)
@@ -1936,6 +1968,7 @@ class TestRestorerToolActorSpawnOrder:
             updated_at=now,
             **projection_kwargs(tc),
         )
+        seed_agent_cards(event_store, tc)
         event_store.save_team(process)
 
         # Track spawn order

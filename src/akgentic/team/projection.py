@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import TYPE_CHECKING
 
 from pydantic import Field
 
@@ -30,6 +31,20 @@ from akgentic.team.models import (
     TeamCardMember,
     spawned_names,
 )
+from akgentic.team.ports import AgentCardNotFoundError
+
+if TYPE_CHECKING:
+    from akgentic.team.ports import EventStore
+
+_HIREABLE_FIELD = "can_be_hired"
+"""The one card field that is a team's policy rather than the card's content.
+
+Named once because three things must agree about it: the hash excludes it, the
+store normalises it away, and ``AgentCardRef`` carries it instead. A test pins
+that it is a declared field of ``AgentCard`` — the exclusion is a ``pop`` that
+tolerates the key's absence, so without that pin a rename in ``akgentic-core``
+would make every guard here vacuously green.
+"""
 
 
 def hash_agent_card(card: AgentCard) -> str:
@@ -68,9 +83,76 @@ def hash_agent_card(card: AgentCard) -> str:
         The hex SHA-256 digest of the canonical form.
     """
     payload = card.model_dump(mode="json")
-    payload.pop("can_be_hired", None)
+    payload.pop(_HIREABLE_FIELD, None)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def storable_agent_card(card: AgentCard) -> AgentCard:
+    """Return the form of *card* the content-addressed store holds.
+
+    ``can_be_hired`` is normalised back to its declared default, so the stored
+    bytes are a **pure function of the hash**. Excluding the flag from the hash
+    is necessary but not sufficient: ``derive_team_projection`` hands over cards
+    already carrying their final hireability, so two teams reaching one role with
+    different policies would otherwise write the same key with different content
+    and whichever wrote last would silently decide what every other team reads
+    back — including a restore that hands the orchestrator a card whose own flag
+    contradicts the authoritative one on its ``AgentCardRef``.
+
+    The default is read off ``AgentCard.model_fields`` rather than written as a
+    literal, so a card whose default ever changes normalises to the new one, and
+    a card that loses the field raises here instead of normalising nothing.
+
+    The caller's card is untouched — the flag is applied to a ``model_copy``,
+    the same discipline ``derive_team_projection`` follows in the other
+    direction.
+
+    Args:
+        card: The card to normalise.
+
+    Returns:
+        A copy with ``can_be_hired`` at its default. ``hash_agent_card`` of the
+        result equals ``hash_agent_card`` of the input, by construction.
+    """
+    default = AgentCard.model_fields[_HIREABLE_FIELD].default
+    return card.model_copy(update={_HIREABLE_FIELD: default})
+
+
+def resolve_agent_cards(refs: list[AgentCardRef], store: EventStore) -> list[AgentCard]:
+    """Resolve *refs* against the card store — the ONE place a hash becomes a card.
+
+    One batch ``load_agent_cards`` call for the whole set, whatever its size:
+    the restorer, and story 31-5's migration verification after it, go through
+    here rather than reading per role. A per-role read returns the identical
+    result, which is exactly why only a call-count assertion catches it coming
+    back.
+
+    Each returned card carries its ref's ``can_be_hired``, applied with
+    ``model_copy(update=...)`` — never by mutating the card the store handed
+    back, which a caching backend may share with the next caller.
+
+    Args:
+        refs: The ``Process``'s card refs, in order.
+        store: The store to resolve against.
+
+    Returns:
+        One card per ref, in the same order.
+
+    Raises:
+        AgentCardNotFoundError: If any ref's hash is absent from the store,
+            naming the first unresolved ref's role AND hash. A team that cannot
+            describe one of its agents must refuse to restore (FR14).
+    """
+    resolved = store.load_agent_cards([ref.card_hash for ref in refs])
+    cards: list[AgentCard] = []
+    for ref in refs:
+        stored = resolved.get(ref.card_hash)
+        if stored is None:
+            msg = f"No agent card stored for role '{ref.role}' at hash {ref.card_hash}"
+            raise AgentCardNotFoundError(msg)
+        cards.append(stored.model_copy(update={_HIREABLE_FIELD: ref.can_be_hired}))
+    return cards
 
 
 class TeamProjection(SerializableBaseModel):
@@ -93,8 +175,13 @@ class TeamProjection(SerializableBaseModel):
         message_types: Message classes the team handles; first is the default.
         metadata_type: Model class for the team's business metadata, or ``None``.
         cards: The deduplicated cards ``agent_cards`` points at, in the same
-            order, each already carrying its final ``can_be_hired`` value. This
-            is the set story 31-7's card store will persist; **no consumer yet**.
+            order, each already carrying its final ``can_be_hired`` value.
+            ``TeamManager.create_team`` hands this straight to
+            ``EventStore.save_agent_cards``, before the ``Process`` that
+            references it. The store normalises the hireable flag away — it
+            belongs to the ``AgentCardRef``, not to the stored card — so the
+            flag set here serves the *other* consumer, the orchestrator
+            registration.
     """
 
     team_name: str | None = Field(default=None, description="The team's name")
@@ -116,7 +203,7 @@ class TeamProjection(SerializableBaseModel):
     )
     cards: list[AgentCard] = Field(
         default_factory=list,
-        description="The deduped cards agent_cards points at; persisted by story 31-7",
+        description="The deduped cards agent_cards points at; persisted by save_agent_cards",
     )
 
 

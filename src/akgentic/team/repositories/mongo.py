@@ -8,6 +8,10 @@ Collection layout::
     teams              # One document per team (Process metadata) -- upsert by team_id
     events             # One document per event -- append-only, indexed by (team_id, sequence)
     agent_states       # One document per agent per team -- upsert by (team_id, agent_id)
+    agent_cards        # One document per CARD, shared across teams -- upsert by card_hash
+
+``agent_cards`` is the only collection with no ``team_id``: it is content-
+addressed and shared, and ``delete_team`` deliberately does not touch it (FR13).
 """
 
 from __future__ import annotations
@@ -29,9 +33,11 @@ except ImportError as exc:
 
 from pymongo.errors import PyMongoError
 
+from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 
 if TYPE_CHECKING:
     import pymongo.collection
@@ -40,6 +46,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _TEAMS_COLLECTION = "teams"
+
+AGENT_CARDS_COLLECTION = "agent_cards"
+"""Collection holding the content-addressed card store. Public: tests assert it."""
+
+_CARD_HASH_KEY = "card_hash"
+_CARD_HASH_INDEX = "agent_cards_card_hash_idx"
 
 _AUTO_INDEX_ENV = "MONGO_TEAM_AUTO_INDEX"
 # Values that switch the boot-time build off. Anything else — including an
@@ -129,9 +141,10 @@ class MongoEventStore:
     """MongoDB-backed EventStore using pymongo collections.
 
     Satisfies the ``EventStore`` protocol via structural subtyping without
-    inheriting from it. Uses three collections: ``teams`` (upsert by team_id),
-    ``events`` (append-only, indexed by team_id + sequence), and
-    ``agent_states`` (upsert by team_id + agent_id).
+    inheriting from it. Uses four collections: ``teams`` (upsert by team_id),
+    ``events`` (append-only, indexed by team_id + sequence),
+    ``agent_states`` (upsert by team_id + agent_id) and ``agent_cards``
+    (upsert by card_hash, shared across teams and never deleted).
 
     Args:
         db: A pymongo Database instance connected to the target MongoDB server.
@@ -157,6 +170,7 @@ class MongoEventStore:
         self._teams: pymongo.collection.Collection = db[_TEAMS_COLLECTION]  # type: ignore[type-arg]
         self._events: pymongo.collection.Collection = db["events"]  # type: ignore[type-arg]
         self._agent_states: pymongo.collection.Collection = db["agent_states"]  # type: ignore[type-arg]
+        self._agent_cards: pymongo.collection.Collection = db[AGENT_CARDS_COLLECTION]  # type: ignore[type-arg]
 
         # Create indexes for efficient queries
         self._events.create_index([("team_id", 1), ("sequence", 1)])
@@ -182,6 +196,29 @@ class MongoEventStore:
                 "load_events(after_event_id=...) anchor lookups will fall back to a "
                 "collection scan and degrade on large event logs. Results stay correct.",
                 self._events.name,
+                exc_info=True,
+            )
+        # UNIQUE, and guarded — a deliberate pair, not a copy of either
+        # neighbour. Unique because the collection is content-addressed: two
+        # documents at one hash is not a slow query, it is two answers to
+        # "what are the bytes this hash names", and it must be impossible for
+        # any writer, including one that bypasses save_agent_cards. Guarded
+        # because save_agent_cards upserts on that same key, so correctness of
+        # this store's own write path does not depend on the index existing —
+        # which makes refusing to construct the store over it the worse
+        # outcome, exactly as for events_event_id_idx above.
+        try:
+            self._agent_cards.create_index(
+                _CARD_HASH_KEY, name=_CARD_HASH_INDEX, unique=True
+            )
+        except PyMongoError:
+            logger.warning(
+                "Could not create index '%s' on '%s.%s'; load_agent_cards falls back "
+                "to a collection scan and a writer bypassing save_agent_cards could "
+                "fork a hash. Results stay correct.",
+                _CARD_HASH_INDEX,
+                self._agent_cards.name,
+                _CARD_HASH_KEY,
                 exc_info=True,
             )
         # Teams-collection indexes, on by default (parity with how
@@ -484,4 +521,61 @@ class MongoEventStore:
         self._teams.delete_many({"team_id": team_id_str})
         self._events.delete_many({"team_id": team_id_str})
         self._agent_states.delete_many({"team_id": team_id_str})
+        # `agent_cards` is deliberately absent. The cards are shared: another
+        # team may reference the very blobs this team did, no refcount exists,
+        # and purging them here would make that team unresumable (FR13).
         logger.debug("Deleted all data for team %s", team_id)
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Upsert agent cards into the ``agent_cards`` collection by hash.
+
+        ``replace_one(..., upsert=True)`` rather than ``insert_one``: the store
+        is content-addressed, so a card arriving a second time — from a re-save
+        or from another team — must land on the same document with the same
+        bytes instead of raising a duplicate-key error against the unique index.
+
+        One statement per card rather than one ``bulk_write``. The batching that
+        matters is on the read side, which a restore does per team; the write
+        side runs once at creation, and ``bulk_write`` is unusable here because
+        ``mongomock`` — the double the whole Mongo suite runs against — rejects
+        the ``ReplaceOne`` this pymongo emits.
+
+        Args:
+            cards: The cards to persist. An empty list issues no command.
+        """
+        if not cards:
+            return
+        for card in cards:
+            storable = storable_agent_card(card)
+            card_hash = hash_agent_card(storable)
+            self._agent_cards.replace_one(
+                {_CARD_HASH_KEY: card_hash},
+                {_CARD_HASH_KEY: card_hash, "card": storable.model_dump()},
+                upsert=True,
+            )
+        logger.debug("Saved %d agent cards", len(cards))
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes with a single ``$in`` query.
+
+        One query for the whole batch, never one per hash. A hash the collection
+        does not hold is simply absent from the mapping, and a corrupted card
+        document is skipped with a warning the way corrupted team and event
+        documents are.
+
+        Args:
+            hashes: The content hashes to resolve; empty returns ``{}``.
+
+        Returns:
+            Mapping of hash to card for every hash the store holds.
+        """
+        if not hashes:
+            return {}
+        resolved: dict[str, AgentCard] = {}
+        for doc in self._agent_cards.find({_CARD_HASH_KEY: {"$in": list(hashes)}}):
+            try:
+                resolved[doc[_CARD_HASH_KEY]] = AgentCard.model_validate(doc["card"])
+            except (ValueError, TypeError, KeyError) as exc:
+                logger.warning("Skipping corrupted agent card document: %s", exc)
+        logger.debug("Resolved %d of %d agent cards", len(resolved), len(hashes))
+        return resolved

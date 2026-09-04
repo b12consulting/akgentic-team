@@ -7,9 +7,12 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+from akgentic.core.agent_card import AgentCard
+
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,10 @@ class InMemoryEventStore:
         self._event_dicts: list[dict[str, Any]] = []
         self.teams: dict[uuid.UUID, Process] = {}
         self.agent_states: dict[tuple[uuid.UUID, str], AgentStateSnapshot] = {}
+        # Content-addressed and SHARED across teams — deliberately not keyed by
+        # team_id, and deliberately untouched by delete_team.
+        self.agent_cards: dict[str, AgentCard] = {}
+        self.load_agent_cards_calls = 0
 
     def save_event(self, event: PersistedEvent) -> None:
         """Persist a single domain event.
@@ -83,7 +90,12 @@ class InMemoryEventStore:
         return self.teams.get(team_id)
 
     def delete_team(self, team_id: uuid.UUID) -> None:
-        """Delete all persisted data for a team."""
+        """Delete all persisted data for a team.
+
+        ``agent_cards`` is deliberately NOT purged: cards are shared and no
+        ``EventStore`` method deletes one (FR13). Purging them here would let
+        this fake pass a test the real backends fail.
+        """
         self.teams.pop(team_id, None)
         self.events = [e for e in self.events if e.team_id != team_id]
         tid = str(team_id)
@@ -161,3 +173,28 @@ class InMemoryEventStore:
             for (snapshot_team_id, _), snapshot in self.agent_states.items()
             if snapshot_team_id == team_id
         ]
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Persist agent cards into the dict-backed content-addressed store.
+
+        Keyed by ``hash_agent_card`` and normalised through
+        ``storable_agent_card``, exactly as every real backend does — so the
+        stored blob is a pure function of its key and two teams differing only
+        in hireability cannot write different bytes to one hash. Saving the
+        same card twice leaves one entry by construction.
+        """
+        for card in cards:
+            storable = storable_agent_card(card)
+            self.agent_cards[hash_agent_card(storable)] = storable
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes; a hash the store does not hold is simply absent.
+
+        Counts its calls: the restore path must resolve a team's whole set in
+        ONE call, and a per-role read returns the identical mapping — the count
+        is the only thing that separates them.
+        """
+        self.load_agent_cards_calls += 1
+        if not hashes:
+            return {}
+        return {h: self.agent_cards[h] for h in hashes if h in self.agent_cards}

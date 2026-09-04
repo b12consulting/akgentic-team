@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import pytest
@@ -12,7 +13,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import UserMessage
 from akgentic.core.utils.serializer import SerializableBaseModel
 
-from akgentic.team.models import TeamCard, TeamCardMember
+from akgentic.team.models import AgentCardRef, Process, TeamCard, TeamCardMember
 from akgentic.team.projection import (
     TeamProjection,
     derive_team_projection,
@@ -55,6 +56,11 @@ def _make_member(
         headcount=headcount,
         members=members or [],
     )
+
+
+def _writer_ref(projection: TeamProjection) -> AgentCardRef:
+    """Return the ``Writer`` ref of *projection*."""
+    return next(ref for ref in projection.agent_cards if ref.role == "Writer")
 
 
 def _three_level_card() -> TeamCard:
@@ -110,6 +116,19 @@ class TestHashAgentCard:
         base = _make_card("@Lead", "Lead")
         other = _make_card("@Lead2", "Lead")
         assert hash_agent_card(other) != hash_agent_card(base)
+
+    def test_can_be_hired_is_a_declared_field_of_agent_card(self) -> None:
+        """The exclusion needs a subject that can be seen to disappear.
+
+        ``hash_agent_card`` drops the key with ``payload.pop(..., None)``, which
+        tolerates its absence — and ``model_copy(update=...)`` on an undeclared
+        field never reaches ``model_fields``, so it never reaches the payload
+        either. If ``akgentic-core`` ever renames or drops ``can_be_hired``, the
+        exclusion goes vacuous while the test below stays **green**: both cards
+        would then be byte-identical and hash the same for the wrong reason.
+        This is the guard that can see its own subject vanish.
+        """
+        assert "can_be_hired" in AgentCard.model_fields
 
     def test_can_be_hired_is_excluded_from_the_hash(self) -> None:
         """AC 17: hireability is a property of the team, not of the card.
@@ -287,6 +306,47 @@ class TestDeriveTeamProjection:
         # ...and the projection did flag its own copies.
         assert any(card.can_be_hired for card in projection.cards)
 
+    def test_one_role_reached_two_ways_gives_refs_differing_only_in_the_flag(
+        self,
+    ) -> None:
+        """The property the shared store rests on.
+
+        The same role reached through the member tree (not hireable) and
+        through ``agent_profiles`` (hireable) must address ONE stored blob, so
+        the two refs may differ in ``can_be_hired`` and in nothing else.
+        """
+        card = _make_card("@Writer", "Writer")
+        tree_only = TeamCard(
+            name="tree-team",
+            description="Writer via the member tree",
+            entry_point=_make_member("@Lead", "Lead"),
+            members=[TeamCardMember(card=card)],
+        )
+        profile_only = TeamCard(
+            name="profile-team",
+            description="Writer via agent_profiles",
+            entry_point=_make_member("@Lead", "Lead"),
+            agent_profiles=[card],
+        )
+
+        tree_ref = _writer_ref(derive_team_projection(tree_only))
+        profile_ref = _writer_ref(derive_team_projection(profile_only))
+
+        assert tree_ref.card_hash == profile_ref.card_hash
+        assert tree_ref.can_be_hired is False
+        assert profile_ref.can_be_hired is True
+        assert tree_ref.model_dump() == profile_ref.model_dump() | {"can_be_hired": False}
+
+    def test_the_derivation_hashes_in_exactly_one_place(self) -> None:
+        """AC 1: one canonicalisation, one call site.
+
+        A second ``hash_agent_card`` call inside the derivation is how the same
+        card starts being addressed by two digests — the fork the store cannot
+        detect, because both keys resolve.
+        """
+        source = inspect.getsource(derive_team_projection)
+        assert source.count("hash_agent_card(") == 1
+
     def test_the_projection_round_trips(self) -> None:
         tc = _three_level_card()
         tc.message_types = [UserMessage]
@@ -300,3 +360,37 @@ class TestDeriveTeamProjection:
         assert restored.metadata_type is SampleMetadata
         assert restored.agent_cards == projection.agent_cards
         assert restored.supervisors == projection.supervisors
+
+
+# ---------------------------------------------------------------------------
+# The ref shape (AC 4) — verified, not reintroduced
+# ---------------------------------------------------------------------------
+
+
+class TestAgentCardRefShape:
+    """The ref stays three scalar fields, and no whole card reaches a Process."""
+
+    def test_agent_card_ref_has_exactly_three_fields(self) -> None:
+        assert set(AgentCardRef.model_fields) == {"role", "card_hash", "can_be_hired"}
+
+    def test_can_be_hired_defaults_to_false(self) -> None:
+        ref = AgentCardRef(role="Lead", card_hash="deadbeef")
+        assert ref.can_be_hired is False
+
+    def test_process_agent_cards_holds_refs_not_cards(self) -> None:
+        """Embedding a card here is the duplication the whole epic removes."""
+        assert Process.model_fields["agent_cards"].annotation == list[AgentCardRef]
+
+    def test_no_process_field_holds_an_agent_card(self) -> None:
+        """No path in this story puts a whole ``AgentCard`` on a ``Process``.
+
+        ``team_card`` still carries the card graph — story 31-3 deletes it — so
+        this asserts no *new* field does, which is what "Process gains no field
+        here" means in practice.
+        """
+        card_fields = [
+            name
+            for name, field in Process.model_fields.items()
+            if field.annotation in (AgentCard, list[AgentCard], AgentCard | None)
+        ]
+        assert card_fields == []

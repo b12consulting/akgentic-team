@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
+from akgentic.core.agent_card import AgentCard
 from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
@@ -19,6 +20,23 @@ class EventNotFoundError(LookupError):
 
     Subclasses ``LookupError`` — never ``ValueError`` — so the corrupted-document
     handlers in the YAML and Mongo backends cannot swallow a stale cursor.
+    """
+
+
+class AgentCardNotFoundError(LookupError):
+    """Raised when an ``AgentCardRef``'s hash resolves to no card in the store.
+
+    Subclasses ``LookupError`` — never ``ValueError`` — for exactly the reason
+    ``EventNotFoundError`` does: the corrupted-document handlers in the YAML and
+    Mongo backends catch ``ValueError``, so a ``ValueError`` here would be
+    swallowed on the very path it exists to fail loudly on. A team that cannot
+    resolve one of its cards must refuse to restore, never restore with agents
+    the orchestrator cannot describe (ADR-26 §Decision 5, FR14).
+
+    The message names **both** the role and the hash. The store knows only the
+    hash — the role comes from the ``AgentCardRef``, which is why this is raised
+    by :func:`akgentic.team.projection.resolve_agent_cards` and never by a
+    backend.
     """
 
 
@@ -192,6 +210,73 @@ class EventStore(Protocol):
         """Load all agent state snapshots for a team.
 
         Called by TeamRestorer to restore agent states during team resumption.
+        """
+        ...
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Persist agent cards into the content-addressed card store.
+
+        Called by ``TeamManager.create_team`` with the whole card set of a team,
+        **before** the ``Process`` that references it — a stored ``Process`` must
+        never point at a blob that is not there (FR13).
+
+        The contract every backend honours:
+
+        * **Keyed by content hash.** The key is
+          :func:`akgentic.team.projection.hash_agent_card` of the card, and
+          nothing else. The store is shared across teams: a card reached by ten
+          teams is one blob.
+        * **Idempotent by content.** Saving the same card twice, or from two
+          different teams, leaves ONE stored blob. An empty list is a no-op that
+          touches no storage.
+        * **Stored in normalised form.** ``can_be_hired`` is excluded from the
+          hash, so the bytes are stored with the flag back at its default, via
+          :func:`akgentic.team.projection.storable_agent_card`. Excluding the
+          flag from the *hash* is necessary but not sufficient: without also
+          normalising the *bytes*, two teams differing only in hireability write
+          the same key with different content and last-write-wins silently
+          decides what every other team reads back. Hireability is carried by
+          the ``Process``'s ``AgentCardRef`` alone.
+        * **Immutable.** A blob at a hash is the bytes that hash names, forever.
+          A re-save rewrites the same bytes; it never appends and never mutates
+          a card in place. Editing a catalog entry produces a *new* card with a
+          *new* hash, which is what leaves every existing team pointing at
+          exactly what it was built from (ADR-26 §Consequences, NFR2).
+        * **Never deleted.** NO ``EventStore`` method removes a card,
+          ``delete_team`` included. Another team may share it, no refcount is
+          introduced, cards are small, and garbage collection is out of scope
+          (FR13).
+
+        Args:
+            cards: The cards to persist. Order is irrelevant; duplicates are
+                harmless. An empty list is a no-op.
+        """
+        ...
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes to cards, in ONE round trip.
+
+        Args:
+            hashes: The content hashes to resolve. An empty list returns ``{}``
+                without a backend round trip.
+
+        Returns:
+            A mapping keyed by hash holding an entry for every hash the store
+            holds, and NO entry for one it does not. A miss is an absent key,
+            never a raise: the store knows the hash but not the role, and the
+            role is half of what FR14's failure has to name. That failure is
+            owned by :func:`akgentic.team.projection.resolve_agent_cards`,
+            which raises ``AgentCardNotFoundError``.
+
+        Implementations MUST resolve the whole batch in ONE backend query
+        (Mongo ``$in``, SQL ``IN``, one directory read) rather than one per
+        hash — resolving a team's card set per role is the N+1 this store
+        exists to prevent, and it is invisible in the result.
+
+        A card the backend holds but cannot parse is skipped the way corrupted
+        team and state documents already are — logged, absent from the mapping —
+        so it surfaces as FR14's loud failure at resolution rather than as an
+        exception escaping the store.
         """
         ...
 

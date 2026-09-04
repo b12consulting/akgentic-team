@@ -7,11 +7,18 @@ the EventStore protocol via structural subtyping (no explicit inheritance).
 File layout per team::
 
     {data_dir}/
+      agent_cards/          # Content-addressed card store, SHARED by every team
+        {card_hash}.yaml    #   one blob per card (overwrite; immutable content)
       {team_uuid}/
         team.yaml           # Process metadata (overwrite)
         events.yaml         # Append-only event log (multi-document YAML)
         states/
           {agent_id}.yaml   # Latest agent state snapshot (overwrite)
+
+``agent_cards/`` is a **sibling** of the per-team directories, not a child of
+one. ``delete_team`` removes a whole team directory with ``shutil.rmtree``, so a
+card store nested inside one would be deleted with the first team that referenced
+it — making "cards are never deleted" (FR13) unsatisfiable by construction.
 """
 
 from __future__ import annotations
@@ -26,11 +33,20 @@ from typing import Any
 
 import yaml
 
+from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 
 logger = logging.getLogger(__name__)
+
+CARDS_DIRNAME = "agent_cards"
+"""Name of the shared card directory under ``data_dir``.
+
+Public because ``list_teams`` must skip it by name and tests assert the layout.
+A team directory is always a UUID, so the two namespaces cannot collide.
+"""
 
 
 class YamlEventStore:
@@ -76,6 +92,14 @@ class YamlEventStore:
             Path to the team's directory under the data root.
         """
         return self._data_dir / str(team_id)
+
+    def _cards_dir(self) -> Path:
+        """Return the shared card directory — a sibling of the team directories.
+
+        Deliberately NOT under a team directory: ``delete_team`` rmtrees those,
+        and cards outlive every team that references them (FR13).
+        """
+        return self._data_dir / CARDS_DIRNAME
 
     def save_team(self, process: Process) -> None:
         """Persist a team process snapshot to team.yaml.
@@ -279,6 +303,12 @@ class YamlEventStore:
         for child in sorted(self._data_dir.iterdir()):
             if not child.is_dir():
                 continue
+            if child.name == CARDS_DIRNAME:
+                # The shared card store is a deliberate sibling of the team
+                # directories, so it is skipped SILENTLY — the warning below
+                # fires once per list_teams call, not once per team, and would
+                # otherwise log on every single call for the rest of time.
+                continue
             try:
                 team_id = uuid.UUID(child.name)
             except ValueError:
@@ -452,3 +482,62 @@ class YamlEventStore:
         if team_dir.exists():
             shutil.rmtree(team_dir)
             logger.debug("Deleted team directory %s", team_dir)
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Persist agent cards as ``{data_dir}/agent_cards/{hash}.yaml``.
+
+        Content-addressed, so the write is naturally idempotent: the same card
+        always lands on the same path with the same bytes, whether it arrives
+        once or from ten teams. Rewritten rather than skipped, through
+        ``_atomic_write``, so a half-written file left by an earlier crash heals
+        on the next save instead of being trusted forever.
+
+        Args:
+            cards: The cards to persist. An empty list touches no filesystem.
+        """
+        if not cards:
+            return
+        cards_dir = self._cards_dir()
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        for card in cards:
+            storable = storable_agent_card(card)
+            card_path = cards_dir / f"{hash_agent_card(storable)}.yaml"
+            self._atomic_write(card_path, storable.model_dump())
+        logger.debug("Saved %d agent cards to %s", len(cards), cards_dir)
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes against the card directory, one read per hash.
+
+        The batch is a directory of files, so "one round trip" is one directory;
+        there is no query to push down. A hash the directory does not hold is
+        simply absent from the mapping, and a corrupted card file is skipped
+        with a log exactly as a corrupted team or state file is — either way it
+        surfaces as ``AgentCardNotFoundError`` at resolution rather than as an
+        exception escaping the store.
+
+        Args:
+            hashes: The content hashes to resolve; empty returns ``{}``.
+
+        Returns:
+            Mapping of hash to card for every hash the store holds.
+        """
+        if not hashes:
+            return {}
+        cards_dir = self._cards_dir()
+        if not cards_dir.exists():
+            return {}
+        resolved: dict[str, AgentCard] = {}
+        for card_hash in hashes:
+            card_path = cards_dir / f"{card_hash}.yaml"
+            if not card_path.exists():
+                continue
+            try:
+                with open(card_path) as f:
+                    resolved[card_hash] = AgentCard.model_validate(yaml.safe_load(f))
+            except (yaml.YAMLError, ValueError) as exc:
+                # ValueError covers both a non-UTF-8 file (UnicodeDecodeError
+                # out of the text stream) and Pydantic's ValidationError, the
+                # same pair _load_team_data and load_agent_states handle.
+                logger.error("Skipping corrupted agent card %s: %s", card_hash, exc)
+        logger.debug("Resolved %d of %d agent cards", len(resolved), len(hashes))
+        return resolved

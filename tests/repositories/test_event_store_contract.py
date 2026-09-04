@@ -17,13 +17,19 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_card import AgentCard
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import UserMessage
 
-from akgentic.team.models import Process, TeamStatus
-from akgentic.team.ports import EventNotFoundError, EventStore
+from akgentic.team.models import AgentCardRef, Process, TeamStatus
+from akgentic.team.ports import AgentCardNotFoundError, EventNotFoundError, EventStore
+from akgentic.team.projection import hash_agent_card, resolve_agent_cards
 from tests.models.conftest import (
     AcmeTeamMetadata,
     SampleAgentState,
+    make_agent_card,
     make_agent_state_snapshot,
     make_indexed_process,
     make_persisted_event,
@@ -959,3 +965,218 @@ class TestEventStoreContract:
             "load semantics); per-backend corrupted-payload coverage "
             "lives in tests/repositories/{yaml,mongo,postgres}/."
         )
+
+
+class ContractStubAgent(Akgent[BaseConfig, BaseState]):
+    """A real, importable agent class so a stored card can be validated back.
+
+    ``AgentCard`` resolves ``agent_class`` only when ``config`` arrives as a
+    dict — that is, on the way *out* of storage — so a card built with an
+    unresolvable FQCN constructs fine and fails the moment it is read back.
+    The card store reads cards back, so its fixtures need a class that exists.
+    """
+
+
+def _make_card(name: str, role: str) -> AgentCard:
+    """An AgentCard whose ``agent_class`` survives a store round trip."""
+    return make_agent_card(name=name, role=role, agent_class=ContractStubAgent)
+
+
+class TestAgentCardStoreContract:
+    """FR11-FR14: the content-addressed card store, on every backend.
+
+    Runs against yaml, mongo AND postgres through the same ``event_store``
+    fixture — which is precisely why a backend cannot be left unimplemented:
+    an absent method is an ``AttributeError`` here, not a silent gap.
+    """
+
+    # --- round trip and content addressing --------------------------------
+
+    def test_save_and_load_agent_card_round_trip(self, event_store: EventStore) -> None:
+        """A saved card comes back under its own hash."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+
+        event_store.save_agent_cards([card])
+        loaded = event_store.load_agent_cards([card_hash])
+
+        assert set(loaded) == {card_hash}
+        assert loaded[card_hash].role == "Lead"
+        assert loaded[card_hash].description == card.description
+        assert loaded[card_hash].skills == card.skills
+
+    def test_a_card_read_back_rehashes_to_the_key_it_was_stored_under(
+        self, event_store: EventStore
+    ) -> None:
+        """The invariant that makes the store content-addressed, not merely hash-keyed.
+
+        A backend that dropped or reordered a field on the way through would
+        still return *a* card under the right key; only re-hashing the result
+        catches it.
+        """
+        card = _make_card("analyst", "Analyst")
+        card_hash = hash_agent_card(card)
+
+        event_store.save_agent_cards([card])
+        loaded = event_store.load_agent_cards([card_hash])
+
+        assert hash_agent_card(loaded[card_hash]) == card_hash
+
+    def test_can_be_hired_is_normalised_off_the_stored_card(
+        self, event_store: EventStore
+    ) -> None:
+        """FR12: hireability rides on the ``AgentCardRef``, never on the blob.
+
+        Excluding the flag from the hash is not enough on its own — the stored
+        BYTES have to be a pure function of the hash too, or two teams
+        differing only in hireability write the same key with different content
+        and last-write-wins decides what everyone else reads.
+        """
+        hireable = _make_card("specialist", "Specialist").model_copy(
+            update={"can_be_hired": True}
+        )
+        card_hash = hash_agent_card(hireable)
+
+        event_store.save_agent_cards([hireable])
+        loaded = event_store.load_agent_cards([card_hash])
+
+        assert loaded[card_hash].can_be_hired is False
+
+    def test_two_teams_differing_only_in_hireability_share_one_blob(
+        self, event_store: EventStore
+    ) -> None:
+        """The same role, hireable for one team and not the other, is ONE card."""
+        plain = _make_card("writer", "Writer")
+        hireable = plain.model_copy(update={"can_be_hired": True})
+
+        assert hash_agent_card(plain) == hash_agent_card(hireable)
+
+        event_store.save_agent_cards([plain])
+        event_store.save_agent_cards([hireable])
+        loaded = event_store.load_agent_cards([hash_agent_card(plain)])
+
+        assert set(loaded) == {hash_agent_card(plain)}
+        assert loaded[hash_agent_card(plain)].can_be_hired is False
+
+    # --- idempotence ------------------------------------------------------
+
+    def test_saving_the_same_card_twice_is_idempotent(
+        self, event_store: EventStore
+    ) -> None:
+        """A re-save must not raise (upsert, never insert) and must not fork the key."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+
+        event_store.save_agent_cards([card])
+        event_store.save_agent_cards([card])
+        event_store.save_agent_cards([card, card])
+
+        loaded = event_store.load_agent_cards([card_hash])
+        assert set(loaded) == {card_hash}
+        assert hash_agent_card(loaded[card_hash]) == card_hash
+
+    def test_two_teams_sharing_a_role_store_one_card(
+        self, event_store: EventStore
+    ) -> None:
+        """Two teams from the same catalog namespace: one stored card per role."""
+        shared = _make_card("lead", "Lead")
+        team_a = [shared, _make_card("analyst", "Analyst")]
+        team_b = [shared, _make_card("writer", "Writer")]
+
+        event_store.save_agent_cards(team_a)
+        event_store.save_agent_cards(team_b)
+
+        hashes = [hash_agent_card(c) for c in (*team_a, *team_b)]
+        loaded = event_store.load_agent_cards(hashes)
+        assert set(loaded) == set(hashes)
+        assert len(set(hashes)) == 3
+
+    # --- batch semantics --------------------------------------------------
+
+    def test_load_resolves_the_whole_batch(self, event_store: EventStore) -> None:
+        cards = [_make_card(f"agent-{i}", f"Role{i}") for i in range(5)]
+        hashes = [hash_agent_card(c) for c in cards]
+
+        event_store.save_agent_cards(cards)
+        loaded = event_store.load_agent_cards(hashes)
+
+        assert set(loaded) == set(hashes)
+        assert [loaded[h].role for h in hashes] == [c.role for c in cards]
+
+    def test_an_unknown_hash_is_absent_rather_than_raising(
+        self, event_store: EventStore
+    ) -> None:
+        """The store does not know the role, so it cannot raise FR14's error."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        event_store.save_agent_cards([card])
+
+        loaded = event_store.load_agent_cards([card_hash, "0" * 64])
+
+        assert set(loaded) == {card_hash}
+
+    def test_loading_an_unknown_hash_from_an_empty_store_returns_empty(
+        self, event_store: EventStore
+    ) -> None:
+        assert event_store.load_agent_cards(["0" * 64]) == {}
+
+    def test_saving_an_empty_list_is_a_no_op(self, event_store: EventStore) -> None:
+        """A team with no cards must not create storage or raise."""
+        event_store.save_agent_cards([])
+        assert event_store.load_agent_cards(["0" * 64]) == {}
+
+    def test_loading_an_empty_list_returns_an_empty_mapping(
+        self, event_store: EventStore
+    ) -> None:
+        event_store.save_agent_cards([_make_card("lead", "Lead")])
+        assert event_store.load_agent_cards([]) == {}
+
+    # --- delete_team never touches the store (FR13) -----------------------
+
+    def test_delete_team_leaves_the_card_store_untouched(
+        self, event_store: EventStore
+    ) -> None:
+        """Mutation-verified: purging the cards in ``delete_team`` turns this red."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        process = make_process()
+
+        event_store.save_agent_cards([card])
+        event_store.save_team(process)
+        event_store.delete_team(process.team_id)
+
+        assert event_store.load_team(process.team_id) is None
+        assert set(event_store.load_agent_cards([card_hash])) == {card_hash}
+
+    def test_a_second_team_sharing_the_cards_still_resolves_after_a_delete(
+        self, event_store: EventStore
+    ) -> None:
+        """FR13's whole point: cards outlive every team that referenced them."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        deleted = make_process()
+        survivor = make_process()
+
+        event_store.save_agent_cards([card])
+        event_store.save_team(deleted)
+        event_store.save_team(survivor)
+        event_store.delete_team(deleted.team_id)
+
+        resolved = resolve_agent_cards(
+            [AgentCardRef(role="Lead", card_hash=card_hash)], event_store
+        )
+        assert [c.role for c in resolved] == ["Lead"]
+
+    # --- the loud failure (FR14) ------------------------------------------
+
+    def test_an_unresolvable_ref_raises_naming_the_role_and_the_hash(
+        self, event_store: EventStore
+    ) -> None:
+        missing = "f" * 64
+        with pytest.raises(AgentCardNotFoundError) as excinfo:
+            resolve_agent_cards(
+                [AgentCardRef(role="Ghost", card_hash=missing)], event_store
+            )
+
+        assert "Ghost" in str(excinfo.value)
+        assert missing in str(excinfo.value)

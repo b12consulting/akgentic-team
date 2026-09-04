@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the nine :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the eleven :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -21,9 +21,11 @@ from collections.abc import Mapping
 
 from nagra import Transaction  # type: ignore[import-untyped]
 
+from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
 
 _LIKE_ESCAPE = "!"
@@ -256,6 +258,10 @@ class NagraEventStore:
         Order (dependency-safe): ``agent_state_entries`` → ``event_entries``
         → ``team_process_entries``. Idempotent: calling twice for the same
         id is a no-op on the second call (matches YAML / Mongo semantics).
+
+        ``agent_card_entries`` is deliberately NOT in the cascade: cards are
+        content-addressed and shared, another team may reference the very rows
+        this team did, and no refcount exists (FR13).
         """
         tid = str(team_id)
         with Transaction(self._conn_string) as trn:
@@ -353,3 +359,64 @@ class NagraEventStore:
             AgentStateSnapshot.model_validate(decode_jsonb_column(r[0]))
             for r in rows
         ]
+
+    # --- agent cards (agent_card_entries) ----------------------------------
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Upsert agent cards into ``agent_card_entries``, keyed by content hash.
+
+        ``ON CONFLICT (card_hash) DO UPDATE`` rather than a plain ``INSERT``:
+        the store is content-addressed, so a card arriving again — from a
+        re-save or from a second team — writes the same bytes to the same row
+        instead of violating the natural key. Nagra's ``create_tables()``
+        provisions that key from ``schema.toml``, which is what makes the
+        ``ON CONFLICT`` target valid.
+
+        The whole batch runs in ONE transaction, so a team's cards land
+        together or not at all.
+
+        Args:
+            cards: The cards to persist. An empty list opens no transaction.
+        """
+        if not cards:
+            return
+        with Transaction(self._conn_string) as trn:
+            for card in cards:
+                storable = storable_agent_card(card)
+                trn.execute(
+                    "INSERT INTO agent_card_entries (card_hash, data) "
+                    "VALUES (%s, %s) "
+                    "ON CONFLICT (card_hash) DO UPDATE SET data = EXCLUDED.data",
+                    (hash_agent_card(storable), json.dumps(storable.model_dump())),
+                )
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes with a single ``IN`` query.
+
+        One statement for the whole batch. The ``IN`` list is built from a
+        placeholder per hash — fixed ``%s`` fragments joined with commas — so
+        every caller value still travels as a bound parameter and none reaches
+        SQL through interpolation.
+
+        Args:
+            hashes: The content hashes to resolve; empty returns ``{}`` without
+                opening a transaction (and avoids an ``IN ()``, which is not
+                valid SQL).
+
+        Returns:
+            Mapping of hash to card for every hash the table holds. A hash the
+            table does not hold is simply absent.
+        """
+        if not hashes:
+            return {}
+        placeholders = ", ".join(["%s"] * len(hashes))
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute(
+                "SELECT card_hash, data FROM agent_card_entries "
+                f"WHERE card_hash IN ({placeholders})",
+                tuple(hashes),
+            )
+            rows = cursor.fetchall()
+        return {
+            row[0]: AgentCard.model_validate(decode_jsonb_column(row[1])) for row in rows
+        }

@@ -25,15 +25,29 @@ from typing import TYPE_CHECKING, Any
 
 import psycopg
 import pytest
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_card import AgentCard
 from nagra import Transaction  # type: ignore[import-untyped]
 
 from akgentic.team.models import Process, TeamStatus
+from akgentic.team.projection import hash_agent_card
 from akgentic.team.repositories.postgres import NagraEventStore, init_db
 
 if TYPE_CHECKING:
     from akgentic.team.ports import EventStore
 
-from tests.models.conftest import AcmeTeamMetadata, make_indexed_process, make_persisted_event
+from tests.models.conftest import (
+    AcmeTeamMetadata,
+    make_agent_card,
+    make_indexed_process,
+    make_persisted_event,
+    make_process,
+)
+
+
+def _card_fixture() -> AgentCard:
+    """An AgentCard whose ``agent_class`` resolves on the way back out of storage."""
+    return make_agent_card(name="lead", role="Lead", agent_class=Akgent)
 
 
 def _read_metadata_indexes_column(conn_string: str, team_id: uuid.UUID) -> list[str] | None:
@@ -726,3 +740,86 @@ class TestMetadataStatementShape:
         declared = sql.split("ESCAPE '")[1][0]
         pattern = str(params[0])
         assert pattern == f"tenant|50{declared}%%"
+
+
+class TestNagraAgentCardStore:
+    """Postgres-only invariants of the content-addressed card store.
+
+    Behavioural coverage runs in the shared contract suite; what is here is the
+    table itself — that ``init_db`` provisions it, that it carries no
+    ``team_id``, and that ``delete_team``'s cascade does not reach it.
+    """
+
+    def test_init_db_provisions_the_card_table(self, postgres_initialized: str) -> None:
+        """No hand-written ``ALTER TABLE`` — ``create_tables()`` is the upgrade path.
+
+        A database provisioned before this table existed gains it on the next
+        ``init_db`` call, which is why the story adds nothing to ``init_db``
+        beyond the ``schema.toml`` declaration.
+        """
+        with Transaction(postgres_initialized) as trn:
+            cursor = trn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'agent_card_entries'"
+            )
+            columns = {row[0] for row in cursor.fetchall()}
+
+        assert {"card_hash", "data"} <= columns
+        assert "team_id" not in columns
+
+    def test_a_re_save_updates_the_row_rather_than_raising(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """``ON CONFLICT`` against the natural key Nagra provisions."""
+        store = NagraEventStore(postgres_clean_tables)
+        card = _card_fixture()
+
+        store.save_agent_cards([card])
+        store.save_agent_cards([card])
+
+        with Transaction(postgres_clean_tables) as trn:
+            cursor = trn.execute("SELECT COUNT(*) FROM agent_card_entries")
+            row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+    def test_delete_team_does_not_cascade_to_the_card_table(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """FR13, asserted with SQL rather than through a later read."""
+        store = NagraEventStore(postgres_clean_tables)
+        process = make_process()
+        store.save_agent_cards([_card_fixture()])
+        store.save_team(process)
+
+        store.delete_team(process.team_id)
+
+        with Transaction(postgres_clean_tables) as trn:
+            cursor = trn.execute("SELECT COUNT(*) FROM agent_card_entries")
+            row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+    def test_saving_no_cards_writes_no_row(self, postgres_clean_tables: str) -> None:
+        store = NagraEventStore(postgres_clean_tables)
+        store.save_agent_cards([])
+
+        with Transaction(postgres_clean_tables) as trn:
+            cursor = trn.execute("SELECT COUNT(*) FROM agent_card_entries")
+            row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == 0
+
+    def test_the_batch_load_is_one_statement_over_the_whole_set(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """An ``IN`` list of bound placeholders, never a query per hash."""
+        store = NagraEventStore(postgres_clean_tables)
+        cards = [
+            make_agent_card(name=f"agent-{i}", role=f"Role{i}", agent_class=Akgent)
+            for i in range(4)
+        ]
+        store.save_agent_cards(cards)
+        hashes = [hash_agent_card(c) for c in cards]
+
+        assert set(store.load_agent_cards(hashes)) == set(hashes)

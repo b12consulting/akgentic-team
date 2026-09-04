@@ -102,12 +102,21 @@ def postgres_initialized(postgres_conn_string: str) -> str:
 
 @pytest.fixture
 def postgres_clean_tables(postgres_initialized: str) -> Iterator[str]:
-    """Truncate the three team event-store tables between tests."""
+    """Truncate the four team event-store tables between tests.
+
+    ``agent_card_entries`` is included even though ``delete_team`` never touches
+    it: the store is deliberately shared across teams, so without a truncate a
+    card seeded by one test would still resolve in the next and a
+    "hash absent from the store" assertion would pass for the wrong reason.
+    """
     from nagra import Transaction  # type: ignore[import-untyped]
 
     yield postgres_initialized
     with Transaction(postgres_initialized) as trn:
-        trn.execute("TRUNCATE team_process_entries, event_entries, agent_state_entries")
+        trn.execute(
+            "TRUNCATE team_process_entries, event_entries, agent_state_entries, "
+            "agent_card_entries"
+        )
 
 
 # --- Parametrized contract fixture --------------------------------------
