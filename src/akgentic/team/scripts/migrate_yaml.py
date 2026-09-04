@@ -121,8 +121,13 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s is not a directory; nothing to migrate", data_dir)
         return 2
 
-    store = YamlEventStore(data_dir)
-    report = migrate_documents(read_documents(data_dir), store)
+    try:
+        store = YamlEventStore(data_dir)
+        report = migrate_documents(read_documents(data_dir), store)
+    except Exception:
+        logger.exception("YAML migration failed")
+        return 1
+
     log_report(report)
     return 1 if report.failed else 0
 

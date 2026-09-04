@@ -293,12 +293,13 @@ def make_indexed_process(
 def to_legacy_document(process: Process, team_card: TeamCard) -> dict[str, Any]:
     """Render *process* back into the PRE-projection stored shape.
 
-    The only honest reconstruction available now that ``Process.team_card`` is
-    gone: take the current dump, drop the seven projection fields, and put the
-    nested card back. A document built this way carries exactly what a store
-    written before story 31-1 holds — ``team_card`` present, ``entry_point``
-    absent — which is the shape ``Process.reject_unmigrated_document``
-    recognises and the migration converts.
+    The only honest reconstruction available now that ``Process`` no longer
+    carries a nested ``team_card``: take the current dump, drop the seven
+    projection fields, and put the nested card back. A document built this way
+    carries exactly what a store written before story 31-1 holds —
+    ``team_card`` present, ``entry_point`` absent — which is the shape
+    ``Process.reject_unmigrated_document`` recognises and the migration
+    converts.
 
     The seven keys to drop come from ``projection_kwargs`` rather than a
     hand-written list, so this fixture cannot fall behind a projection that

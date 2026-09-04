@@ -17,6 +17,7 @@ multi-agent teams with event-sourced persistence and crash recovery.
 - [Messages](#messages)
 - [Team Metadata](#team-metadata)
 - [Persistence](#persistence)
+- [Upgrading a deployed store](#upgrading-a-deployed-store)
 - [CLI](#cli)
 - [Examples](#examples)
 - [Development](#development)
@@ -30,7 +31,7 @@ providing:
 
 - **Declarative team definitions** — `TeamCard` is the root object that
   parametrizes a whole team: its hierarchical `TeamCardMember` tree, entry
-  point, message type, metadata schema and hireable profiles
+  point, message type, metadata schema and the roles it declares hireable
 - **One-call team building** via `TeamFactory` — from a `TeamCard` to live
   Pykka actors with routing wired
 - **Full lifecycle management** via `TeamManager` — create, stop, resume,
@@ -289,8 +290,8 @@ mechanism working, not a fault.
 `TeamCard` is the one object that parametrizes a team. Everything the framework
 needs in order to build the team and route into it is declared there: who is in
 the team, who reports to whom, who faces the outside world, which message type
-the team speaks, what business metadata it carries, and which extra profiles it
-is allowed to hire while running.
+the team speaks, what business metadata it carries, and which extra roles it
+declares hireable at runtime.
 
 It is a **pure Pydantic model** — no actor exists until the card is handed to
 `TeamFactory.build()`, in practice through `TeamManager.create_team()`.
@@ -304,7 +305,8 @@ create_team(team_card)
    │      1. Orchestrator actor
    │      2. entry_point, then the members tree — each agent is spawned
    │         through its parent and emits StartMessage(config, parent)
-   │      3. agent_profiles ──▶ orchestrator role catalog
+   │      3. every role reachable from the card ──▶ orchestrator role catalog
+   │         (entry point + the whole member tree + agent_profiles, by role)
    │      4. welcome_message ──▶ WelcomeMessage on the event stream
    │      │
    │      └─▶ TeamRuntime          (live handle, returned to you)
@@ -313,21 +315,33 @@ create_team(team_card)
    │      PersistenceSubscriber ──▶ EventStore ─┬─ events
    │                                            └─ agent_states
    │
-   └─▶ save_team(Process(team_id, team_card, RUNNING, metadata, …))
+   └─▶ derive_team_projection(team_card)
           │
-          └─▶ team collection      (the card, stored for reference)
+          ├─▶ save_agent_cards(...)   agent-card store  (written FIRST,
+          │                           keyed by content hash)
+          │
+          └─▶ save_team(Process(team_id, RUNNING, metadata, …))
+                 │
+                 └─▶ team collection   (the projection: team_name,
+                        team_description, entry_point and supervisors as
+                        {name, role} refs, agent_cards as
+                        {role, card_hash, can_be_hired} refs, message_types,
+                        metadata_type — no card)
 ```
 
-#### Restore — the card does *not* rebuild the team
+#### Restore — the stored record does *not* rebuild the team
 
-The card kept on the `Process` is a reference: what this team was *asked* to be.
+The `Process` does not keep the card the team was created from. It keeps a flat
+**structural projection** of it, derived at creation by one function
+(`akgentic.team.projection.derive_team_projection`): who the entry point is, who
+the supervisors are, and which role resolves to which card in the card store.
 The roster that comes back is the one that was actually alive, and that is read
-from the event store, not from the card.
+from the event store, not from the projection.
 
 ```
 resume_team(team_id)
    │
-   ├─▶ load_team(team_id) ──▶ Process.team_card       (reference — see below)
+   ├─▶ load_team(team_id) ──▶ Process   (the projection — see below)
    │
    └─▶ TeamRestorer.restore(process)
           1. load_events(team_id) + load_agent_states(team_id)
@@ -345,15 +359,19 @@ resume_team(team_id)
 | `StartMessage` / `StopMessage` in the event log | which agents are alive, and each one's name, role, config and parent |
 | `agent_states` collection | each agent's persisted state |
 | replay of the remaining events | the orchestrator's history and the agents' message context |
-| `Process.team_card` | the team-level wiring only — which member is the entry point, which are the supervisors, which `agent_profiles` to re-register, which `metadata_type` to validate against |
+| `Process.entry_point` | the **spawned** name and role of the agent every `send()` routes through |
+| `Process.supervisors[*].name` | the spawned names of the first-layer members. `headcount` is already expanded here — two instances of one role are two refs — so a restore expands nothing |
+| `Process.agent_cards` | one `{role, card_hash, can_be_hired}` ref per role reachable from the team. Resolved against the agent-card store and registered as the orchestrator's role catalog |
+| `Process.metadata_type` | the model class this team's `metadata` is validated against, read here rather than off a nested card |
 
 The practical consequence: an agent hired at runtime comes back after a resume
 even though no card ever mentioned it, and a member the card declares stays gone
 if it was fired. Editing a card does not retro-fit a team already created from it.
 
-Storing the card on the `Process` is nonetheless what makes it round-trip through
-the team collection, which is why every field is a declared, serializable type —
-and why the same card can be written as YAML and fed to the CLI (see [CLI](#cli)).
+The projection is a **flat, serializable** record, which is why every one of its
+fields is a declared type — and the card it was derived from remains writable as
+YAML and feedable to the CLI (see [CLI](#cli)), because `create_team` still takes
+a `TeamCard`. Only what is *stored* changed.
 
 #### Fields
 
@@ -365,7 +383,7 @@ and why the same card can be written as YAML and fed to the CLI (see [CLI](#cli)
 | `members` | `list[TeamCardMember]` | `[]` | The team proper, as a tree. Its **first layer** are the supervisors — the agents the entry point actually delivers to. |
 | `message_types` | `list[type]` | `[]` | The message classes the team speaks. **The first is the team default**: it is what a plain `str` handed to `send()` gets wrapped in. See [Messages](#messages). |
 | `metadata_type` | `type[SerializableBaseModel] \| None` | `None` | The model class this team's business metadata must validate against, typically a `TeamMetadata` subclass. See [Team Metadata](#team-metadata). |
-| `agent_profiles` | `list[AgentCard]` | `[]` | The profiles the orchestrator is given access to: cards registered in its catalog but **not** spawned. They are what an agent may hire at runtime, and what the `team_roles()` tool advertises in the system prompt. |
+| `agent_profiles` | `list[AgentCard]` | `[]` | The roles this team **declares hireable**: cards that are registered but **not** spawned. They are marked `can_be_hired=True` in the role catalog. The catalog itself is wider than this list — see the note below. |
 | `welcome_message` | `str \| None` | `None` | Static greeting published on the team's event stream when the team is first created (not on resume). `None` disables it. |
 
 Two properties are derived from the tree rather than declared:
@@ -373,29 +391,51 @@ Two properties are derived from the tree rather than declared:
 | Property | Returns |
 |---|---|
 | `agent_cards` | Flat `dict[name, AgentCard]` of every card in the tree, entry point included. **Raises `ValueError` on a duplicate `config.name`** — this is where name collisions surface. |
-| `supervisors` | The `AgentCard`s of the **first layer of `members` only**. The entry point is excluded (it is the sender), and so is anything nested deeper. This is exactly the set `send()` fans out to. |
+| `supervisors` | The `AgentCard`s of the **first layer of `members` only** — one card per **declared slot**, not per spawned actor. The entry point is excluded (it is the sender), and so is anything nested deeper. A slot declared with `headcount=3` is one card here and three live agents named `<name>_0..2`, so the names on these cards are **not** the names of anything that receives a message. The set `send()` fans out to is `TeamRuntime.supervisor_addrs`, keyed off the spawn result; use `spawned_names()` for names. Addressing recipients through this property is the mistake that once dropped every multi-instance supervisor out of the fan-out. Nothing in the framework reads it. |
 
 Two fields deserve a note beyond the table:
 
-- **`agent_profiles` is the orchestrator's role catalog.** The factory registers
-  it through `Orchestrator.register_agent_profiles()` at create *and* at restore,
-  keyed by `card.role`. Two things read it back:
+- **`agent_profiles` declares hireable roles; the role catalog is the whole
+  roster.** The factory registers one card per **role** reachable from the card —
+  the entry point, every member of the tree at every depth, *and*
+  `agent_profiles` — through `Orchestrator.register_agent_profiles()` at create
+  *and* at restore. Registering the whole roster is what lets one agent read a
+  colleague's `description` and `skills` at all. `agent_profiles` is the subset
+  carried into the catalog with `can_be_hired=True`.
+
+  Two things read the catalog back:
 
   - **`team_roles()`**, the Team tool's role-profiles prompt (exposed on the
     system-prompt and command channels). It renders the catalog into the agent's
-    system prompt one line per profile — `role: description (Skills: …)` — which
-    is how an LLM agent learns which roles exist for hiring, and why `description`
-    and `skills` on those cards are prompt copy, not decoration.
+    system prompt one line per role — `role: description (Skills: …)` — which is
+    why `description` and `skills` on those cards are prompt copy, not
+    decoration.
   - **`hire_member(role)` / `hire_members(roles)`**, which look the card up by
     role and spawn it.
 
-  Because the catalog is keyed by role, two profiles sharing a role silently
-  overwrite each other. And keep live members out of the list: they are already in
-  the room, so registering them lets the LLM hire a duplicate of an agent it can
-  already talk to.
+  **What `can_be_hired` does today, stated plainly.** The flag records which
+  roles a team declares hireable, and it is written onto every `AgentCardRef` on
+  the `Process`. The guard that would refuse a hire of a non-hireable role lives
+  in `akgentic-tool` and **has not shipped**
+  (`b12consulting/akgentic-tool#321`): no code in the framework reads the flag,
+  the hire path takes any catalog card whose role matches, and
+  `get_available_roles()` advertises every registered role back to the model. So
+  today every registered role can be hired, live members included — which means
+  an agent can spawn a duplicate of a colleague it can already talk to. That is a
+  known consequence of the widened catalog, not a property of the flag.
+
+  **Dedup and precedence.** The catalog is keyed by role, so two profiles sharing
+  a role collapse to one entry. A role that appears in **both** the member tree
+  and `agent_profiles` resolves to the **`agent_profiles` card** — a profile
+  declares what a newly hired agent of that role *should* be, while a tree card
+  only records what one already-running member was built from.
 - **`metadata_type` is a declared field, not a type parameter.** A parameterised
-  `TeamCard[X]` has no importable dotted path, which would break the very
-  round-trip `Process.team_card` exists to perform.
+  `TeamCard[X]` is a Pydantic-generated class with no importable dotted path, so
+  the `__model__` tag cannot round-trip it — and a `TeamCard` still crosses that
+  round-trip whole: it is the create-time request body the `akgentic-infra`
+  worker route accepts, serialized and posted by the enterprise and department
+  deployment tiers alike. Declaring the metadata model as a field keeps the card
+  on the wire.
 
 ### TeamCardMember — the member tree
 
@@ -443,7 +483,7 @@ team_card = TeamCard(
         ]),
     ],
     message_types=[UserMessage],                          # team default type
-    agent_profiles=[translator_card],                     # hireable, not spawned
+    agent_profiles=[translator_card],                     # declared hireable, not spawned
     welcome_message="Research team ready.",
 )
 
@@ -485,9 +525,11 @@ Live handle to a running team, returned by `create_team()` and `resume_team()`:
 
 ```python
 runtime.id                                # team UUID
-runtime.team                              # the TeamCard it was built from
+runtime.team_name                         # the team's name, or None
+runtime.message_types                     # the message classes the team speaks
 runtime.addrs                             # agent name → ActorAddress (every member)
-runtime.supervisor_addrs                  # the first-layer members send() fans out to
+runtime.supervisor_addrs                  # spawned first-layer instances, headcount
+                                          #   expanded — the set send() fans out to
 
 runtime.send("Hello!")                    # into the team, through the entry point
 runtime.send_to("@Reviewer", "Hello!")    # directed to one member
@@ -498,6 +540,13 @@ runtime.emitMessage(some_message)         # publish to the record, no agent invo
 `TeamRuntime` is itself serializable: the addresses are persistent fields and the
 actor proxies are rebuilt from them in `model_post_init`, which is what lets a
 restored team be handed back as an ordinary runtime.
+
+It carries **no `TeamCard`**. `team_name` and `message_types` are plain values it
+holds itself; the entry point's agent class comes from the orchestrator's role
+catalog, keyed by the entry address's own role; and whether a target is a
+`UserProxy` comes from that target's `ActorAddress` — the actor's actual type,
+never a card's declaration. That is what lets the restore path build a runtime
+from the stored projection alone.
 
 ## Messages
 
@@ -847,7 +896,13 @@ data/{team-uuid}/
   team.yaml              # Process metadata (overwrite)
   events.yaml            # All events (append-only)
   states/{agent-id}.yaml # Agent state snapshots (overwrite)
+data/agent_cards/
+  {card-hash}.yaml       # Content-addressed AgentCards, shared across teams
 ```
+
+`agent_cards/` is a **sibling of the per-team directories, not a team**, which is
+why `list_teams` and the migration both skip it by name rather than by trying to
+parse its name as a UUID.
 
 **MongoDB** — install the `[mongo]` extra:
 
@@ -857,8 +912,11 @@ import pymongo
 
 db = pymongo.MongoClient("mongodb://localhost:27017")["akgentic"]
 event_store = MongoEventStore(db)
-# Collections: teams, events, agent_states
+# Collections: teams, events, agent_states, agent_cards
 ```
+
+`agent_cards` holds the content-addressed `AgentCard` blobs, keyed by hash and
+shared across teams.
 
 **PostgreSQL (Nagra)** — install the `[postgres]` extra:
 
@@ -868,7 +926,7 @@ uv sync --extra postgres
 ```
 
 The PostgreSQL backend is built on [Nagra](https://pypi.org/project/nagra/)
-and stores team state across three tables with promoted query keys plus a
+and stores team state across four tables with promoted query keys plus a
 `data JSONB` payload (the payload is authoritative — promoted columns are
 indexes, not the source of truth):
 
@@ -877,6 +935,7 @@ indexes, not the source of truth):
 | `team_process_entries` | `id` | One row per team — `Process` snapshot. Also carries the promoted `metadata_indexes TEXT[]` column |
 | `event_entries` | `(team_id, sequence)` | Append-only event log |
 | `agent_state_entries` | `(team_id, agent_id)` | Agent state snapshots |
+| `agent_card_entries` | `card_hash` | Content-addressed `AgentCard` blobs, shared across teams |
 
 `init_db` creates two indexes on `team_process_entries`: the functional
 expression index `team_process_user_id_idx` over `(data ->> 'user_id')`, and
@@ -886,8 +945,11 @@ addresses them by name.
 
 Each public `NagraEventStore` method opens its own `Transaction`. The one
 exception is `delete_team`, which spans a single transaction across the
-three tables (ordered: `agent_state_entries` → `event_entries` →
-`team_process_entries`) so cascade deletion is atomic. `save_event`
+three per-team tables (ordered: `agent_state_entries` → `event_entries` →
+`team_process_entries`) so cascade deletion is atomic. **`delete_team` leaves
+the agent-card store untouched on every backend** — cards are content-addressed
+and shared, another team may reference the very blobs this team did, and no
+refcount exists, so cards are never deleted. `save_event`
 propagates the raw `psycopg`/Nagra `UniqueViolation` on duplicate
 `(team_id, sequence)` — matching the Mongo backend's raw
 `DuplicateKeyError` propagation.
@@ -1014,6 +1076,82 @@ deployment project owns the application-level switch.
 2. **Rebuild** agents from the event log (Orchestrator first, then others)
 3. **Replay** all events to reconstruct full state including LLM context
 
+## Upgrading a deployed store
+
+A `Process` written before the structural projection carries a nested
+`team_card` and none of the projection fields. Such a document does not load:
+`Process` refuses it by design, and all three backends log the refusal and skip
+the row rather than failing the whole read. **Every team already in a deployed
+store therefore needs converting once.**
+
+### Rollout ordering — a hard constraint
+
+**Run the migration between stopping the old version and starting the new one.**
+
+Old code cannot read a migrated document, and new code cannot resume an
+unmigrated one. There is no window in which both versions can serve the same
+store, so the migration is not a rolling upgrade step — it belongs in the gap.
+
+On a distributed deployment that window includes **every worker process**. A
+Dapr-based tier that upgrades some replicas before others resolves to "some
+teams resume, some do not", decided by which replica happened to serve the
+request — with no error that names the cause. Stop the whole fleet, migrate,
+start the whole fleet.
+
+Each script repeats this constraint in its `--help`.
+
+### "Team not found" after the upgrade means unmigrated, not deleted
+
+An unmigrated team reports **`Team {id} not found`**, and that team has **not**
+been deleted.
+
+The mechanism, in one line: `Process.entry_point` is required, an unmigrated
+document carries `team_card` and no `entry_point`, validation refuses it, and
+all three backends log-and-skip it — so the team reads as absent to
+`load_team`, `resume_team` and `list_teams` alike. The caller-visible surface is
+deliberately unchanged: promoting the skip to an escaping error would break
+`list_teams` for the whole store because of one bad row.
+
+**The remedy is to run the migration script for that backend.** Nothing is lost
+in the meantime; the documents are intact and simply unreadable by the new code.
+
+### The migration scripts
+
+One conversion (`akgentic.team.migration.migrate_documents`) behind one
+derivation (`akgentic.team.projection.derive_team_projection`) behind three
+readers, so a migrated team and a freshly created one cannot disagree.
+
+All three read the store **raw**. `list_teams` returns *nothing* for an
+unmigrated store — it skips exactly the documents the migration exists to
+convert — so a migration built on the public read path would convert nothing and
+report success.
+
+All three are **idempotent**: a document that already carries the projection is
+skipped without a write, so re-running after a partial run costs nothing and
+changes nothing.
+
+| Backend | Invocation | Configuration |
+|---|---|---|
+| YAML | `python -m akgentic.team.scripts.migrate_yaml --data-dir /var/lib/akgentic/teams` | `--data-dir` is required — the directory `YamlEventStore` was built with |
+| MongoDB | `python -m akgentic.team.scripts.migrate_mongo` | `MONGO_URI` and `MONGO_DB`, the same names `init_mongo` uses; either may be overridden with `--mongo-uri` / `--mongo-db` |
+| PostgreSQL | `python -m akgentic.team.scripts.migrate_postgres` | `DB_CONN_STRING_PERSISTENCE`, the same name `init_db` uses; overridable with `--conn-string` |
+
+Exit codes are the same three everywhere:
+
+| Code | Meaning |
+|---|---|
+| `0` | every document converted or skipped |
+| `1` | at least one document could not be converted (each is logged with its `team_id`), or the backend is unavailable or unreachable |
+| `2` | the required configuration is missing — `--data-dir` absent or not a directory, `MONGO_URI` / `MONGO_DB` unset, `DB_CONN_STRING_PERSISTENCE` unset |
+
+A run that hits `1` has still converted everything it could; the count exists
+because not aborting is not the same as succeeding. Re-run it after fixing the
+cause — the documents it did convert are skipped the second time.
+
+> **PostgreSQL only:** run `python -m akgentic.team.scripts.init_db` first if the
+> store predates the content-addressed card table. The migration writes into
+> `agent_card_entries`, which `init_db` provisions.
+
 ## CLI
 
 The `ak-team` command is available when the `[cli]` extra is installed.
@@ -1103,17 +1241,20 @@ proves less.
 ```
 src/akgentic/team/
     __init__.py          # Public API (__all__)
-    models.py            # TeamCard, TeamRuntime, Process, TeamStatus, persistence models
+    models.py            # TeamCard, TeamRuntime, Process, AgentRef, AgentCardRef, TeamStatus
     messages.py          # WelcomeMessage
     metadata.py          # TeamMetadata, make_index_entry, derive_metadata_indexes
     reference_metadata.py # ReferenceTeamMetadata — the worked metadata example
+    projection.py        # derive_team_projection, hash_agent_card — the one derivation
+    migration.py         # migrate_documents — the one pre-projection conversion
     ports.py             # EventStore, ServiceRegistry protocols, NullServiceRegistry
     factory.py           # TeamFactory — static builder
     manager.py           # TeamManager — lifecycle facade
     restorer.py          # TeamRestorer — crash recovery
     subscriber.py        # PersistenceSubscriber, IdleStopSubscriber
     repositories/        # YamlEventStore, MongoEventStore, postgres/NagraEventStore
-    scripts/             # init_db / init_mongo deployment entry points
+    scripts/             # init_db / init_mongo, plus migrate_yaml / migrate_mongo
+                         #   / migrate_postgres deployment entry points
     cli/                 # ak-team CLI (Typer)
 examples/                # 6 progressive examples with companion docs
 tests/                   # organized by domain, mirroring src/

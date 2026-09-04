@@ -62,6 +62,28 @@ class TestMigrateYamlScriptConfiguration:
 
         assert script.main(["--data-dir", str(not_a_dir)]) == 2
 
+    def test_an_unreadable_data_dir_exits_1_rather_than_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Story 31-6 AC 12: ``main`` fails like its two sibling scripts.
+
+        The directory passes ``is_dir()`` — so this is past the exit-2 gate —
+        and then raises on iteration, which is what a permissions change or a
+        read-only mount looks like mid-run. Per-file read errors are already
+        handled by ``_read_team_document``; this is the store-level failure it
+        cannot see. The operator must get one of the documented 0/1/2 codes,
+        not a traceback.
+        """
+        data_dir = tmp_path / "store"
+        data_dir.mkdir()
+
+        def _refuse(self: Path) -> Any:
+            raise PermissionError(f"Permission denied: {self}")
+
+        monkeypatch.setattr(Path, "iterdir", _refuse)
+
+        assert script.main(["--data-dir", str(data_dir)]) == 1
+
 
 class TestMigrateYamlScriptRuns:
     """AC 15, 18: the script converts a real store and reports its exit code."""

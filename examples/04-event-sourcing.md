@@ -27,7 +27,10 @@ TeamManager creates and registers a PersistenceSubscriber automatically during
 
 - **PersistedEvent**: `team_id` (UUID), `sequence` (int), `event` (Message), `timestamp` (datetime)
 - **AgentStateSnapshot**: `team_id` (UUID), `agent_id` (str), `state` (BaseState), `updated_at` (datetime)
-- **Process**: `team_id`, `team_card`, `status`, `user_id`, `user_email`, `created_at`, `updated_at`
+- **Process**: `team_id`, `status`, `user_id`, `user_email`, `created_at`, `updated_at`,
+  plus the structural projection — `team_name`, `team_description`, `entry_point`,
+  `supervisors`, `agent_cards`, `message_types`, `metadata_type` (the cards themselves
+  live in the shared, content-addressed agent-card store)
 
 ### YAML File Layout
 
