@@ -686,20 +686,17 @@ class Process(SerializableBaseModel):
         the guard from firing on a hybrid a migration might produce mid-write.
 
         Deliberately raises ``ValueError`` (as Pydantic wraps it) rather than a
-        ``LookupError`` subclass. The YAML and Mongo backends catch
-        ``ValueError`` from validation, log it and skip the document, so
-        ``load_team`` still returns ``None`` and ``resume_team`` still raises
-        ``Team {id} not found``. A ``LookupError`` would escape those handlers
-        and so escape ``list_teams`` too, turning one unmigrated team into a
-        broken listing for the whole store.
+        ``LookupError`` subclass. **All three backends** catch ``ValueError``
+        from validation, log it and skip the document, so ``load_team`` still
+        returns ``None`` and ``resume_team`` still raises ``Team {id} not
+        found``. A ``LookupError`` would escape those handlers and so escape
+        ``list_teams`` too, turning one unmigrated team into a broken listing
+        for the whole store.
 
-        The Postgres backend does NOT have that handler: it validates inline
-        (``repositories/postgres/event_store.py``), so on that tier any
-        validation failure — this one and every one that predates it —
-        propagates out of ``load_team`` and ``list_teams``. The message is at
-        least legible there too, which is what this validator is for; whether
-        Postgres should log-and-skip like its siblings is a backend-parity
-        decision of its own, recorded in ``backlog.md``.
+        Postgres was the exception until story 31-5 — it validated inline, with
+        no handler, so a single unmigrated row raised for the whole call. It now
+        logs and skips like its siblings, and the ``EventStore`` port states the
+        contract rather than leaving it to be rediscovered per backend.
 
         Args:
             data: Whatever Pydantic hands the validator. Only a mapping — the

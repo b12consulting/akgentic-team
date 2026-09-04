@@ -14,7 +14,9 @@ payload-authority invariants) stay in the per-backend modules under
 
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Any
 
 import pytest
 from akgentic.core.agent import Akgent
@@ -34,7 +36,18 @@ from tests.models.conftest import (
     make_indexed_process,
     make_persisted_event,
     make_process,
+    make_team_card,
+    to_legacy_document,
 )
+from tests.repositories.conftest import RawTeamSeeder
+
+
+def _unmigrated_document(team_id: uuid.UUID) -> dict[str, Any]:
+    """A stored document in the shape every backend held before the projection."""
+    team_card = make_team_card()
+    return to_legacy_document(
+        make_process(team_id=team_id, team_card=team_card), team_card
+    )
 
 
 def build_metadata_fixture_set() -> dict[str, Process]:
@@ -934,6 +947,62 @@ class TestEventStoreContract:
         assert len(loaded) == 1
         assert isinstance(loaded[0].state, SampleAgentState)
         assert loaded[0].state.task_count == 42
+
+    # --- the unloadable document, on every backend ------------------------
+
+    def test_list_teams_skips_an_unloadable_document_and_returns_the_others(
+        self,
+        event_store: EventStore,
+        seed_raw_team: RawTeamSeeder,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One bad row must not empty the listing for a whole store.
+
+        Postgres validated inline with no handler until story 31-5, so a single
+        unmigrated row raised for the entire call and ``list_teams`` returned
+        nothing for anybody — the fleet-scale outage the migration exists to
+        close, arriving through the very window it closes. YAML and Mongo
+        already skipped. Pinned here so the three cannot diverge again: a caller
+        cannot reason about ``list_teams`` if whether it raises depends on which
+        backend is configured.
+
+        The document seeded is the pre-projection shape itself — ``team_card``
+        present, ``entry_point`` absent — which is what a deployed store holds
+        before it is migrated.
+        """
+        loadable = [make_process(), make_process()]
+        for process in loadable:
+            event_store.save_team(process)
+        unloadable_id = uuid.uuid4()
+        seed_raw_team(unloadable_id, _unmigrated_document(unloadable_id))
+
+        with caplog.at_level(logging.WARNING):
+            listed = event_store.list_teams()
+
+        assert {p.team_id for p in listed} == {p.team_id for p in loadable}
+        assert any(record.levelno >= logging.WARNING for record in caplog.records), (
+            "an unloadable document must be logged, not silently dropped"
+        )
+
+    def test_load_team_returns_none_for_an_unloadable_document(
+        self,
+        event_store: EventStore,
+        seed_raw_team: RawTeamSeeder,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The single-team counterpart: ``None``, logged — never a raise.
+
+        ``resume_team`` then reports ``Team {id} not found`` for a team that was
+        never deleted, which is legible; a ``ValidationError`` escaping into the
+        caller is not.
+        """
+        unloadable_id = uuid.uuid4()
+        seed_raw_team(unloadable_id, _unmigrated_document(unloadable_id))
+
+        with caplog.at_level(logging.WARNING):
+            assert event_store.load_team(unloadable_id) is None
+
+        assert any(record.levelno >= logging.WARNING for record in caplog.records)
 
     # --- Validation failure on corrupted payload --------------------------
 

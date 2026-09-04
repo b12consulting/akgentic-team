@@ -45,7 +45,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_TEAMS_COLLECTION = "teams"
+TEAMS_COLLECTION = "teams"
+"""Collection holding one document per team. Public: the projection migration
+script reads it raw — ``load_team`` / ``list_teams`` skip the very documents it
+exists to convert — and tests assert the layout."""
 
 AGENT_CARDS_COLLECTION = "agent_cards"
 """Collection holding the content-addressed card store. Public: tests assert it."""
@@ -121,7 +124,7 @@ def ensure_indexes(
     Args:
         db: Database holding the teams collection.
     """
-    teams = db[_TEAMS_COLLECTION]
+    teams = db[TEAMS_COLLECTION]
     for key, name in _TEAM_INDEX_SPECS:
         try:
             teams.create_index(key, name=name)
@@ -167,7 +170,7 @@ class MongoEventStore:
         auto_create_indexes: bool | None = None,
     ) -> None:
         self._db = db
-        self._teams: pymongo.collection.Collection = db[_TEAMS_COLLECTION]  # type: ignore[type-arg]
+        self._teams: pymongo.collection.Collection = db[TEAMS_COLLECTION]  # type: ignore[type-arg]
         self._events: pymongo.collection.Collection = db["events"]  # type: ignore[type-arg]
         self._agent_states: pymongo.collection.Collection = db["agent_states"]  # type: ignore[type-arg]
         self._agent_cards: pymongo.collection.Collection = db[AGENT_CARDS_COLLECTION]  # type: ignore[type-arg]

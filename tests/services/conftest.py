@@ -37,6 +37,12 @@ class InMemoryEventStore:
         # team_id, and deliberately untouched by delete_team.
         self.agent_cards: dict[str, AgentCard] = {}
         self.load_agent_cards_calls = 0
+        # Write-method names in call order. The projection migration must write
+        # cards BEFORE the document that references them (FR13), and both orders
+        # leave identical storage — only the sequence tells them apart. Recorded
+        # here rather than in a forked fake so every suite using this store gets
+        # the same instrument.
+        self.write_calls: list[str] = []
 
     def save_event(self, event: PersistedEvent) -> None:
         """Persist a single domain event.
@@ -83,6 +89,7 @@ class InMemoryEventStore:
 
     def save_team(self, process: Process) -> None:
         """Persist team process snapshot."""
+        self.write_calls.append("save_team")
         self.teams[process.team_id] = process
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
@@ -182,7 +189,11 @@ class InMemoryEventStore:
         stored blob is a pure function of its key and two teams differing only
         in hireability cannot write different bytes to one hash. Saving the
         same card twice leaves one entry by construction.
+
+        Recorded in ``write_calls`` — the card write and the document write are
+        ordered against each other by FR13, and the end state cannot show it.
         """
+        self.write_calls.append("save_agent_cards")
         for card in cards:
             storable = storable_agent_card(card)
             self.agent_cards[hash_agent_card(storable)] = storable

@@ -290,6 +290,38 @@ def make_indexed_process(
     )
 
 
+def to_legacy_document(process: Process, team_card: TeamCard) -> dict[str, Any]:
+    """Render *process* back into the PRE-projection stored shape.
+
+    The only honest reconstruction available now that ``Process.team_card`` is
+    gone: take the current dump, drop the seven projection fields, and put the
+    nested card back. A document built this way carries exactly what a store
+    written before story 31-1 holds — ``team_card`` present, ``entry_point``
+    absent — which is the shape ``Process.reject_unmigrated_document``
+    recognises and the migration converts.
+
+    The seven keys to drop come from ``projection_kwargs`` rather than a
+    hand-written list, so this fixture cannot fall behind a projection that
+    grows a field.
+
+    Args:
+        process: A migrated ``Process``, normally from ``make_process``.
+        team_card: The card the projection was derived from; it goes back into
+            the document under ``team_card``.
+
+    Returns:
+        The raw mapping a pre-projection backend would have stored.
+    """
+    projection_keys = set(projection_kwargs(team_card))
+    document = {
+        key: value
+        for key, value in process.model_dump().items()
+        if key not in projection_keys
+    }
+    document["team_card"] = team_card.model_dump()
+    return document
+
+
 def make_persisted_event(
     team_id: uuid.UUID | None = None,
     sequence: int = 0,

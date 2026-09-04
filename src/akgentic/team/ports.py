@@ -93,6 +93,17 @@ class EventStore(Protocol):
 
         Called by TeamManager to retrieve team state. Returns None if no
         snapshot exists for the given team ID.
+
+        **An unloadable document also returns ``None``**, logged at ERROR
+        naming the ``team_id``. Implementations MUST NOT let a validation
+        failure escape: a stored document that does not validate — corrupted,
+        or written before a model change, such as the pre-projection shape
+        ``Process.reject_unmigrated_document`` refuses — is a skipped document,
+        not an exception. Callers see the same "no snapshot" answer either way,
+        and the log line is what the operator acts on.
+
+        This was silent here until story 31-5, which is exactly how the three
+        backends came to diverge on it unnoticed.
         """
         ...
 
@@ -172,6 +183,12 @@ class EventStore(Protocol):
         is applied server-side and is NEVER weakened by ``metadata`` — metadata
         is caller-supplied and non-secret, so it must not become a way to reach
         another owner's teams.
+
+        **An unloadable document is skipped, never raised**, logged at WARNING
+        naming the ``team_id``. One corrupted or unmigrated document must not
+        empty the listing for every team in the store — the blast radius of
+        failing loud here is a whole fleet, and it is tier-independent. The
+        counterpart of the same rule on :meth:`load_team`.
 
         Results MUST be identical whatever strategy an implementation uses;
         where the filter runs is a performance property, not a semantic one.

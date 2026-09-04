@@ -157,7 +157,14 @@ class NagraEventStore:
             )
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
-        """Load a team process snapshot by id; return ``None`` if absent."""
+        """Load a team process snapshot by id; return ``None`` if absent.
+
+        A stored document that does not validate is logged and returns ``None``
+        too, exactly as it does on the YAML and Mongo backends. Divergent
+        failure modes behind one ``Protocol`` are themselves the defect: a
+        caller cannot reason about ``load_team`` if whether it raises depends on
+        which backend is configured.
+        """
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(
                 "SELECT data FROM team_process_entries WHERE id = %s",
@@ -166,7 +173,32 @@ class NagraEventStore:
             row = cursor.fetchone()
         if row is None:
             return None
-        return Process.model_validate(decode_jsonb_column(row[0]))
+        return self._hydrate_team(str(team_id), row[0], logging.ERROR)
+
+    @staticmethod
+    def _hydrate_team(team_id: str, data: object, level: int) -> Process | None:
+        """Validate one stored team document, or log it and return ``None``.
+
+        Shared by :meth:`load_team` and :meth:`list_teams` so the two cannot
+        drift: one bad row must not empty the listing for a whole store, and it
+        must not raise out of a single-team read either. Pydantic's
+        ``ValidationError`` is a ``ValueError``, which is why the clause is not
+        narrowed to it.
+
+        Args:
+            team_id: The row's id, named in the log line — the only thing that
+                lets an operator find the offending document.
+            data: The raw ``data`` column value.
+            level: ``ERROR`` for a single-team read, ``WARNING`` for a sweep,
+                mirroring the Mongo backend. A caller who asked for one team and
+                got ``None`` has a harder failure than a listing that dropped one
+                row out of many.
+        """
+        try:
+            return Process.model_validate(decode_jsonb_column(data))
+        except (ValueError, TypeError) as exc:
+            logger.log(level, "Corrupted team document for team %s: %s", team_id, exc)
+            return None
 
     def list_teams(
         self,
@@ -208,6 +240,10 @@ class NagraEventStore:
         Results never depend on an index existing. Dropping either index
         changes the access path the planner picks and nothing else.
 
+        A row that does not validate is logged at WARNING naming its
+        ``team_id`` and skipped, never raised — one corrupted or unmigrated
+        document must not empty the listing for every team in the store.
+
         Args:
             user_id: If provided, return only snapshots whose
                 ``Process.user_id`` matches. If ``None`` (default), return all
@@ -243,13 +279,20 @@ class NagraEventStore:
         for group in make_index_prefix_groups(metadata):
             clauses.append(_metadata_key_clause(len(group)))
             params.extend(_like_prefix_pattern(prefix) for prefix in group)
-        sql = "SELECT data FROM team_process_entries"
+        # ``id`` rides along purely so an unloadable row can be NAMED in the log
+        # line. Without it the operator learns that a document is corrupted and
+        # nothing about which one.
+        sql = "SELECT id, data FROM team_process_entries"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(sql, tuple(params))
             rows = cursor.fetchall()
-        teams = [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
+        teams: list[Process] = []
+        for row in rows:
+            process = self._hydrate_team(str(row[0]), row[1], logging.WARNING)
+            if process is not None:
+                teams.append(process)
         # The one filter still evaluated in Python — see the docstring.
         if status is not None:
             teams = [t for t in teams if t.status == status]

@@ -655,7 +655,7 @@ class TestMetadataStatementShape:
 
         sql, params = recorded_sql[-1]
         assert sql == (
-            "SELECT data FROM team_process_entries WHERE "
+            "SELECT id, data FROM team_process_entries WHERE "
             "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) "
             "WHERE entry LIKE %s ESCAPE '!')"
         )
@@ -685,7 +685,7 @@ class TestMetadataStatementShape:
         assert sql.count(" AND ") == 2  # user_id + two per-key clauses
         assert sql.count(" OR ") == 1  # the tenant key's two terms
         assert sql == (
-            "SELECT data FROM team_process_entries WHERE (data ->> 'user_id') = %s AND "
+            "SELECT id, data FROM team_process_entries WHERE (data ->> 'user_id') = %s AND "
             "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) WHERE "
             "entry LIKE %s ESCAPE '!' OR entry LIKE %s ESCAPE '!') AND "
             "EXISTS (SELECT 1 FROM unnest(metadata_indexes) AS e(entry) WHERE "
