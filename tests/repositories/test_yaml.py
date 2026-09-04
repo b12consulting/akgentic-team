@@ -694,3 +694,39 @@ class TestYamlAgentCardStoreLayout:
         self, yaml_store: YamlEventStore
     ) -> None:
         assert yaml_store.load_agent_cards(["0" * 64]) == {}
+
+    def test_a_hash_that_is_not_a_hex_digest_never_reaches_the_filesystem(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """This backend turns a hash into a PATH, so a bad key must not name a file.
+
+        The hashes reaching ``load_agent_cards`` come off a persisted
+        ``Process``, and ``../`` is a perfectly valid ``str``. A SHA-256 hex
+        digest is the only key the store ever writes, so anything else is a
+        clean miss rather than a stray read outside the card directory.
+        """
+        # A genuinely VALID card outside the store, so the assertion below fails
+        # on the escape itself rather than on the escaped file being unparseable.
+        outside = tmp_path / "escaped.yaml"
+        outside.write_text(yaml.dump(_card_fixture().model_dump()))
+        yaml_store.save_agent_cards([_card_fixture()])
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
+            loaded = yaml_store.load_agent_cards([f"../{outside.stem}", "not-a-hash"])
+
+        assert loaded == {}
+        assert len(
+            [r for r in caplog.records if "malformed agent card hash" in r.getMessage()]
+        ) == 2
+
+    def test_a_real_digest_is_still_resolved(self, yaml_store: YamlEventStore) -> None:
+        """The guard rejects by shape, and a genuine key has that shape."""
+        card = _card_fixture()
+        yaml_store.save_agent_cards([card])
+
+        assert set(yaml_store.load_agent_cards([hash_agent_card(card)])) == {
+            hash_agent_card(card)
+        }

@@ -433,9 +433,15 @@ class TestStorableAgentCard:
         assert hireable.can_be_hired is True
 
     def test_it_changes_nothing_else(self) -> None:
-        card = _make_card("@Lead", "Lead")
+        """Start from a HIREABLE card, or the assertion holds for a card that
+        was already normalised and would pass on a function returning its
+        argument unchanged — proving nothing about "changes nothing else".
+        """
+        card = _make_card("@Lead", "Lead").model_copy(update={"can_be_hired": True})
         storable = storable_agent_card(card)
-        assert storable.model_dump() == card.model_dump()
+
+        assert storable.can_be_hired is False
+        assert storable.model_dump() == card.model_dump() | {"can_be_hired": False}
 
     def test_the_projection_cards_keep_their_flag_for_the_other_consumer(self) -> None:
         """The store wants the flagless form; the orchestrator wants the flagged one.

@@ -487,11 +487,22 @@ class TeamRestorer:
 
         # 2f. Register the team's resolved agent cards with the orchestrator.
         # The WHOLE card set, not just the hireable subset the old
-        # `team_card.agent_profiles` registration carried: the orchestrator can
-        # then describe every colleague, while each card's own `can_be_hired` —
-        # taken from its AgentCardRef, the authoritative copy — still says which
-        # of them may be hired at runtime. That widening is the intended change
+        # `team_card.agent_profiles` registration carried, so the orchestrator
+        # can describe every colleague. That widening is the intended change
         # (ADR-26 §Decision 5, FR2/FR11), not a regression.
+        #
+        # It is NOT hireability-neutral today, and that is worth stating
+        # plainly rather than assuming. Each resolved card carries its ref's
+        # `can_be_hired`, but NOTHING in the framework reads that flag: the
+        # hire path picks any card whose role matches out of
+        # `Orchestrator.get_agent_catalog()`, and `get_available_roles()`
+        # advertises every registered role. So until a hire guard exists, a
+        # restored team's already-live members become hirable by role and the
+        # model can spawn duplicates of them — exactly what the registration
+        # this replaced was narrow in order to avoid. The guard belongs to
+        # `akgentic-tool` / `akgentic-core` (Golden Rule 4 bars fixing it
+        # here); tracked as `backlog.md` row 17. Story 31-2 repeats this
+        # widening on the create path, which is when it stops being restore-only.
         #
         # Resolved in ONE batch load through the single resolution site. A
         # per-role read would return exactly this, which is why the call count

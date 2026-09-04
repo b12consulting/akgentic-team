@@ -48,6 +48,26 @@ Public because ``list_teams`` must skip it by name and tests assert the layout.
 A team directory is always a UUID, so the two namespaces cannot collide.
 """
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_CARD_HASH_LENGTH = 64
+
+
+def _is_card_hash(value: str) -> bool:
+    """Return whether *value* has the shape ``hash_agent_card`` produces.
+
+    This backend is the one that turns a hash into a **path**, so a hash it did
+    not compute must not be allowed to name a file: ``../../secrets`` is a valid
+    ``str`` and reads outside the store. The hashes reaching ``load_agent_cards``
+    come off a persisted ``Process``, which this module already treats as
+    untrusted enough to guard corrupted payloads against.
+
+    A SHA-256 hex digest is the only key the store ever writes, so constraining
+    reads to that shape costs nothing and makes a malformed key a clean miss
+    (``AgentCardNotFoundError`` naming the role) rather than a stray filesystem
+    read.
+    """
+    return len(value) == _CARD_HASH_LENGTH and _HEX_DIGITS.issuperset(value)
+
 
 class YamlEventStore:
     """File-based EventStore using YAML serialization with per-team directories.
@@ -528,6 +548,11 @@ class YamlEventStore:
             return {}
         resolved: dict[str, AgentCard] = {}
         for card_hash in hashes:
+            if not _is_card_hash(card_hash):
+                # A key this store cannot have written. Skipped rather than
+                # joined onto a path — see ``_is_card_hash``.
+                logger.error("Skipping malformed agent card hash %r", card_hash)
+                continue
             card_path = cards_dir / f"{card_hash}.yaml"
             if not card_path.exists():
                 continue

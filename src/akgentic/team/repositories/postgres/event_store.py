@@ -16,6 +16,7 @@ Implements ADR-15 Nagra-based PostgreSQL EventStore §§2, 3, 4, 8, 9, 10.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 
@@ -27,6 +28,8 @@ from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, Te
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
+
+logger = logging.getLogger(__name__)
 
 _LIKE_ESCAPE = "!"
 """``ESCAPE`` character for the metadata ``LIKE`` patterns — chosen, not default.
@@ -405,7 +408,13 @@ class NagraEventStore:
 
         Returns:
             Mapping of hash to card for every hash the table holds. A hash the
-            table does not hold is simply absent.
+            table does not hold is simply absent, and so is one whose row does
+            not parse — logged and skipped, the way ``yaml.py`` and ``mongo.py``
+            treat a corrupted card, so it surfaces as
+            ``AgentCardNotFoundError`` naming the ROLE at resolution rather than
+            as a bare ``ValidationError`` naming nothing. This is the one
+            ``NagraEventStore`` reader that tolerates a bad row, deliberately:
+            it is the only one whose miss the caller turns into a better error.
         """
         if not hashes:
             return {}
@@ -417,6 +426,10 @@ class NagraEventStore:
                 tuple(hashes),
             )
             rows = cursor.fetchall()
-        return {
-            row[0]: AgentCard.model_validate(decode_jsonb_column(row[1])) for row in rows
-        }
+        resolved: dict[str, AgentCard] = {}
+        for row in rows:
+            try:
+                resolved[row[0]] = AgentCard.model_validate(decode_jsonb_column(row[1]))
+            except (ValueError, TypeError) as exc:
+                logger.error("Skipping corrupted agent card %s: %s", row[0], exc)
+        return resolved

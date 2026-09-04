@@ -19,6 +19,7 @@ Constructor / source-purity / import-gate tests live in adjacent files
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -823,3 +824,31 @@ class TestNagraAgentCardStore:
         hashes = [hash_agent_card(c) for c in cards]
 
         assert set(store.load_agent_cards(hashes)) == set(hashes)
+
+    def test_a_corrupted_card_row_is_skipped_not_raised(
+        self, postgres_clean_tables: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The port promises a skip; Postgres has to honour it too.
+
+        A bad row raising a bare ``ValidationError`` out of the store names
+        neither the role nor the hash. Skipping it lets ``resolve_agent_cards``
+        raise ``AgentCardNotFoundError``, which names both — the whole point of
+        FR14. This is the one ``NagraEventStore`` reader that tolerates a bad
+        row, deliberately.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        good = _card_fixture()
+        store.save_agent_cards([good])
+        bad_hash = "c" * 64
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute(
+                "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
+                (bad_hash, json.dumps({"not": "a card"})),
+            )
+
+        logger_name = "akgentic.team.repositories.postgres.event_store"
+        with caplog.at_level(logging.ERROR, logger=logger_name):
+            loaded = store.load_agent_cards([hash_agent_card(good), bad_hash])
+
+        assert set(loaded) == {hash_agent_card(good)}
+        assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]
