@@ -139,8 +139,16 @@ def migrate_document(document: Mapping[str, Any], store: EventStore) -> None:
         TypeError: If the stored ``team_card`` is not a shape Pydantic can read.
         KeyError: If *document* carries no ``team_card`` at all. Callers reach
             this through :func:`migrate_documents`, which classifies such a
-            document as skipped before it gets here; a direct caller sees the
-            ``KeyError``, which is why the loop's clause names it too.
+            document as skipped before it gets here.
+        ImportError: If the stored card names a module that cannot be imported.
+        AttributeError: If that module carries no class of the stored name.
+        Exception: The list above is what this function is *known* to raise, not
+            a closed set. ``TeamCard.model_validate`` runs the deserializer over
+            an arbitrary stored payload, which imports and constructs
+            third-party classes; anything they raise surfaces here. That is why
+            :func:`migrate_documents` catches broadly rather than repeating a
+            tuple that has to grow every time a deserializer gains a failure
+            mode.
     """
     team_card = TeamCard.model_validate(document[LEGACY_CARD_KEY])
     projection = derive_team_projection(team_card)
@@ -166,7 +174,9 @@ def migrate_documents(documents: Iterable[Any], store: EventStore) -> MigrationR
     so a second run over a migrated store performs no writes at all.
 
     One document's failure is counted and logged; the run continues. A store
-    holding a single malformed team must still migrate every other team in it.
+    holding a single malformed team must still migrate every other team in it —
+    including the common real case of a card naming an agent class that has
+    since been renamed, moved, or removed with its package.
 
     Args:
         documents: Raw stored mappings, in any order. A non-mapping is counted
@@ -202,7 +212,19 @@ def migrate_documents(documents: Iterable[Any], store: EventStore) -> MigrationR
             continue
         try:
             migrate_document(document, store)
-        except (ValueError, TypeError, KeyError) as exc:
+        except Exception as exc:
+            # Deliberately every exception, not a tuple. This loop's whole
+            # contract is that one bad document must not stop the run, and
+            # migrate_document deserializes an arbitrary stored payload —
+            # import_class alone raises ImportError for a module that has moved
+            # and AttributeError for a class that has been renamed, and the
+            # third-party classes it constructs can raise anything at all. A
+            # named tuple can only list the failures somebody has already seen;
+            # the one it omits aborts a fleet migration inside the FR10 window,
+            # where there is no version that can serve the store while it is
+            # fixed. Nothing is swallowed: every failure is logged with its
+            # team_id and counted, and a non-zero ``failed`` is what each script
+            # turns into a non-zero exit code.
             logger.error("Failed to migrate team %s: %s", team_id, exc)
             report.failed += 1
             continue

@@ -328,6 +328,95 @@ class TestTheMigrationCore:
         assert set(MigrationReport.model_fields) == {"converted", "skipped", "failed"}
 
 
+def _naming_a_gone_agent_class(document: dict[str, Any], class_path: str) -> dict[str, Any]:
+    """Rewrite every ``agent_class`` in *document*'s stored card to *class_path*.
+
+    A walk rather than an indexed path: the nesting under ``team_card`` is the
+    member tree's business, not this fixture's, and the container shape is
+    preserved so the rewritten value validates exactly as the original did.
+    """
+
+    def _rewrite(value: Any) -> Any:
+        if isinstance(value, dict):
+            rewritten = {key: _rewrite(item) for key, item in value.items()}
+            if "agent_class" in rewritten:
+                current = rewritten["agent_class"]
+                rewritten["agent_class"] = (
+                    {"__type__": class_path} if isinstance(current, dict) else class_path
+                )
+            return rewritten
+        if isinstance(value, list):
+            return [_rewrite(item) for item in value]
+        return value
+
+    document["team_card"] = _rewrite(document["team_card"])
+    return document
+
+
+class TestAnUnloadableAgentClassDoesNotAbortTheRun:
+    """Issue #208: the failure a fleet actually hits, and the one that hurt most.
+
+    A stored card names its agent class by dotted path. Between the release that
+    wrote it and the release that migrates it, that class can be renamed, moved
+    to another module, or removed with its package — so resolving it raises
+    ``ImportError`` or ``AttributeError`` rather than anything Pydantic wraps.
+
+    The migration runs BETWEEN stopping the old version and starting the new one
+    (FR10, ``ROLLOUT_ORDERING_NOTE``). One such card aborting the whole run
+    leaves the operator inside that window with ``converted=0`` and no way to
+    skip the bad document — which is why these two specs assert on the OTHER
+    documents rather than only on the count.
+    """
+
+    @pytest.mark.parametrize(
+        ("class_path", "what_is_gone"),
+        [
+            ("akgentic.team.no_such_module.GoneAgent", "the module"),
+            ("akgentic.team.migration.GoneAgent", "the class"),
+        ],
+    )
+    def test_a_card_naming_a_gone_agent_class_is_counted_and_the_run_continues(
+        self,
+        store: InMemoryEventStore,
+        caplog: pytest.LogCaptureFixture,
+        class_path: str,
+        what_is_gone: str,
+    ) -> None:
+        """Counted ``failed``, logged with its team_id, and it stops nothing."""
+        del what_is_gone  # names the case in the test id
+        first = _legacy_document()
+        broken = _naming_a_gone_agent_class(_legacy_document(), class_path)
+        third = _legacy_document()
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.migration"):
+            report = migrate_documents([first, broken, third], store)
+
+        assert report == MigrationReport(converted=2, skipped=0, failed=1)
+        assert store.load_team(uuid.UUID(str(first["team_id"]))) is not None
+        assert store.load_team(uuid.UUID(str(third["team_id"]))) is not None
+        assert store.load_team(uuid.UUID(str(broken["team_id"]))) is None
+        assert str(broken["team_id"]) in caplog.text
+
+    def test_a_store_of_only_broken_documents_still_returns_a_report(
+        self, store: InMemoryEventStore
+    ) -> None:
+        """The run ENDS rather than raising — the exit code comes from ``failed``.
+
+        A traceback out of ``migrate_documents`` gives the script no report to
+        turn into an exit code, so ``converted=0 skipped=0 failed=0`` is what
+        the operator sees for a store that failed entirely.
+        """
+        documents = [
+            _naming_a_gone_agent_class(_legacy_document(), "akgentic.team.no_such_module.Gone")
+            for _ in range(3)
+        ]
+
+        report = migrate_documents(documents, store)
+
+        assert report == MigrationReport(converted=0, skipped=0, failed=3)
+        assert store.write_calls == []
+
+
 class TestHeadcountIsExpandedByTheMigration:
     """AC 10 (FR8a): the stored card is the DECLARED shape; refs are spawned names."""
 

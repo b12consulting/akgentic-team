@@ -135,6 +135,34 @@ def _make_team_card(
     )
 
 
+class ProcessWithAFieldAddedLater(Process):
+    """``Process`` as it will look once someone adds the next field to it.
+
+    Nothing in ``manager.py`` mentions ``added_later``, so it survives a
+    lifecycle write only if that write copies the record rather than rebuilding
+    it from a hand-written field list (Golden Rule #12). Module level, not
+    nested in a test: the serializer records a model by its importable
+    ``module.ClassName`` path.
+    """
+
+    added_later: str = "the-default"
+
+
+def _store_as_a_later_release_would(
+    event_store: InMemoryEventStore, team_id: uuid.UUID, value: str
+) -> ProcessWithAFieldAddedLater:
+    """Replace the stored ``Process`` with the subclass, carrying *value*.
+
+    ``dict(stored)`` hands over the live field values, so concrete submodels
+    survive instead of being flattened by a dump/validate cycle.
+    """
+    stored = event_store.load_team(team_id)
+    assert stored is not None
+    later = ProcessWithAFieldAddedLater(**dict(stored), added_later=value)
+    event_store.save_team(later)
+    return later
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1537,6 +1565,61 @@ def _create_and_stop_team_with_namespace(
 
     manager.stop_team(team_id)
     return team_id
+
+
+class TestLifecycleWritesCarryAnUnknownFieldForward:
+    """Golden Rule #12 for the two paths that run on their own.
+
+    ``resume_team`` and ``stop_team`` both re-save the ``Process``, and both are
+    driven by machinery rather than by a person — a resume on worker restart, a
+    stop by the idle-stop countdown. That is the worst place for a hand-listed
+    rebuild: a value written correctly can survive for weeks and then be nulled
+    by a sweep nobody triggered, with no error and no failing test.
+
+    The ``catalog_namespace`` specs above cannot catch it. They name a field
+    that exists today, so a rebuild naming every field that exists today is
+    green — the whole-model comparison has the same blind spot. Only a field the
+    write path has never heard of distinguishes the two, which is what
+    ``ProcessWithAFieldAddedLater`` supplies.
+    """
+
+    def test_stop_carries_a_field_added_to_process_forward(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """A stop changes status and updated_at; the unknown field rides along."""
+        runtime = manager.create_team(_make_team_card(), user_id="u", user_email="u@e")
+        before = _store_as_a_later_release_would(event_store, runtime.id, "carried-through")
+
+        manager.stop_team(runtime.id)
+
+        persisted = event_store.load_team(runtime.id)
+        assert isinstance(persisted, ProcessWithAFieldAddedLater)
+        assert persisted.added_later == "carried-through"
+        assert persisted.status == TeamStatus.STOPPED
+        assert persisted == before.model_copy(
+            update={"status": TeamStatus.STOPPED, "updated_at": persisted.updated_at}
+        )
+
+    def test_resume_carries_a_field_added_to_process_forward(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Same for a resume — the path a worker restart runs unattended."""
+        team_id = _create_and_stop_team(manager, event_store)
+        before = _store_as_a_later_release_would(event_store, team_id, "carried-through")
+
+        manager.resume_team(team_id)
+
+        persisted = event_store.load_team(team_id)
+        assert isinstance(persisted, ProcessWithAFieldAddedLater)
+        assert persisted.added_later == "carried-through"
+        assert persisted.status == TeamStatus.RUNNING
+        assert persisted == before.model_copy(
+            update={"status": TeamStatus.RUNNING, "updated_at": persisted.updated_at}
+        )
 
 
 # ---------------------------------------------------------------------------
