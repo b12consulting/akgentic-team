@@ -62,3 +62,19 @@ def test_module_is_importable() -> None:
     """akgentic.team is importable as a module."""
     mod = importlib.import_module("akgentic.team")
     assert mod is not None
+
+
+def test_the_card_store_surface_is_exported() -> None:
+    """The error a consumer must catch, and the two functions it needs to raise it.
+
+    ``AgentCardNotFoundError`` is the one an out-of-package caller has to be
+    able to name — a restore that cannot resolve a card fails with it, and a
+    consumer catching ``Exception`` instead is how a loud failure becomes a
+    quiet one. ``resolve_agent_cards`` and ``storable_agent_card`` are exported
+    beside it because every writer into, and reader out of, the store must use
+    exactly these two — a second normalisation or a second resolution is how the
+    store starts holding two blobs for one hash.
+    """
+    for name in ("AgentCardNotFoundError", "resolve_agent_cards", "storable_agent_card"):
+        assert name in akgentic.team.__all__, f"{name} missing from __all__"
+        assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"

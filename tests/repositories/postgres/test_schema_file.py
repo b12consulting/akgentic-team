@@ -19,7 +19,12 @@ SCHEMA_PATH = (
     / "schema.toml"
 )
 
-EXPECTED_TABLES = {"team_process_entries", "event_entries", "agent_state_entries"}
+EXPECTED_TABLES = {
+    "team_process_entries",
+    "event_entries",
+    "agent_state_entries",
+    "agent_card_entries",
+}
 
 
 def _load_schema() -> dict[str, object]:
@@ -31,7 +36,7 @@ def test_schema_file_exists() -> None:
     assert SCHEMA_PATH.exists(), f"schema.toml missing at {SCHEMA_PATH}"
 
 
-def test_schema_has_exactly_three_top_level_tables() -> None:
+def test_schema_has_exactly_four_top_level_tables() -> None:
     schema = _load_schema()
     assert set(schema.keys()) == EXPECTED_TABLES
 
@@ -68,3 +73,19 @@ def test_agent_state_entries_shape() -> None:
     columns = table["columns"]
     assert isinstance(columns, dict)
     assert columns == {"team_id": "str", "agent_id": "str", "data": "json"}
+
+
+def test_agent_card_entries_shape() -> None:
+    """The content-addressed card store: keyed by hash, with NO team_id.
+
+    A ``team_id`` column here would be the whole design gone — the store is
+    shared across every team that references a card, which is what makes
+    "one blob per card" and "never deleted with a team" possible at all.
+    """
+    schema = _load_schema()
+    table = schema["agent_card_entries"]
+    assert isinstance(table, dict)
+    assert table["natural_key"] == ["card_hash"]
+    columns = table["columns"]
+    assert isinstance(columns, dict)
+    assert columns == {"card_hash": "str", "data": "json"}

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
+from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
@@ -25,12 +27,12 @@ from akgentic.team.models import (
     TeamRuntime,
     TeamStatus,
 )
+from tests.conftest import projection_kwargs
 
 
 def make_agent_card(
     name: str = "test-agent",
     role: str = "TestAgent",
-    routes_to: list[str] | None = None,
     agent_class: str | type = "tests.fixtures.MockAgent",
 ) -> AgentCard:
     """Create a minimal AgentCard for testing.
@@ -38,7 +40,6 @@ def make_agent_card(
     Args:
         name: Config name for the agent.
         role: Agent role.
-        routes_to: List of agent names this agent routes to.
         agent_class: Agent class or FQCN string.
 
     Returns:
@@ -50,7 +51,6 @@ def make_agent_card(
         skills=["testing"],
         agent_class=agent_class,
         config=BaseConfig(name=name, role=role),
-        routes_to=routes_to or [],
     )
 
 
@@ -101,11 +101,23 @@ def make_team_card(
     )
 
 
-def make_stub_addr(name: str = "stub") -> MagicMock:
+def make_stub_addr(
+    name: str = "stub",
+    role: str = "Stub",
+    *,
+    is_user_proxy: bool = False,
+) -> MagicMock:
     """Create a MagicMock that behaves like an ActorAddress.
+
+    ``role`` and ``is_user_proxy`` are set explicitly rather than left to the
+    spec. A ``MagicMock(spec=ActorAddress)`` answers both with a truthy
+    ``MagicMock``, which would flow into ``get_agent_profile`` and into the
+    ``UserProxy`` check and make every assertion about them vacuously green.
 
     Args:
         name: Name for the stub address.
+        role: Role for the stub address — the orchestrator catalog key.
+        is_user_proxy: What the address reports about the actor's actual type.
 
     Returns:
         A MagicMock with ActorAddress spec.
@@ -113,48 +125,70 @@ def make_stub_addr(name: str = "stub") -> MagicMock:
     addr = MagicMock(spec=ActorAddress)
     addr.agent_id = uuid.uuid4()
     addr.name = name
+    addr.role = role
+    addr.is_user_proxy = is_user_proxy
     return addr
 
 
-def make_stub_actor_system() -> MagicMock:
+def make_stub_actor_system(entry_agent_class: type | None = Akgent) -> MagicMock:
     """Create a MagicMock that behaves like an ActorSystem.
+
+    The single ``proxy_ask`` return value doubles as the orchestrator proxy, so
+    its ``get_agent_profile`` is what ``TeamRuntime.model_post_init`` reads to
+    type the entry proxy.
+
+    Args:
+        entry_agent_class: The agent class the catalog reports for whatever role
+            it is asked about. ``None`` makes the catalog answer with no entry,
+            which is the construction-time ``ValueError`` path.
 
     Returns:
         A MagicMock with ActorSystem spec and proxy methods.
     """
+    orchestrator = MagicMock()
+    orchestrator.get_agent_profile = MagicMock(
+        return_value=(
+            None
+            if entry_agent_class is None
+            else make_agent_card(name="entry", role="Entry", agent_class=entry_agent_class)
+        )
+    )
     system = MagicMock(spec=ActorSystem)
-    system.proxy_ask = MagicMock(return_value=MagicMock())
+    system.proxy_ask = MagicMock(return_value=orchestrator)
     system.proxy_tell = MagicMock(return_value=MagicMock())
     return system
 
 
 def make_team_runtime(
     *,
-    team_card: TeamCard | None = None,
+    team_name: str | None = "test-team",
     message_types: list[type] | None = None,
     supervisor_addrs: dict[str, ActorAddress] | None = None,
     addrs: dict[str, ActorAddress] | None = None,
+    actor_system: MagicMock | None = None,
+    entry_addr: ActorAddress | None = None,
 ) -> TeamRuntime:
     """Create a TeamRuntime with mock dependencies for testing.
 
     Args:
-        team_card: Optional pre-built TeamCard.
-        message_types: Message types for auto-generated TeamCard.
+        team_name: The team's name, as it appears in error messages.
+        message_types: Message classes the team handles.
         supervisor_addrs: Supervisor address mapping.
         addrs: All agent address mapping.
+        actor_system: Optional pre-configured stub actor system, for tests that
+            need to steer the orchestrator catalog.
+        entry_addr: Optional pre-built entry-point address.
 
     Returns:
         A TeamRuntime with mock ActorSystem and addresses.
     """
-    from akgentic.core.agent import Akgent
-
-    tc = team_card or make_team_card(message_types=message_types, agent_class=Akgent)
     return TeamRuntime(
         id=uuid.uuid4(),
-        team=tc,
-        actor_system=make_stub_actor_system(),
-        orchestrator_addr=make_stub_addr("orchestrator"),
-        entry_addr=make_stub_addr("entry"),
+        team_name=team_name,
+        message_types=message_types or [],
+        actor_system=actor_system or make_stub_actor_system(),
+        orchestrator_addr=make_stub_addr("orchestrator", "Orchestrator"),
+        entry_addr=entry_addr or make_stub_addr("entry", "Lead"),
         supervisor_addrs=supervisor_addrs or {},
         addrs=addrs or {},
     )
@@ -208,28 +242,19 @@ def make_process(
         A Process with the specified or default configuration.
     """
     now = datetime.now(UTC)
-    if user_id is None:
-        # Omit user_id so the field defaults to "cli" per Process.user_id.
-        return Process(
-            team_id=team_id or uuid.uuid4(),
-            team_card=team_card or make_team_card(),
-            status=status,
-            created_at=now,
-            updated_at=now,
-            catalog_namespace=catalog_namespace,
-            metadata=metadata,
-            metadata_indexes=metadata_indexes or [],
-        )
+    tc = team_card or make_team_card()
+    # Omit user_id when None so the field falls back to its model default.
+    optional: dict[str, Any] = {} if user_id is None else {"user_id": user_id}
     return Process(
         team_id=team_id or uuid.uuid4(),
-        team_card=team_card or make_team_card(),
         status=status,
-        user_id=user_id,
         created_at=now,
         updated_at=now,
         catalog_namespace=catalog_namespace,
         metadata=metadata,
         metadata_indexes=metadata_indexes or [],
+        **projection_kwargs(tc),
+        **optional,
     )
 
 
@@ -263,6 +288,39 @@ def make_indexed_process(
         metadata=metadata,
         metadata_indexes=derive_metadata_indexes(metadata),
     )
+
+
+def to_legacy_document(process: Process, team_card: TeamCard) -> dict[str, Any]:
+    """Render *process* back into the PRE-projection stored shape.
+
+    The only honest reconstruction available now that ``Process`` no longer
+    carries a nested ``team_card``: take the current dump, drop the seven
+    projection fields, and put the nested card back. A document built this way
+    carries exactly what a store written before story 31-1 holds —
+    ``team_card`` present, ``entry_point`` absent — which is the shape
+    ``Process.reject_unmigrated_document`` recognises and the migration
+    converts.
+
+    The seven keys to drop come from ``projection_kwargs`` rather than a
+    hand-written list, so this fixture cannot fall behind a projection that
+    grows a field.
+
+    Args:
+        process: A migrated ``Process``, normally from ``make_process``.
+        team_card: The card the projection was derived from; it goes back into
+            the document under ``team_card``.
+
+    Returns:
+        The raw mapping a pre-projection backend would have stored.
+    """
+    projection_keys = set(projection_kwargs(team_card))
+    document = {
+        key: value
+        for key, value in process.model_dump().items()
+        if key not in projection_keys
+    }
+    document["team_card"] = team_card.model_dump()
+    return document
 
 
 def make_persisted_event(

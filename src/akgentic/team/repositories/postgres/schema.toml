@@ -18,3 +18,12 @@ natural_key = ["team_id", "agent_id"]
 team_id = "str"
 agent_id = "str"
 data = "json"
+
+# The content-addressed agent-card store. No team_id: cards are shared across
+# every team that references them, and delete_team deliberately never touches
+# this table.
+[agent_card_entries]
+natural_key = ["card_hash"]
+[agent_card_entries.columns]
+card_hash = "str"
+data = "json"

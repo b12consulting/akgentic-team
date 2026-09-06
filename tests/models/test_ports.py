@@ -10,7 +10,12 @@ import uuid
 
 import pytest
 
-from akgentic.team.ports import EventNotFoundError, NullServiceRegistry, ServiceRegistry
+from akgentic.team.ports import (
+    AgentCardNotFoundError,
+    EventNotFoundError,
+    NullServiceRegistry,
+    ServiceRegistry,
+)
 
 
 @pytest.fixture()
@@ -41,6 +46,34 @@ class TestEventNotFoundError:
                 raise EventNotFoundError("stale cursor")
             except ValueError:  # pragma: no cover - must not catch
                 pytest.fail("EventNotFoundError was caught by `except ValueError`")
+
+
+class TestAgentCardNotFoundError:
+    """Same base-class argument as ``EventNotFoundError``, for the same reason."""
+
+    def test_is_a_lookup_error(self) -> None:
+        assert issubclass(AgentCardNotFoundError, LookupError)
+
+    def test_is_not_a_value_error(self) -> None:
+        """An unresolvable card must not be swallowed by a corrupted-document handler.
+
+        ``yaml.py`` and ``mongo.py`` both ``except ValueError`` around document
+        hydration. A ``ValueError`` here would be absorbed on exactly the path
+        FR14 exists to fail loudly on, leaving a team restored with agents the
+        orchestrator cannot describe.
+        """
+        assert not issubclass(AgentCardNotFoundError, ValueError)
+
+        with pytest.raises(AgentCardNotFoundError):
+            try:
+                raise AgentCardNotFoundError("no card at that hash")
+            except ValueError:  # pragma: no cover - must not catch
+                pytest.fail("AgentCardNotFoundError was caught by `except ValueError`")
+
+    def test_is_a_distinct_type_from_the_event_cursor_error(self) -> None:
+        """A caller catching one must not silently catch the other."""
+        assert not issubclass(AgentCardNotFoundError, EventNotFoundError)
+        assert not issubclass(EventNotFoundError, AgentCardNotFoundError)
 
 
 class TestNullServiceRegistry:

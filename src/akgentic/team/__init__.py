@@ -16,6 +16,8 @@ from akgentic.team.metadata import (
     make_index_prefix_groups,
 )
 from akgentic.team.models import (
+    AgentCardRef,
+    AgentRef,
     AgentStateSnapshot,
     PersistedEvent,
     Process,
@@ -23,12 +25,21 @@ from akgentic.team.models import (
     TeamCardMember,
     TeamRuntime,
     TeamStatus,
+    spawned_names,
 )
 from akgentic.team.ports import (
+    AgentCardNotFoundError,
     EventNotFoundError,
     EventStore,
     NullServiceRegistry,
     ServiceRegistry,
+)
+from akgentic.team.projection import (
+    TeamProjection,
+    derive_team_projection,
+    hash_agent_card,
+    resolve_agent_cards,
+    storable_agent_card,
 )
 from akgentic.team.reference_metadata import ReferenceTeamMetadata
 from akgentic.team.repositories import YamlEventStore
@@ -39,6 +50,9 @@ __version__ = "1.0.0-alpha.2"
 
 __all__: list[str] = [
     "__version__",
+    "AgentCardNotFoundError",
+    "AgentCardRef",
+    "AgentRef",
     "AgentStateSnapshot",
     "EventNotFoundError",
     "EventStore",
@@ -53,14 +67,20 @@ __all__: list[str] = [
     "TeamFactory",
     "TeamManager",
     "TeamMetadata",
+    "TeamProjection",
     "TeamRestorer",
     "TeamRuntime",
     "TeamStatus",
     "WelcomeMessage",
     "YamlEventStore",
     "derive_metadata_indexes",
+    "derive_team_projection",
+    "hash_agent_card",
     "make_index_entry",
     "make_index_prefix_groups",
+    "resolve_agent_cards",
+    "spawned_names",
+    "storable_agent_card",
 ]
 
 _mongo_available = False

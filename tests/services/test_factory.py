@@ -14,11 +14,13 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.core.messages.message import Message
+from akgentic.core.messages.message import Message, UserMessage
+from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.team.factory import GRACE_TIMEOUT_SECONDS, TeamFactory
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime, spawned_names
+from akgentic.team.projection import derive_team_projection
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -68,7 +70,6 @@ def _make_card(
     name: str,
     role: str = "TestRole",
     agent_class: type[Akgent[Any, Any]] = StubAgent,
-    routes_to: list[str] | None = None,
 ) -> AgentCard:
     return AgentCard(
         role=role,
@@ -76,7 +77,6 @@ def _make_card(
         skills=["testing"],
         agent_class=agent_class,
         config=BaseConfig(name=name, role=role),
-        routes_to=routes_to or [],
     )
 
 
@@ -86,10 +86,9 @@ def _make_member(
     agent_class: type[Akgent[Any, Any]] = StubAgent,
     headcount: int = 1,
     members: list[TeamCardMember] | None = None,
-    routes_to: list[str] | None = None,
 ) -> TeamCardMember:
     return TeamCardMember(
-        card=_make_card(name, role, agent_class, routes_to),
+        card=_make_card(name, role, agent_class),
         headcount=headcount,
         members=members or [],
     )
@@ -196,28 +195,6 @@ class TestTeamFactoryBuild:
             time.sleep(0.01)
         assert sub.stopped is True
 
-    # -- 3.5: routes_to wiring ------------------------------------------
-
-    def test_routes_to_registered(self, actor_system: ActorSystem) -> None:
-        """AC 4,6: Agent profiles with routes_to are registered with orchestrator."""
-        worker = _make_member("worker", "Worker")
-        ep = _make_member("lead", "Lead", routes_to=["Worker"])
-        tc = _make_team_card(entry_point=ep, members=[worker])
-        # Explicitly register profiles for hiring
-        tc.agent_profiles = list(tc.agent_cards.values())
-
-        runtime = TeamFactory.build(tc, actor_system)
-
-        # Verify agent profiles are registered
-        catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        roles = {c.role for c in catalog}
-        assert "Lead" in roles
-        assert "Worker" in roles
-
-        # Verify routes_to is preserved
-        lead_card = next(c for c in catalog if c.role == "Lead")
-        assert "Worker" in lead_card.routes_to
-
     # -- 3.6: Partial failure rollback -----------------------------------
 
     def test_partial_failure_rollback(self, actor_system: ActorSystem) -> None:
@@ -240,33 +217,19 @@ class TestTeamFactoryBuild:
         assert runtime.orchestrator_addr.team_id == runtime.id
         assert runtime.entry_addr.team_id == runtime.id
 
-    # -- 3.8: Agent profiles registered with orchestrator ----------------
+    # -- 3.8: The full role catalog registered with the orchestrator -----
 
-    def test_agent_profiles_registered(self, actor_system: ActorSystem) -> None:
-        """AC 6: orchestrator.get_agent_catalog() returns only agent_profiles."""
+    def test_declared_profiles_are_in_the_catalog(self, actor_system: ActorSystem) -> None:
+        """The roles named in agent_profiles reach the catalog, flagged hireable."""
         worker = _make_member("worker", "Worker")
         tc = _make_team_card(members=[worker])
-        # Explicitly register profiles for hiring
         tc.agent_profiles = list(tc.agent_cards.values())
 
         runtime = TeamFactory.build(tc, actor_system)
 
         catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        roles = {c.role for c in catalog}
-        assert "Lead" in roles
-        assert "Worker" in roles
-        assert len(catalog) == 2
-
-    def test_no_profiles_means_empty_catalog(self, actor_system: ActorSystem) -> None:
-        """Default agent_profiles (empty) results in empty hiring catalog."""
-        worker = _make_member("worker", "Worker")
-        tc = _make_team_card(members=[worker])
-        # agent_profiles defaults to empty — no roles available for hiring
-
-        runtime = TeamFactory.build(tc, actor_system)
-
-        catalog = runtime.orchestrator_proxy.get_agent_catalog()
-        assert len(catalog) == 0
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert all(c.can_be_hired for c in catalog)
 
     # -- Additional edge-case tests --------------------------------------
 
@@ -530,3 +493,283 @@ class TestFactoryRollbackWaitsOnOrchestrator:
         assert events.index("orchestrator-wait") == len(events) - 1, (
             f"orchestrator wait must be last (after agent stops): {events}"
         )
+
+
+class TestBuildRegistersTheWholeRoleCatalog:
+    """AC 1, 3-8 (31-2): the catalog is the team's full roster, not a subset.
+
+    Note what these tests do NOT assert: nothing in the framework reads
+    ``can_be_hired`` yet, so a card carrying it is carried, not enforced. The
+    flag's value is asserted as a value.
+    """
+
+    @staticmethod
+    def _three_level_card_with_two_profiles() -> TeamCard:
+        """Entry point, a three-level tree, and two roles only in agent_profiles."""
+        junior = _make_member("junior", "Junior")
+        worker = _make_member("worker", "Worker", members=[junior])
+        supervisor = _make_member("supervisor", "Supervisor", members=[worker])
+        tc = _make_team_card(members=[supervisor])
+        tc.agent_profiles = [
+            _make_card("analyst", "Analyst"),
+            _make_card("scribe", "Scribe"),
+        ]
+        return tc
+
+    def test_every_reachable_role_gets_exactly_one_entry(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC1: entry point + every tree depth + every profile, one entry per role."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        roles = [c.role for c in catalog]
+        assert sorted(roles) == [
+            "Analyst",
+            "Junior",
+            "Lead",
+            "Scribe",
+            "Supervisor",
+            "Worker",
+        ]
+        assert len(roles) == len(set(roles))
+
+    def test_a_role_in_both_the_tree_and_the_profiles_yields_one_hireable_entry(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC3: no duplicate entry, and the surviving one is flagged hireable."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        tc.agent_profiles = [_make_card("worker-profile", "Worker")]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        workers = [c for c in catalog if c.role == "Worker"]
+        assert len(workers) == 1
+        assert workers[0].can_be_hired is True
+
+    def test_the_profiles_card_reaches_the_catalog_for_a_dual_listed_role(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC 16, create path: WHICH card the catalog holds, not how many.
+
+        The profile and the tree card for ``Worker`` differ in description and
+        skills, so this fails under tree-wins precedence rather than passing
+        either way — which the count-and-flag spec above cannot do.
+        """
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        profile = _make_card("worker-profile", "Worker")
+        profile.description = "Hired to work, not the one already working"
+        profile.skills = ["onboarding"]
+        tc.agent_profiles = [profile]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        entry = next(c for c in catalog if c.role == "Worker")
+        assert entry.description == profile.description
+        assert entry.skills == profile.skills
+        assert entry.description != worker.card.description
+
+    def test_only_profile_roles_carry_the_hireable_flag(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC4: every tree-only role in the catalog reads can_be_hired=False."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        flags = {c.role: c.can_be_hired for c in runtime.orchestrator_proxy.get_agent_catalog()}
+        assert flags == {
+            "Lead": False,
+            "Supervisor": False,
+            "Worker": False,
+            "Junior": False,
+            "Analyst": True,
+            "Scribe": True,
+        }
+
+    def test_a_team_with_no_profiles_still_registers_its_roster(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC5: the replaced code skipped registration entirely for such a team."""
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        assert tc.agent_profiles == []
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert {c.role for c in catalog} == {"Lead", "Worker"}
+        assert not any(c.can_be_hired for c in catalog)
+
+    def test_the_registered_cards_are_the_derivation_functions_own_output(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC6: a second walk of the card inside factory.py fails here."""
+        tc = self._three_level_card_with_two_profiles()
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert runtime.orchestrator_proxy.get_agent_catalog() == derive_team_projection(tc).cards
+
+    def test_the_callers_cards_are_never_flagged(self, actor_system: ActorSystem) -> None:
+        """AC7: every card reachable from the INPUT card still reads False."""
+        tc = self._three_level_card_with_two_profiles()
+
+        TeamFactory.build(tc, actor_system)
+
+        reachable = [
+            tc.entry_point.card,
+            *tc.agent_cards.values(),
+            *tc.agent_profiles,
+        ]
+        assert [c.can_be_hired for c in reachable] == [False] * len(reachable)
+
+    def test_a_hireable_catalog_entry_is_a_copy_not_the_callers_object(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """AC8: the flag is applied to a model_copy, never written back."""
+        tc = self._three_level_card_with_two_profiles()
+        analyst_input = tc.agent_profiles[0]
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        analyst_registered = next(c for c in catalog if c.role == "Analyst")
+        assert analyst_registered is not analyst_input
+        assert analyst_registered.can_be_hired is True
+        assert analyst_input.can_be_hired is False
+
+
+class TestSpawnedNamesMatchesTheFactory:
+    """AC 15: the projection's naming rule and the factory's spawning agree."""
+
+    def test_every_name_the_rule_produces_is_a_live_agent(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The projection records spawned names; a divergence must go red here.
+
+        ``spawned_names`` states the ``headcount`` expansion once, and
+        ``TeamFactory._spawn_member`` performs it. Nothing but this test holds
+        the two together — 31-4 makes the factory call the function, and until
+        then a drift would only surface as a supervisor silently missing from
+        ``send()``'s fan-out at runtime.
+        """
+        entry = _make_member("lead", "Lead")
+        crew = _make_member("worker", "Worker", headcount=3)
+        solo = _make_member("scribe", "Scribe")
+        tc = _make_team_card(entry_point=entry, members=[crew, solo])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        for member in (entry, crew, solo):
+            for name in spawned_names(member):
+                assert name in runtime.addrs, (
+                    f"spawned_names produced '{name}', which the factory never "
+                    f"spawned: {sorted(runtime.addrs)}"
+                )
+        assert spawned_names(crew) == ["worker_0", "worker_1", "worker_2"]
+
+
+def _sent_recipients(
+    subscriber: StubSubscriber, since: int, expected: int
+) -> list[SentMessage]:
+    """Return the ``SentMessage``s recorded after *since*, once *expected* arrive.
+
+    ``TeamRuntime.send`` routes through a fire-and-forget ``proxy_tell`` entry
+    proxy and the orchestrator notification is asynchronous, so the count is
+    polled rather than read once. Returning early on the expected count keeps a
+    passing test fast; the deadline is what makes a failing one finite.
+
+    On timeout this returns whatever DID arrive rather than failing, so every
+    caller pins ``len(...)`` as well as the recipients — a set of one value is
+    equal to a set of three identical ones, so a partial delivery reads as a
+    pass without the count.
+    """
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        sent = [m for m in subscriber.messages[since:] if isinstance(m, SentMessage)]
+        if len(sent) >= expected:
+            return sent
+        time.sleep(0.01)
+    return [m for m in subscriber.messages[since:] if isinstance(m, SentMessage)]
+
+
+class TestASupervisorDeclaredWithHeadcountReachesTheFanOut:
+    """FR7: ``supervisor_addrs`` is keyed by SPAWNED names, not declared ones.
+
+    A supervisor declared ``headcount=3`` is spawned as ``worker_0..2``, so a
+    construction that matches the bare ``config.name`` never finds it and
+    ``send()`` silently never reaches it.
+    """
+
+    def test_a_headcount_supervisor_contributes_one_entry_per_instance(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The three spawned names are the keys; the declared name is nowhere."""
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert set(runtime.supervisor_addrs) == {"worker_0", "worker_1", "worker_2"}
+        for name in ("worker_0", "worker_1", "worker_2"):
+            assert runtime.supervisor_addrs[name] == runtime.addrs[name]
+        assert "worker" not in runtime.supervisor_addrs
+        assert "worker" not in runtime.addrs
+
+    def test_the_expansion_leaves_the_layer_boundary_where_it_was(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """Expanded, ``supervisor_addrs`` is still the first layer of members.
+
+        The entry point is the sender, not a recipient, and a second-layer
+        subordinate is internal to its supervisor's subtree. Neither joins the
+        fan-out because a sibling member happens to be multi-instance.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        junior = _make_member("junior", "Junior")
+        solo = _make_member("scribe", "Scribe", members=[junior])
+        tc = _make_team_card(members=[crew, solo])
+
+        runtime = TeamFactory.build(tc, actor_system)
+
+        assert set(runtime.supervisor_addrs) == {
+            "worker_0",
+            "worker_1",
+            "worker_2",
+            "scribe",
+        }
+        assert "lead" not in runtime.supervisor_addrs
+        assert "junior" not in runtime.supervisor_addrs
+        # The subordinate WAS spawned — it is excluded by layer, not missing.
+        assert "junior" in runtime.addrs
+
+    def test_send_reaches_every_instance_of_a_headcount_supervisor(
+        self, actor_system: ActorSystem
+    ) -> None:
+        """The symptom: the send is RECORDED, not merely called.
+
+        ``send`` routes through ``ActorSystem.proxy_tell``, which casts and
+        discards the actor type it is handed, so a call that does not raise
+        proves nothing. ``len(sent)`` is pinned alongside the recipient set
+        because a set comparison alone cannot tell a full delivery from a
+        partial one.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+        tc.message_types = [UserMessage]
+        recording = StubSubscriber()
+
+        runtime = TeamFactory.build(tc, actor_system, subscribers=[recording])
+        baseline = len(recording.messages)
+        runtime.send("staff the whole crew")
+
+        sent = _sent_recipients(recording, baseline, expected=3)
+        assert len(sent) == 3
+        assert {m.recipient.name for m in sent} == {"worker_0", "worker_1", "worker_2"}

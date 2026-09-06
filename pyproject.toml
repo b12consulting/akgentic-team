@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-team"
-version = "1.6.1"
+version = "1.7.0"
 description = "Team lifecycle management — create, resume, stop, delete teams with event-sourced persistence"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,7 +22,7 @@ keywords = ["agents", "ai", "akgentic", "teams", "lifecycle"]
 dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
-    "akgentic-core>=1.5.6",
+    "akgentic-core>=1.5.13",
 ]
 
 [project.optional-dependencies]
@@ -73,7 +73,13 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
-markers = ["integration: Full lifecycle tests requiring real LLM and API keys"]
+markers = [
+    """\
+integration: Needs a service this machine may not have — a real LLM and API keys \
+for the full lifecycle suite, a running Docker daemon for the container-backed \
+ones. Deselected by the default addopts.\
+""",
+]
 # --ignore: integration tests import akgentic.agent (not a dependency of
 # akgentic-team); skip collecting them so the import does not error before the
 # 'not integration' marker filter is applied.

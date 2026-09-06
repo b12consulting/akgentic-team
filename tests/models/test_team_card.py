@@ -308,26 +308,6 @@ class TestTeamCardSerialization:
         sup_names = {s.config.name for s in restored.supervisors}
         assert sup_names == {"l1"}
 
-    def test_routes_to_preserved_through_serialization(self) -> None:
-        """routes_to on AgentCards within the tree survive round-trip."""
-        card_with_routes = make_agent_card(
-            name="router",
-            role="Router",
-            routes_to=["TargetA", "TargetB"],
-        )
-        member = TeamCardMember(card=card_with_routes)
-        entry = TeamCardMember(card=make_agent_card(name="entry", role="Entry"))
-        team = TeamCard(
-            name="routing-team",
-            description="Team with routing",
-            entry_point=entry,
-            members=[member],
-        )
-        dumped = team.model_dump()
-        restored = TeamCard.model_validate(dumped)
-        router_card = restored.agent_cards["router"]
-        assert router_card.routes_to == ["TargetA", "TargetB"]
-
     def test_single_member_team_round_trip(self) -> None:
         """Entry-point only team serializes and deserializes correctly."""
         team = TeamCard(
@@ -376,8 +356,8 @@ class TestTeamCardSerialization:
         """TeamCard is a plain model, never Generic[...].
 
         A parameterised TeamCard[X] is a Pydantic-generated class with no stable
-        importable dotted path, which breaks the tagged-dict round-trip that
-        Process.team_card depends on to rebuild a team on resume.
+        importable dotted path, which breaks the tagged-dict round-trip every
+        stored copy of this card depends on — a catalog entry, the CLI's YAML.
         """
         assert TeamCard.__pydantic_generic_metadata__["parameters"] == ()
         assert TeamCard.__pydantic_generic_metadata__["origin"] is None

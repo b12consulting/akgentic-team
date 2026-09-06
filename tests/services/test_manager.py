@@ -5,10 +5,12 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
@@ -28,10 +30,13 @@ from akgentic.team.models import (
     TeamCardMember,
     TeamRuntime,
     TeamStatus,
+    spawned_names,
 )
 from akgentic.team.ports import NullServiceRegistry
+from akgentic.team.repositories.yaml import YamlEventStore
 from akgentic.team.restorer import TeamRestorer
 from akgentic.team.subscriber import IdleStopSubscriber, PersistenceSubscriber
+from tests.conftest import projection_kwargs
 from tests.services.conftest import InMemoryEventStore
 
 # ---------------------------------------------------------------------------
@@ -130,6 +135,34 @@ def _make_team_card(
     )
 
 
+class ProcessWithAFieldAddedLater(Process):
+    """``Process`` as it will look once someone adds the next field to it.
+
+    Nothing in ``manager.py`` mentions ``added_later``, so it survives a
+    lifecycle write only if that write copies the record rather than rebuilding
+    it from a hand-written field list (Golden Rule #12). Module level, not
+    nested in a test: the serializer records a model by its importable
+    ``module.ClassName`` path.
+    """
+
+    added_later: str = "the-default"
+
+
+def _store_as_a_later_release_would(
+    event_store: InMemoryEventStore, team_id: uuid.UUID, value: str
+) -> ProcessWithAFieldAddedLater:
+    """Replace the stored ``Process`` with the subclass, carrying *value*.
+
+    ``dict(stored)`` hands over the live field values, so concrete submodels
+    survive instead of being flattened by a dump/validate cycle.
+    """
+    stored = event_store.load_team(team_id)
+    assert stored is not None
+    later = ProcessWithAFieldAddedLater(**dict(stored), added_later=value)
+    event_store.save_team(later)
+    return later
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -187,7 +220,7 @@ class TestTeamManagerCreate:
         assert process.status == TeamStatus.RUNNING
         assert process.user_id == "test-user"
         assert process.user_email == "u@test.com"
-        assert process.team_card.name == "test-team"
+        assert process.team_name == "test-team"
 
         # Timestamps are set to reasonable values
         assert before - timedelta(seconds=1) <= process.created_at <= after + timedelta(seconds=1)
@@ -247,6 +280,54 @@ class TestTeamManagerCreate:
         process = event_store.load_team(runtime.id)
         assert process is not None
         assert process.team_id == runtime.id
+
+    def test_create_team_registers_the_whole_role_catalog(
+        self,
+        manager: TeamManager,
+    ) -> None:
+        """AC2 (31-2): the caller-facing path gets the catalog, not only the factory.
+
+        The registered set and the persisted refs come from one derivation, so
+        they agree by construction — asserted here on the roles they share.
+        """
+        worker = _make_member("worker", "Worker")
+        tc = _make_team_card(members=[worker])
+        tc.agent_profiles = [_make_card("analyst", "Analyst")]
+
+        runtime = manager.create_team(tc)
+
+        catalog = runtime.orchestrator_proxy.get_agent_catalog()
+        assert {c.role for c in catalog} == {"Lead", "Worker", "Analyst"}
+        assert {c.role: c.can_be_hired for c in catalog} == {
+            "Lead": False,
+            "Worker": False,
+            "Analyst": True,
+        }
+
+    def test_the_stored_supervisors_and_the_runtime_agree_on_a_headcount_member(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """FR7 (31-4): the persisted record and the live fan-out are keyed alike.
+
+        The ``Process`` half of this is a NON-REGRESSION pin, not a reproduction:
+        ``derive_team_projection`` has expanded ``headcount`` through
+        ``spawned_names`` since 31-1 (FR3a), so the three refs were already
+        correct before this story. What 31-4 changes is the other side of the
+        equality — ``supervisor_addrs`` — and asserting them equal is what stops
+        the two records drifting apart again.
+        """
+        crew = _make_member("worker", "Worker", headcount=3)
+        tc = _make_team_card(members=[crew])
+
+        runtime = manager.create_team(tc, user_id="test-user")
+
+        process = event_store.load_team(runtime.id)
+        assert process is not None
+        stored = {ref.name for ref in process.supervisors}
+        assert stored == {"worker_0", "worker_1", "worker_2"}
+        assert stored == set(runtime.supervisor_addrs)
 
 
 # ---------------------------------------------------------------------------
@@ -308,15 +389,7 @@ class TestTeamManagerStateMachine:
         # Manually transition to STOPPED
         process = event_store.load_team(runtime.id)
         assert process is not None
-        stopped_process = Process(
-            team_id=process.team_id,
-            team_card=process.team_card,
-            status=TeamStatus.STOPPED,
-            user_id=process.user_id,
-            user_email=process.user_email,
-            created_at=process.created_at,
-            updated_at=process.updated_at,
-        )
+        stopped_process = process.model_copy(update={"status": TeamStatus.STOPPED})
         event_store.save_team(stopped_process)
 
         manager.delete_team(runtime.id)
@@ -341,14 +414,15 @@ class TestTeamManagerStateMachine:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -400,14 +474,15 @@ class TestTeamManagerServiceRegistry:
             instance_id=instance_id,
         )
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
             status=TeamStatus.STOPPED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -471,29 +546,39 @@ def _create_and_stop_team(
 
     # Inject StartMessages for all agents in the TeamCard tree
     def _inject_member(member: TeamCardMember) -> None:
+        """Inject one StartMessage per SPAWNED actor, not one per member slot.
+
+        A member declared ``headcount=3`` is three live actors named
+        ``<name>_0..2``. Under the bare declared name the lookup below missed,
+        fell back to a random UUID belonging to no live actor, and the synthetic
+        log described an agent the factory never spawned. The expansion is a
+        no-op for every ``headcount == 1`` member.
+        """
         nonlocal seq
-        name = member.card.config.name
         role = member.card.config.role
         agent_class = member.card.get_agent_class()
-        addr = runtime.addrs.get(name)
-        agent_id = addr.agent_id if addr else uuid.uuid4()
-        seq += 1
-        addr_dict: ActorAddressDict = {
-            "__actor_address__": True,
-            "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
-            "agent_id": str(agent_id),
-            "name": name,
-            "role": role,
-            "team_id": str(team_id),
-            "squad_id": str(uuid.uuid4()),
-            "user_message": False,
-        }
-        sm = StartMessage(config=member.card.get_config_copy())
-        sm.sender = ActorAddressProxy(addr_dict)
-        sm.team_id = team_id
-        event_store.save_event(PersistedEvent(
-            team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
-        ))
+        for name in spawned_names(member):
+            addr = runtime.addrs.get(name)
+            agent_id = addr.agent_id if addr else uuid.uuid4()
+            config = member.card.get_config_copy()
+            config.name = name
+            seq += 1
+            addr_dict: ActorAddressDict = {
+                "__actor_address__": True,
+                "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
+                "agent_id": str(agent_id),
+                "name": name,
+                "role": role,
+                "team_id": str(team_id),
+                "squad_id": str(uuid.uuid4()),
+                "user_message": False,
+            }
+            sm = StartMessage(config=config)
+            sm.sender = ActorAddressProxy(addr_dict)
+            sm.team_id = team_id
+            event_store.save_event(PersistedEvent(
+                team_id=team_id, sequence=seq, event=sm, timestamp=datetime.now(UTC),
+            ))
         for child in member.members:
             _inject_member(child)
 
@@ -548,14 +633,15 @@ class TestTeamManagerResume:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -569,6 +655,40 @@ class TestTeamManagerResume:
         """AC 4: resume_team on non-existent team raises ValueError."""
         with pytest.raises(ValueError, match="not found"):
             manager.resume_team(uuid.uuid4())
+
+    def test_resume_of_an_unmigrated_team_still_reports_not_found(
+        self,
+        actor_system: ActorSystem,
+        tmp_path: Path,
+    ) -> None:
+        """AC 13: the caller-visible surface is deliberately UNCHANGED.
+
+        The legible reason reaches the store's log; the caller still gets the
+        same ``Team {id} not found`` it got before, because ``load_team``
+        log-and-skips any ``ValueError`` from validation. Pinned here so that
+        widening it — which would also change ``list_teams`` — has to be a
+        deliberate act rather than a side effect.
+        """
+        store = YamlEventStore(tmp_path)
+        mgr = TeamManager(actor_system=actor_system, event_store=store)
+
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "team.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "team_id": str(team_id),
+                    "team_card": {"name": "pre-projection-team"},
+                    "status": TeamStatus.STOPPED.value,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+        )
+
+        with pytest.raises(ValueError, match="not found"):
+            mgr.resume_team(team_id)
 
     def test_resume_registers_with_service_registry(
         self,
@@ -930,14 +1050,15 @@ class TestTeamManagerStop:
         from datetime import UTC, datetime
 
         team_id = uuid.uuid4()
+        tc = _make_team_card()
         process = Process(
             team_id=team_id,
-            team_card=_make_team_card(),
             status=TeamStatus.DELETED,
             user_id="cli",
             user_email="",
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
+            **projection_kwargs(tc),
         )
         event_store.save_team(process)
 
@@ -1404,34 +1525,37 @@ def _create_and_stop_team_with_namespace(
     )
 
     def _inject_member(member: TeamCardMember) -> None:
+        """One StartMessage per SPAWNED actor — see ``_create_and_stop_team``."""
         nonlocal seq
-        name = member.card.config.name
         role = member.card.config.role
         agent_class = member.card.get_agent_class()
-        addr = runtime.addrs.get(name)
-        agent_id = addr.agent_id if addr else uuid.uuid4()
-        seq += 1
-        addr_dict: ActorAddressDict = {
-            "__actor_address__": True,
-            "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
-            "agent_id": str(agent_id),
-            "name": name,
-            "role": role,
-            "team_id": str(team_id),
-            "squad_id": str(uuid.uuid4()),
-            "user_message": False,
-        }
-        sm = StartMessage(config=member.card.get_config_copy())
-        sm.sender = ActorAddressProxy(addr_dict)
-        sm.team_id = team_id
-        event_store.save_event(
-            PersistedEvent(
-                team_id=team_id,
-                sequence=seq,
-                event=sm,
-                timestamp=datetime.now(UTC),
+        for name in spawned_names(member):
+            addr = runtime.addrs.get(name)
+            agent_id = addr.agent_id if addr else uuid.uuid4()
+            config = member.card.get_config_copy()
+            config.name = name
+            seq += 1
+            addr_dict: ActorAddressDict = {
+                "__actor_address__": True,
+                "__actor_type__": f"{agent_class.__module__}.{agent_class.__name__}",
+                "agent_id": str(agent_id),
+                "name": name,
+                "role": role,
+                "team_id": str(team_id),
+                "squad_id": str(uuid.uuid4()),
+                "user_message": False,
+            }
+            sm = StartMessage(config=config)
+            sm.sender = ActorAddressProxy(addr_dict)
+            sm.team_id = team_id
+            event_store.save_event(
+                PersistedEvent(
+                    team_id=team_id,
+                    sequence=seq,
+                    event=sm,
+                    timestamp=datetime.now(UTC),
+                )
             )
-        )
         for child in member.members:
             _inject_member(child)
 
@@ -1441,6 +1565,61 @@ def _create_and_stop_team_with_namespace(
 
     manager.stop_team(team_id)
     return team_id
+
+
+class TestLifecycleWritesCarryAnUnknownFieldForward:
+    """Golden Rule #12 for the two paths that run on their own.
+
+    ``resume_team`` and ``stop_team`` both re-save the ``Process``, and both are
+    driven by machinery rather than by a person — a resume on worker restart, a
+    stop by the idle-stop countdown. That is the worst place for a hand-listed
+    rebuild: a value written correctly can survive for weeks and then be nulled
+    by a sweep nobody triggered, with no error and no failing test.
+
+    The ``catalog_namespace`` specs above cannot catch it. They name a field
+    that exists today, so a rebuild naming every field that exists today is
+    green — the whole-model comparison has the same blind spot. Only a field the
+    write path has never heard of distinguishes the two, which is what
+    ``ProcessWithAFieldAddedLater`` supplies.
+    """
+
+    def test_stop_carries_a_field_added_to_process_forward(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """A stop changes status and updated_at; the unknown field rides along."""
+        runtime = manager.create_team(_make_team_card(), user_id="u", user_email="u@e")
+        before = _store_as_a_later_release_would(event_store, runtime.id, "carried-through")
+
+        manager.stop_team(runtime.id)
+
+        persisted = event_store.load_team(runtime.id)
+        assert isinstance(persisted, ProcessWithAFieldAddedLater)
+        assert persisted.added_later == "carried-through"
+        assert persisted.status == TeamStatus.STOPPED
+        assert persisted == before.model_copy(
+            update={"status": TeamStatus.STOPPED, "updated_at": persisted.updated_at}
+        )
+
+    def test_resume_carries_a_field_added_to_process_forward(
+        self,
+        manager: TeamManager,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Same for a resume — the path a worker restart runs unattended."""
+        team_id = _create_and_stop_team(manager, event_store)
+        before = _store_as_a_later_release_would(event_store, team_id, "carried-through")
+
+        manager.resume_team(team_id)
+
+        persisted = event_store.load_team(team_id)
+        assert isinstance(persisted, ProcessWithAFieldAddedLater)
+        assert persisted.added_later == "carried-through"
+        assert persisted.status == TeamStatus.RUNNING
+        assert persisted == before.model_copy(
+            update={"status": TeamStatus.RUNNING, "updated_at": persisted.updated_at}
+        )
 
 
 # ---------------------------------------------------------------------------

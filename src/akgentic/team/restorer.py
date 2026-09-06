@@ -25,10 +25,10 @@ from akgentic.team.models import (
     AgentStateSnapshot,
     PersistedEvent,
     Process,
-    TeamCard,
     TeamRuntime,
 )
 from akgentic.team.ports import EventStore
+from akgentic.team.projection import resolve_agent_cards
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +133,7 @@ class TeamRestorer:
 
             # Build and return TeamRuntime
             runtime = self._build_team_runtime(
-                team_id,
-                process.team_card,
+                process,
                 result.orchestrator_addr,
                 result.addrs,
                 addr_map,
@@ -484,12 +483,32 @@ class TeamRestorer:
                 proxy_llm: Akgent[Any, Any] = self._actor_system.proxy_ask(addr, Akgent)
                 proxy_llm.init_llm_context(agent_events)
 
-        # 2f. Register hireable agent profiles with orchestrator
-        # Only profiles listed in agent_profiles are available for runtime
-        # hiring. Instantiated members are already live — registering them
-        # would cause the LLM to hire duplicates via role names.
-        if process.team_card.agent_profiles:
-            orchestrator_proxy.register_agent_profiles(process.team_card.agent_profiles)
+        # 2f. Register the team's resolved agent cards with the orchestrator.
+        # The WHOLE card set, not just the hireable subset the old
+        # `team_card.agent_profiles` registration carried, so the orchestrator
+        # can describe every colleague. That widening is the intended change
+        # (ADR-26 §Decision 5, FR2/FR11), not a regression.
+        #
+        # It is NOT hireability-neutral today, and that is worth stating
+        # plainly rather than assuming. Each resolved card carries its ref's
+        # `can_be_hired`, but NOTHING in the framework reads that flag: the
+        # hire path picks any card whose role matches out of
+        # `Orchestrator.get_agent_catalog()`, and `get_available_roles()`
+        # advertises every registered role. So until a hire guard exists, a
+        # restored team's already-live members become hirable by role and the
+        # model can spawn duplicates of them — exactly what the registration
+        # this replaced was narrow in order to avoid. The guard belongs to
+        # `akgentic-tool` / `akgentic-core` (Golden Rule 4 bars fixing it
+        # here); tracked as `backlog.md` row 17. Story 31-2 repeats this
+        # widening on the create path, which is when it stops being restore-only.
+        #
+        # Resolved in ONE batch load through the single resolution site. A
+        # per-role read would return exactly this, which is why the call count
+        # rather than the result is what a test has to pin.
+        if process.agent_cards:
+            orchestrator_proxy.register_agent_profiles(
+                resolve_agent_cards(process.agent_cards, self._event_store)
+            )
 
         # 2g. Register subscribers last — ensures they only receive events
         # during Phase 3 replay, matching fresh-team event stream (ADR-014).
@@ -668,17 +687,22 @@ class TeamRestorer:
 
     def _build_team_runtime(
         self,
-        team_id: uuid.UUID,
-        team_card: TeamCard,
+        process: Process,
         orchestrator_addr: ActorAddress,
         addrs: dict[str, ActorAddress],
         addr_map: dict[uuid.UUID, ActorAddress],
     ) -> TeamRuntime:
         """Construct a TeamRuntime from restored components.
 
+        Every value comes off the stored structural projection — the record of
+        what was actually spawned — rather than off a nested ``TeamCard``
+        (ADR-26 §Decision 6). The supervisor names on ``process.supervisors``
+        are already the spawned ones: ``derive_team_projection`` expands
+        ``headcount`` when it builds each ref, so there is no expansion step
+        left here to forget.
+
         Args:
-            team_id: The team identifier.
-            team_card: The declarative team definition.
+            process: The persisted team record, carrying the projection.
             orchestrator_addr: Address of the restored orchestrator.
             addrs: Map of agent names to their actor addresses.
             addr_map: Pre-built mapping of agent_id to live ActorAddress
@@ -690,22 +714,25 @@ class TeamRestorer:
         Raises:
             ValueError: If the entry point agent is not found in addrs.
         """
-        entry_name = team_card.entry_point.card.config.name
+        entry_name = process.entry_point.name
 
         entry_addr = addrs.get(entry_name)
         if entry_addr is None:
             msg = f"Entry point agent '{entry_name}' not found after restore"
             raise ValueError(msg)
 
+        # A supervisor absent from addrs was fired during the team's life: its
+        # StopMessage is in the log, so it is deliberately not respawned. Skip
+        # it rather than failing — that is what keeps such a team resumable.
         supervisor_addrs: dict[str, ActorAddress] = {}
-        for card in team_card.supervisors:
-            name = card.config.name
-            if name in addrs:
-                supervisor_addrs[name] = addrs[name]
+        for ref in process.supervisors:
+            if ref.name in addrs:
+                supervisor_addrs[ref.name] = addrs[ref.name]
 
         runtime = TeamRuntime(
-            id=team_id,
-            team=team_card,
+            id=process.team_id,
+            team_name=process.team_name,
+            message_types=list(process.message_types),
             actor_system=self._actor_system,
             orchestrator_addr=orchestrator_addr,
             entry_addr=entry_addr,

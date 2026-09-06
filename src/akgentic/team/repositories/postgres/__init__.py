@@ -3,8 +3,8 @@
 Gates all Nagra imports behind an availability check. When ``nagra`` is not
 installed, importing this package raises ``ImportError`` with installation
 instructions. When ``nagra`` IS available, exposes the schema loader, the
-deployment-time ``init_db`` hook, and the ``NagraEventStore`` class (the
-nine EventStore Protocol methods land in story 17.2).
+deployment-time ``init_db`` hook, and the ``NagraEventStore`` class, which
+implements the whole EventStore Protocol.
 
 Implements ADR-15 Nagra-based PostgreSQL EventStore §5 (lazy import gate)
 and §6 (schema loader + ``init_db`` reference implementation). Mirrors the

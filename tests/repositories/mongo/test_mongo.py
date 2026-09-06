@@ -20,9 +20,16 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_card import AgentCard
 from pymongo.errors import OperationFailure
 
-from akgentic.team.repositories.mongo import MongoEventStore, ensure_indexes
+from akgentic.team.projection import hash_agent_card
+from akgentic.team.repositories.mongo import (
+    AGENT_CARDS_COLLECTION,
+    MongoEventStore,
+    ensure_indexes,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,11 +40,17 @@ if TYPE_CHECKING:
 from akgentic.team.models import TeamStatus
 from tests.models.conftest import (
     AcmeTeamMetadata,
+    make_agent_card,
     make_agent_state_snapshot,
     make_indexed_process,
     make_persisted_event,
     make_process,
 )
+
+
+def _card_fixture() -> AgentCard:
+    """An AgentCard whose ``agent_class`` resolves on the way back out of storage."""
+    return make_agent_card(name="lead", role="Lead", agent_class=Akgent)
 
 
 def _metadata_fixtures() -> list[Process]:
@@ -1152,3 +1165,117 @@ class TestMongoEventStoreMongoSpecific:
             sys.modules.update(saved)  # type: ignore[arg-type]
             sys.modules.update(pymongo_saved)  # type: ignore[arg-type]
             importlib.reload(repos_module)
+
+
+class TestMongoAgentCardStore:
+    """Mongo-only invariants of the content-addressed card store."""
+
+    def test_cards_live_in_their_own_collection(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        card = _card_fixture()
+        mongo_store.save_agent_cards([card])
+
+        docs = list(mongo_db[AGENT_CARDS_COLLECTION].find({}))
+        assert len(docs) == 1
+        assert docs[0]["card_hash"] == hash_agent_card(card)
+
+    def test_the_collection_carries_no_team_id(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """The store is shared. A ``team_id`` here would be the design gone."""
+        mongo_store.save_agent_cards([_card_fixture()])
+
+        doc = mongo_db[AGENT_CARDS_COLLECTION].find_one({})
+        assert doc is not None
+        assert "team_id" not in doc
+
+    def test_the_card_hash_index_is_created_and_unique(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """Unique deliberately: two documents at one hash is two answers to
+        "what are the bytes this hash names", not merely a slow query.
+
+        ``save_agent_cards`` upserts on the same key, so this store's own write
+        path cannot fork a hash without it — the index is what stops a writer
+        that bypasses ``save_agent_cards``, and why the creation is guarded
+        rather than allowed to refuse construction.
+        """
+        info = mongo_db[AGENT_CARDS_COLLECTION].index_information()
+        assert "agent_cards_card_hash_idx" in info
+        assert info["agent_cards_card_hash_idx"]["key"] == [("card_hash", 1)]
+        assert info["agent_cards_card_hash_idx"].get("unique") is True
+
+    def test_the_index_creation_is_idempotent(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        MongoEventStore(mongo_db)  # second construction — must not raise
+
+        info = mongo_db[AGENT_CARDS_COLLECTION].index_information()
+        assert list(info.keys()).count("agent_cards_card_hash_idx") == 1
+
+    def test_a_card_index_rejection_does_not_block_construction(
+        self, mongo_db: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The upsert already guarantees one document per hash without it."""
+        real_create_index = type(mongo_db["x"]).create_index
+
+        def selective_failure(self: Any, keys: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") == "agent_cards_card_hash_idx":
+                raise OperationFailure("index rejected")
+            return real_create_index(self, keys, **kwargs)
+
+        with (
+            patch.object(type(mongo_db["x"]), "create_index", selective_failure),
+            caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.mongo"),
+        ):
+            store = MongoEventStore(mongo_db)
+
+        assert store is not None
+        assert [r for r in caplog.records if "agent_cards_card_hash_idx" in r.getMessage()]
+
+    def test_a_re_save_upserts_rather_than_duplicating(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """``insert_one`` would raise ``DuplicateKeyError`` against the index."""
+        card = _card_fixture()
+        mongo_store.save_agent_cards([card])
+        mongo_store.save_agent_cards([card])
+
+        assert mongo_db[AGENT_CARDS_COLLECTION].count_documents({}) == 1
+
+    def test_delete_team_does_not_touch_the_collection(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """FR13, asserted on the collection rather than on a later read."""
+        process = make_process()
+        mongo_store.save_agent_cards([_card_fixture()])
+        mongo_store.save_team(process)
+
+        mongo_store.delete_team(process.team_id)
+
+        assert mongo_db["teams"].count_documents({}) == 0
+        assert mongo_db[AGENT_CARDS_COLLECTION].count_documents({}) == 1
+
+    def test_saving_no_cards_writes_nothing(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        mongo_store.save_agent_cards([])
+        assert mongo_db[AGENT_CARDS_COLLECTION].count_documents({}) == 0
+
+    def test_a_corrupted_card_document_is_skipped_not_raised(
+        self,
+        mongo_store: MongoEventStore,
+        mongo_db: Any,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Mongo's analogue of the YAML corrupted-file skip."""
+        mongo_db[AGENT_CARDS_COLLECTION].insert_one(
+            {"card_hash": "b" * 64, "card": {"not": "a card"}}
+        )
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.mongo"):
+            loaded = mongo_store.load_agent_cards(["b" * 64])
+
+        assert loaded == {}
+        assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]

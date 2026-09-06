@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,12 +16,10 @@ from akgentic.core.user_proxy import UserProxy
 from akgentic.core.utils.deserializer import ActorAddressDict
 from pydantic import ValidationError
 
-from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime
+from akgentic.team.models import TeamRuntime
 from tests.models.conftest import (
-    make_agent_card,
     make_stub_actor_system,
     make_stub_addr,
-    make_team_card,
     make_team_runtime,
 )
 
@@ -31,7 +30,7 @@ class TestTeamRuntimeConstruction:
     def test_construction_with_all_fields(self) -> None:
         runtime = make_team_runtime()
         assert isinstance(runtime.id, uuid.UUID)
-        assert runtime.team is not None
+        assert runtime.team_name == "test-team"
         assert runtime.actor_system is not None
         assert runtime.orchestrator_addr is not None
         assert runtime.entry_addr is not None
@@ -41,10 +40,9 @@ class TestTeamRuntimeConstruction:
     def test_id_has_no_default(self) -> None:
         """AC4: Construction without explicit id raises ValidationError."""
         system = make_stub_actor_system()
-        tc = make_team_card(agent_class=Akgent)
         with pytest.raises(ValidationError):
             TeamRuntime(
-                team=tc,
+                team_name="test-team",
                 actor_system=system,
                 orchestrator_addr=make_stub_addr(),
                 entry_addr=make_stub_addr(),
@@ -52,10 +50,9 @@ class TestTeamRuntimeConstruction:
 
     def test_supervisor_addrs_defaults_to_empty_dict(self) -> None:
         system = make_stub_actor_system()
-        tc = make_team_card(agent_class=Akgent)
         rt = TeamRuntime(
             id=uuid.uuid4(),
-            team=tc,
+            team_name="test-team",
             actor_system=system,
             orchestrator_addr=make_stub_addr(),
             entry_addr=make_stub_addr(),
@@ -80,32 +77,15 @@ class TestTeamRuntimeConstruction:
 
     def test_model_post_init_keeps_supervisor_addrs(self) -> None:
         """AC2: supervisor_addrs is preserved (the removed proxy build is gone)."""
-        supervisor_card = make_agent_card(name="supervisor", role="Supervisor", agent_class=Akgent)
-        worker_card = make_agent_card(name="worker", role="Worker", agent_class=Akgent)
-        entry_member = TeamCardMember(
-            card=make_agent_card(name="lead", role="Lead", agent_class=Akgent),
-        )
-        # Supervisor has a subordinate worker — makes it a supervisor
-        supervisor_member = TeamCardMember(
-            card=supervisor_card,
-            members=[TeamCardMember(card=worker_card)],
-        )
-        tc = TeamCard(
-            name="team-with-supervisors",
-            description="A team with supervisor hierarchy",
-            entry_point=entry_member,
-            members=[supervisor_member],
-            message_types=[UserMessage],
-        )
-        sup_addr = make_stub_addr("supervisor")
+        sup_addr = make_stub_addr("supervisor", "Supervisor")
         runtime = make_team_runtime(
-            team_card=tc,
+            message_types=[UserMessage],
             supervisor_addrs={"supervisor": sup_addr},
         )
         assert runtime.supervisor_addrs == {"supervisor": sup_addr}
 
     def test_model_post_init_builds_orchestrator_proxy_tell(self) -> None:
-        """AC1: model_post_init builds _orchestrator_proxy_tell via proxy_tell(orchestrator_addr)."""
+        """AC1: model_post_init builds _orchestrator_proxy_tell via proxy_tell."""
         runtime = make_team_runtime()
         assert runtime._orchestrator_proxy_tell is not None
         runtime.actor_system.proxy_tell.assert_any_call(runtime.orchestrator_addr, Orchestrator)
@@ -128,14 +108,70 @@ class TestTeamRuntimeSerialization:
         assert "actor_system" not in data
 
     def test_persistent_fields_in_dump(self) -> None:
-        runtime = make_team_runtime()
+        runtime = make_team_runtime(message_types=[UserMessage])
         data = runtime.model_dump()
         assert "id" in data
-        assert "team" in data
         assert "orchestrator_addr" in data
         assert "entry_addr" in data
         assert "supervisor_addrs" in data
         assert "addrs" in data
+
+    def test_team_card_is_gone_and_the_two_plain_fields_replace_it(self) -> None:
+        """AC9 (31-2): no ``team`` field; ``team_name`` and ``message_types`` instead."""
+        assert "team" not in TeamRuntime.model_fields
+        runtime = make_team_runtime(message_types=[UserMessage])
+        data = runtime.model_dump()
+        assert "team" not in data
+        assert data["team_name"] == "test-team"
+        assert "message_types" in data
+
+    def test_message_types_dump_through_the_type_round_trip(self) -> None:
+        """AC9 (31-2): the ``type`` list survives a dump as a rehydratable marker.
+
+        ``SerializableBaseModel`` turns a ``type`` into ``{"__type__": ...}``;
+        feeding the dumped value straight back through the field must yield the
+        concrete class again, which is what makes ``message_types`` safe to
+        carry on a persisted model.
+        """
+        runtime = make_team_runtime(message_types=[UserMessage])
+        dumped = runtime.model_dump()["message_types"]
+        reloaded = make_team_runtime(message_types=dumped)
+        assert reloaded.message_types == [UserMessage]
+
+
+class SecondAgent(Akgent[Any, Any]):
+    """A distinct Akgent subclass, so "the catalog's class" is distinguishable."""
+
+
+class TestTeamRuntimeEntryClassFromTheCatalog:
+    """AC 12, 13 (31-2): the entry proxy is typed from the orchestrator catalog."""
+
+    def test_entry_proxy_uses_the_class_the_catalog_holds_for_the_entry_role(self) -> None:
+        """AC12: the class reaching proxy_tell is the catalog's, not a default."""
+        system = make_stub_actor_system(entry_agent_class=SecondAgent)
+        entry_addr = make_stub_addr("entry", "Lead")
+
+        runtime = make_team_runtime(actor_system=system, entry_addr=entry_addr)
+
+        system.proxy_tell.assert_any_call(entry_addr, SecondAgent)
+        assert runtime.entry_proxy is not None
+
+    def test_the_catalog_is_asked_for_the_entry_addresses_role(self) -> None:
+        """AC12: the lookup key is the address's role, not a card on the runtime."""
+        system = make_stub_actor_system(entry_agent_class=SecondAgent)
+        entry_addr = make_stub_addr("entry", "Conductor")
+
+        make_team_runtime(actor_system=system, entry_addr=entry_addr)
+
+        system.proxy_ask.return_value.get_agent_profile.assert_called_once_with("Conductor")
+
+    def test_a_role_absent_from_the_catalog_raises_valueerror_naming_it(self) -> None:
+        """AC13: a catalog miss is a ValueError naming the role, not an AttributeError."""
+        system = make_stub_actor_system(entry_agent_class=None)
+        entry_addr = make_stub_addr("entry", "Ghost")
+
+        with pytest.raises(ValueError, match="Ghost"):
+            make_team_runtime(actor_system=system, entry_addr=entry_addr)
 
 
 class TestTeamRuntimeMessaging:
@@ -218,6 +254,13 @@ class TestTeamRuntimeMessaging:
         runtime = make_team_runtime(message_types=[UserMessage])
         runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
         with pytest.raises(ValueError, match="not found"):
+            runtime.send_to("nonexistent", "hello")
+
+    def test_send_to_unknown_agent_names_the_team(self) -> None:
+        """AC14 (31-2): the message names the team, now read from team_name."""
+        runtime = make_team_runtime(team_name="acme-team", message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
+        with pytest.raises(ValueError, match="not found in team 'acme-team'"):
             runtime.send_to("nonexistent", "hello")
 
     def test_make_message_raises_when_no_message_types(self) -> None:
@@ -516,31 +559,15 @@ def _make_proxy_addr(name: str, role: str = "Agent") -> ActorAddressProxy:
     return ActorAddressProxy(addr_dict)
 
 
-def _make_multi_human_runtime(
-    *,
-    human_class: type = UserProxy,
-    support_class: type = UserProxy,
-) -> TeamRuntime:
-    """Build a TeamRuntime with @Human and @Support both as UserProxy."""
-    human_card = make_agent_card(name="@Human", role="Human", agent_class=human_class)
-    support_card = make_agent_card(
-        name="@Support", role="Support", agent_class=support_class
-    )
-    manager_card = make_agent_card(name="@Manager", role="Manager", agent_class=Akgent)
-    entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+def _make_multi_human_runtime() -> TeamRuntime:
+    """Build a TeamRuntime for the routing tests.
 
-    tc = TeamCard(
-        name="multi-human-team",
-        description="Team with two UserProxy agents",
-        entry_point=TeamCardMember(card=entry_card),
-        members=[
-            TeamCardMember(card=human_card),
-            TeamCardMember(card=support_card),
-            TeamCardMember(card=manager_card),
-        ],
-        message_types=[UserMessage],
-    )
-    return make_team_runtime(team_card=tc)
+    Carries no card list on purpose: since 31-2 the ``UserProxy`` question is
+    answered by ``ActorAddress.is_user_proxy`` on the address ``_lookup_member``
+    returns, so what qualifies a target is how each stub address is built, not
+    what any card declares.
+    """
+    return make_team_runtime(team_name="multi-human-team", message_types=[UserMessage])
 
 
 class TestTeamRuntimeProcessHumanInput:
@@ -563,9 +590,9 @@ class TestTeamRuntimeProcessHumanInput:
         proxy_sender = _make_proxy_addr("@Manager", "Manager")
         proxy_recipient = _make_proxy_addr("@Support", "Support")
 
-        live_sender = make_stub_addr("@Manager")
-        live_recipient = make_stub_addr("@Support")
-        target_addr = make_stub_addr("@Support")
+        live_sender = make_stub_addr("@Manager", "Manager")
+        live_recipient = make_stub_addr("@Support", "Support", is_user_proxy=True)
+        target_addr = make_stub_addr("@Support", "Support", is_user_proxy=True)
 
         runtime = _make_multi_human_runtime()
         runtime._orchestrator_proxy.get_team_member = MagicMock(
@@ -617,8 +644,8 @@ class TestTeamRuntimeProcessHumanInput:
 
     def test_routes_by_recipient_name_not_first_match(self) -> None:
         """AC4: Routes to @Support by name, not first UserProxy in dict order."""
-        live_sender = make_stub_addr("@Manager")
-        live_support = make_stub_addr("@Support")
+        live_sender = make_stub_addr("@Manager", "Manager")
+        live_support = make_stub_addr("@Support", "Support", is_user_proxy=True)
 
         runtime = _make_multi_human_runtime()
         runtime._orchestrator_proxy.get_team_member = MagicMock(
@@ -640,9 +667,9 @@ class TestTeamRuntimeProcessHumanInput:
         runtime.actor_system.proxy_ask.assert_any_call(live_support, UserProxy)
 
     def test_target_not_userproxy_raises_valueerror(self) -> None:
-        """AC5: ValueError when target agent is not a UserProxy subclass."""
-        live_sender = make_stub_addr("@Human")
-        live_manager = make_stub_addr("@Manager")
+        """AC5: ValueError when the target actor is not a UserProxy."""
+        live_sender = make_stub_addr("@Human", "Human", is_user_proxy=True)
+        live_manager = make_stub_addr("@Manager", "Manager")
 
         runtime = _make_multi_human_runtime()
         runtime._orchestrator_proxy.get_team_member = MagicMock(
@@ -663,8 +690,8 @@ class TestTeamRuntimeProcessHumanInput:
 
     def test_downstream_receives_rehydrated_message(self) -> None:
         """AC6: The message passed downstream is the rehydrated copy, not original."""
-        live_sender = make_stub_addr("@Manager")
-        live_support = make_stub_addr("@Support")
+        live_sender = make_stub_addr("@Manager", "Manager")
+        live_support = make_stub_addr("@Support", "Support", is_user_proxy=True)
 
         runtime = _make_multi_human_runtime()
         runtime._orchestrator_proxy.get_team_member = MagicMock(
@@ -690,31 +717,19 @@ class TestTeamRuntimeProcessHumanInput:
         assert delivered_msg.content == "question"
 
     def test_dynamic_agent_resolved_by_orchestrator(self) -> None:
-        """AC7: Orchestrator resolves @Expert even if not in self.addrs."""
-        live_sender = make_stub_addr("@Human")
-        live_expert = make_stub_addr("@Expert")
+        """AC7 / AC15 (31-2): an agent hired at runtime routes like any other.
 
-        # Build a runtime where @Expert is in agent_cards as UserProxy
-        expert_card = make_agent_card(
-            name="@Expert", role="Expert", agent_class=UserProxy
-        )
-        human_card = make_agent_card(
-            name="@Human", role="Human", agent_class=UserProxy
-        )
-        entry_card = make_agent_card(name="lead", role="Lead", agent_class=Akgent)
+        ``@Expert`` is in the live roster and in **no** card list on the team —
+        the case the old name-keyed card lookup could not answer. Nothing here
+        declares it a ``UserProxy``; its address reports what the actor is.
+        """
+        live_sender = make_stub_addr("@Human", "Human", is_user_proxy=True)
+        live_expert = make_stub_addr("@Expert", "Expert", is_user_proxy=True)
 
-        tc = TeamCard(
-            name="dynamic-team",
-            description="Team where @Expert is hired at runtime",
-            entry_point=TeamCardMember(card=entry_card),
-            members=[
-                TeamCardMember(card=human_card),
-                TeamCardMember(card=expert_card),
-            ],
-            message_types=[UserMessage],
-        )
         # addrs does NOT include @Expert -- simulating runtime hiring
-        runtime = make_team_runtime(team_card=tc, addrs={})
+        runtime = make_team_runtime(
+            team_name="dynamic-team", message_types=[UserMessage], addrs={}
+        )
 
         runtime._orchestrator_proxy.get_team_member = MagicMock(
             side_effect=lambda name: {
@@ -733,3 +748,56 @@ class TestTeamRuntimeProcessHumanInput:
 
         # Verify _lookup_member resolved via orchestrator (not self.addrs)
         runtime.actor_system.proxy_ask.assert_any_call(live_expert, UserProxy)
+
+
+class TestProcessHumanInputFailuresStayDistinguishable:
+    """AC16 (31-2): "not found" and "found, not a UserProxy" are different errors.
+
+    Both used to collapse into "is not a UserProxy": an unknown name simply had
+    no card, so ``card is None`` produced the same message as a real type
+    mismatch. They are different bugs to whoever reads the log.
+    """
+
+    @staticmethod
+    def _message_to(recipient: ActorAddress) -> UserMessage:
+        message = UserMessage(content="question")
+        message.sender = make_stub_addr("@Human", "Human", is_user_proxy=True)
+        message.recipient = recipient
+        return message
+
+    def test_an_unknown_recipient_raises_the_lookup_error_naming_the_team(self) -> None:
+        """An unknown name never reaches the UserProxy check."""
+        runtime = make_team_runtime(team_name="acme-team", message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
+
+        message = self._message_to(make_stub_addr("@Ghost", "Ghost"))
+
+        with pytest.raises(ValueError, match="Agent '@Ghost' not found in team 'acme-team'"):
+            runtime.process_human_input("response", message)
+
+    def test_a_known_non_userproxy_recipient_raises_the_type_error(self) -> None:
+        """A found target whose actor is not a UserProxy gets its own message."""
+        live_manager = make_stub_addr("@Manager", "Manager")
+        runtime = make_team_runtime(team_name="acme-team", message_types=[UserMessage])
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=live_manager)
+
+        message = self._message_to(live_manager)
+
+        with pytest.raises(ValueError, match="Agent '@Manager' is not a UserProxy"):
+            runtime.process_human_input("response", message)
+
+    def test_the_two_messages_do_not_overlap(self) -> None:
+        """Neither failure can be mistaken for the other by matching on its text."""
+        runtime = make_team_runtime(team_name="acme-team", message_types=[UserMessage])
+
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=None)
+        with pytest.raises(ValueError) as missing:
+            runtime.process_human_input("r", self._message_to(make_stub_addr("@Ghost", "Ghost")))
+
+        live_manager = make_stub_addr("@Manager", "Manager")
+        runtime._orchestrator_proxy.get_team_member = MagicMock(return_value=live_manager)
+        with pytest.raises(ValueError) as wrong_type:
+            runtime.process_human_input("r", self._message_to(live_manager))
+
+        assert "not a UserProxy" not in str(missing.value)
+        assert "not found in team" not in str(wrong_type.value)

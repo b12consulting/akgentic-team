@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the nine :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the eleven :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -16,15 +16,20 @@ Implements ADR-15 Nagra-based PostgreSQL EventStore §§2, 3, 4, 8, 9, 10.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 
 from nagra import Transaction  # type: ignore[import-untyped]
 
+from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventNotFoundError
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
+
+logger = logging.getLogger(__name__)
 
 _LIKE_ESCAPE = "!"
 """``ESCAPE`` character for the metadata ``LIKE`` patterns — chosen, not default.
@@ -152,7 +157,14 @@ class NagraEventStore:
             )
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
-        """Load a team process snapshot by id; return ``None`` if absent."""
+        """Load a team process snapshot by id; return ``None`` if absent.
+
+        A stored document that does not validate is logged and returns ``None``
+        too, exactly as it does on the YAML and Mongo backends. Divergent
+        failure modes behind one ``Protocol`` are themselves the defect: a
+        caller cannot reason about ``load_team`` if whether it raises depends on
+        which backend is configured.
+        """
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(
                 "SELECT data FROM team_process_entries WHERE id = %s",
@@ -161,7 +173,32 @@ class NagraEventStore:
             row = cursor.fetchone()
         if row is None:
             return None
-        return Process.model_validate(decode_jsonb_column(row[0]))
+        return self._hydrate_team(str(team_id), row[0], logging.ERROR)
+
+    @staticmethod
+    def _hydrate_team(team_id: str, data: object, level: int) -> Process | None:
+        """Validate one stored team document, or log it and return ``None``.
+
+        Shared by :meth:`load_team` and :meth:`list_teams` so the two cannot
+        drift: one bad row must not empty the listing for a whole store, and it
+        must not raise out of a single-team read either. Pydantic's
+        ``ValidationError`` is a ``ValueError``, which is why the clause is not
+        narrowed to it.
+
+        Args:
+            team_id: The row's id, named in the log line — the only thing that
+                lets an operator find the offending document.
+            data: The raw ``data`` column value.
+            level: ``ERROR`` for a single-team read, ``WARNING`` for a sweep,
+                mirroring the Mongo backend. A caller who asked for one team and
+                got ``None`` has a harder failure than a listing that dropped one
+                row out of many.
+        """
+        try:
+            return Process.model_validate(decode_jsonb_column(data))
+        except (ValueError, TypeError) as exc:
+            logger.log(level, "Corrupted team document for team %s: %s", team_id, exc)
+            return None
 
     def list_teams(
         self,
@@ -203,6 +240,10 @@ class NagraEventStore:
         Results never depend on an index existing. Dropping either index
         changes the access path the planner picks and nothing else.
 
+        A row that does not validate is logged at WARNING naming its
+        ``team_id`` and skipped, never raised — one corrupted or unmigrated
+        document must not empty the listing for every team in the store.
+
         Args:
             user_id: If provided, return only snapshots whose
                 ``Process.user_id`` matches. If ``None`` (default), return all
@@ -238,13 +279,20 @@ class NagraEventStore:
         for group in make_index_prefix_groups(metadata):
             clauses.append(_metadata_key_clause(len(group)))
             params.extend(_like_prefix_pattern(prefix) for prefix in group)
-        sql = "SELECT data FROM team_process_entries"
+        # ``id`` rides along purely so an unloadable row can be NAMED in the log
+        # line. Without it the operator learns that a document is corrupted and
+        # nothing about which one.
+        sql = "SELECT id, data FROM team_process_entries"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(sql, tuple(params))
             rows = cursor.fetchall()
-        teams = [Process.model_validate(decode_jsonb_column(r[0])) for r in rows]
+        teams: list[Process] = []
+        for row in rows:
+            process = self._hydrate_team(str(row[0]), row[1], logging.WARNING)
+            if process is not None:
+                teams.append(process)
         # The one filter still evaluated in Python — see the docstring.
         if status is not None:
             teams = [t for t in teams if t.status == status]
@@ -256,6 +304,10 @@ class NagraEventStore:
         Order (dependency-safe): ``agent_state_entries`` → ``event_entries``
         → ``team_process_entries``. Idempotent: calling twice for the same
         id is a no-op on the second call (matches YAML / Mongo semantics).
+
+        ``agent_card_entries`` is deliberately NOT in the cascade: cards are
+        content-addressed and shared, another team may reference the very rows
+        this team did, and no refcount exists (FR13).
         """
         tid = str(team_id)
         with Transaction(self._conn_string) as trn:
@@ -353,3 +405,74 @@ class NagraEventStore:
             AgentStateSnapshot.model_validate(decode_jsonb_column(r[0]))
             for r in rows
         ]
+
+    # --- agent cards (agent_card_entries) ----------------------------------
+
+    def save_agent_cards(self, cards: list[AgentCard]) -> None:
+        """Upsert agent cards into ``agent_card_entries``, keyed by content hash.
+
+        ``ON CONFLICT (card_hash) DO UPDATE`` rather than a plain ``INSERT``:
+        the store is content-addressed, so a card arriving again — from a
+        re-save or from a second team — writes the same bytes to the same row
+        instead of violating the natural key. Nagra's ``create_tables()``
+        provisions that key from ``schema.toml``, which is what makes the
+        ``ON CONFLICT`` target valid.
+
+        The whole batch runs in ONE transaction, so a team's cards land
+        together or not at all.
+
+        Args:
+            cards: The cards to persist. An empty list opens no transaction.
+        """
+        if not cards:
+            return
+        with Transaction(self._conn_string) as trn:
+            for card in cards:
+                storable = storable_agent_card(card)
+                trn.execute(
+                    "INSERT INTO agent_card_entries (card_hash, data) "
+                    "VALUES (%s, %s) "
+                    "ON CONFLICT (card_hash) DO UPDATE SET data = EXCLUDED.data",
+                    (hash_agent_card(storable), json.dumps(storable.model_dump())),
+                )
+
+    def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
+        """Resolve card hashes with a single ``IN`` query.
+
+        One statement for the whole batch. The ``IN`` list is built from a
+        placeholder per hash — fixed ``%s`` fragments joined with commas — so
+        every caller value still travels as a bound parameter and none reaches
+        SQL through interpolation.
+
+        Args:
+            hashes: The content hashes to resolve; empty returns ``{}`` without
+                opening a transaction (and avoids an ``IN ()``, which is not
+                valid SQL).
+
+        Returns:
+            Mapping of hash to card for every hash the table holds. A hash the
+            table does not hold is simply absent, and so is one whose row does
+            not parse — logged and skipped, the way ``yaml.py`` and ``mongo.py``
+            treat a corrupted card, so it surfaces as
+            ``AgentCardNotFoundError`` naming the ROLE at resolution rather than
+            as a bare ``ValidationError`` naming nothing. This is the one
+            ``NagraEventStore`` reader that tolerates a bad row, deliberately:
+            it is the only one whose miss the caller turns into a better error.
+        """
+        if not hashes:
+            return {}
+        placeholders = ", ".join(["%s"] * len(hashes))
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute(
+                "SELECT card_hash, data FROM agent_card_entries "
+                f"WHERE card_hash IN ({placeholders})",
+                tuple(hashes),
+            )
+            rows = cursor.fetchall()
+        resolved: dict[str, AgentCard] = {}
+        for row in rows:
+            try:
+                resolved[row[0]] = AgentCard.model_validate(decode_jsonb_column(row[1]))
+            except (ValueError, TypeError) as exc:
+                logger.error("Skipping corrupted agent card %s: %s", row[0], exc)
+        return resolved
