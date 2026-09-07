@@ -1,9 +1,22 @@
 """Tests for the TeamManager metadata write paths — create and update.
 
-The ordering under test is validate -> single database write of the value and
-its re-derived index -> best-effort orchestrator push while RUNNING (ADR-24
-§D7). The failed-push tests are the ones that pin that ordering: an
-implementation that pushed before writing could not pass them.
+The two paths deliberately order themselves differently, and each ordering has
+its own reason.
+
+**Update** is validate -> single database write of the value and its re-derived
+index -> best-effort orchestrator push while RUNNING. The failed-push test is
+what pins that ordering: an implementation that pushed before writing could not
+pass it.
+
+**Create** is validate -> set the value on the orchestrator inside
+``TeamFactory.build``, before any member spawns -> single database write. The
+actor comes first here because a member resolves its tools during its own spawn,
+and it is safe because a build that raises persists no ``Process`` at all —
+there is no window in which the database and the actor disagree, because there
+is no team. The spawn-time observation that motivates it lives in
+``test_identity_and_metadata_at_spawn.py``; what this module pins is that the
+create path has exactly ONE writer, and that a failure to set the value fails
+the whole create rather than being swallowed.
 """
 
 from __future__ import annotations
@@ -30,7 +43,7 @@ from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamCardMember, TeamRuntime, TeamStatus
 from akgentic.team.ports import NullServiceRegistry
 from tests.conftest import projection_kwargs
-from tests.services.conftest import InMemoryEventStore
+from tests.services.conftest import InMemoryEventStore, record_orchestrator_metadata_writes
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -244,7 +257,8 @@ def manager(actor_system: ActorSystem, event_store: CountingEventStore) -> TeamM
 
 
 class TestCreateTeamMetadata:
-    """AC 1-7: create_team validates, persists value + index, then pushes."""
+    """AC 1-7: create_team validates, sets the value on the orchestrator during
+    the build, and persists value + index — with exactly one writer."""
 
     def test_metadata_persisted_with_derived_indexes(
         self, manager: TeamManager, event_store: CountingEventStore
@@ -329,45 +343,76 @@ class TestCreateTeamMetadata:
         assert process.metadata_indexes == []
         assert _read_orchestrator_metadata(actor_system, runtime) is None
 
-    def test_without_metadata_performs_no_push(self, manager: TeamManager) -> None:
-        """AC 7: no metadata means no orchestrator round-trip at all."""
+    def test_without_metadata_performs_no_write_to_the_orchestrator(
+        self, manager: TeamManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC 7: no metadata means no orchestrator round-trip at all.
+
+        Neither writer runs: not the build's ``set_metadata`` (guarded on
+        ``metadata is not None``, the same guard restore uses) and not
+        ``_push_metadata``, which the create path no longer calls at all.
+        """
+        writes = record_orchestrator_metadata_writes(monkeypatch)
+
         with patch.object(TeamManager, "_push_metadata", autospec=True) as push:
             manager.create_team(_make_team_card())
 
+        assert writes == []
         push.assert_not_called()
 
-    def test_failed_push_still_returns_a_runtime_with_the_database_correct(
-        self,
-        manager: TeamManager,
-        actor_system: ActorSystem,
-        event_store: CountingEventStore,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    def test_the_orchestrator_is_written_exactly_once(
+        self, manager: TeamManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """AC 6: the push is best-effort — the persisted Process is unaffected.
+        """AC 6: one writer on the create path, inside the build — not two.
 
-        ``pushed_indexes`` is the ordering assertion: the Process must already
-        be on disk, index and all, when the push is attempted. Asserting only on
-        the final state would pass for an actor-first create too, since the
-        swallowed failure leaves the same end state either way.
+        The end state is identical whether one writer ran or two, so the count
+        is the only thing that separates them. ``_push_metadata`` survives for
+        ``update_team_metadata``; what must not survive is a second call to it
+        from here, silently re-writing a value the build already set.
         """
-        team_id = uuid.uuid4()
-        pushed_indexes: list[list[str] | None] = []
-        _break_metadata_push(
-            actor_system, monkeypatch, _index_recorder(event_store, team_id, pushed_indexes)
-        )
+        writes = record_orchestrator_metadata_writes(monkeypatch)
         metadata = AcmeCaseMetadata(tenant="acme", channel="email")
 
-        with caplog.at_level(logging.WARNING, logger="akgentic.team.manager"):
-            runtime = manager.create_team(_make_team_card(), team_id=team_id, metadata=metadata)
+        with patch.object(TeamManager, "_push_metadata", autospec=True) as push:
+            manager.create_team(_make_team_card(), metadata=metadata)
 
-        assert pushed_indexes == [["tenant|acme", "channel|email"]]
-        assert "Failed to push metadata" in caplog.text
-        assert isinstance(runtime, TeamRuntime)
-        process = event_store.load_team(runtime.id)
-        assert process is not None
-        assert process.metadata == metadata
-        assert process.metadata_indexes == ["tenant|acme", "channel|email"]
+        assert writes == [metadata]
+        push.assert_not_called()
+
+    def test_a_failed_metadata_write_fails_the_create_and_persists_nothing(
+        self,
+        manager: TeamManager,
+        event_store: CountingEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC 6: on create the write is NOT best-effort, and that is safe.
+
+        Inside the build the write is load-bearing: a member resolving a
+        metadata-derived resource during its spawn must not come up against a
+        team whose metadata never arrived, so the failure propagates instead of
+        being logged and swallowed. What makes the stronger behaviour safe is
+        asserted here too — the build rolls back and ``create_team`` re-raises
+        before ``save_team``, so no ``Process`` is left behind for a later
+        resume to bring back half-configured.
+
+        This replaces the best-effort-push test that covered the old ordering;
+        the update path keeps its own, unchanged, below.
+        """
+
+        def exploding_set_metadata(self: Orchestrator, metadata: Any) -> None:
+            del self, metadata
+            msg = "orchestrator unreachable"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(Orchestrator, "set_metadata", exploding_set_metadata)
+
+        with pytest.raises(RuntimeError, match="orchestrator unreachable"):
+            manager.create_team(
+                _make_team_card(), metadata=AcmeCaseMetadata(tenant="acme", channel="email")
+            )
+
+        assert event_store.teams == {}
+        assert event_store.save_team_calls == 0
 
 
 # ---------------------------------------------------------------------------

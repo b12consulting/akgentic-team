@@ -19,6 +19,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import ProcessedMessage
 from akgentic.core.orchestrator import EventSubscriber, Orchestrator
+from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.team import manager as manager_module
 from akgentic.team import subscriber as subscriber_module
@@ -1188,9 +1189,21 @@ def test_create_team_registers_an_idle_stop_subscriber(
         system: ActorSystem,
         subscribers: list[EventSubscriber] | None = None,
         team_id: uuid.UUID | None = None,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        metadata: SerializableBaseModel | None = None,
     ) -> TeamRuntime:
         captured.append(list(subscribers or []))
-        return real_build(team_card, system, subscribers, team_id)
+        return real_build(
+            team_card,
+            system,
+            subscribers,
+            team_id,
+            user_id=user_id,
+            user_email=user_email,
+            metadata=metadata,
+        )
 
     monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
 
@@ -1374,9 +1387,21 @@ def test_a_teardown_dispatches_exactly_one_stop_team(
         system: ActorSystem,
         subscribers: list[EventSubscriber] | None = None,
         team_id: uuid.UUID | None = None,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        metadata: SerializableBaseModel | None = None,
     ) -> TeamRuntime:
         captured.extend(s for s in subscribers or [] if isinstance(s, IdleStopSubscriber))
-        return real_build(team_card, system, subscribers, team_id)
+        return real_build(
+            team_card,
+            system,
+            subscribers,
+            team_id,
+            user_id=user_id,
+            user_email=user_email,
+            metadata=metadata,
+        )
 
     monkeypatch.setattr(manager_module.TeamFactory, "build", staticmethod(_capturing_build))
 
