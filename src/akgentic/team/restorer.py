@@ -231,8 +231,9 @@ class TeamRestorer:
         orchestrator_start: StartMessage,
         team_id: uuid.UUID,
         spawned_addrs: list[ActorAddress],
-        user_id: str | None = None,
-        user_email: str | None = None,
+        *,
+        user_id: str | None,
+        user_email: str | None,
     ) -> tuple[ActorAddress, Orchestrator]:
         """Create the orchestrator actor from its persisted StartMessage.
 
@@ -244,6 +245,9 @@ class TeamRestorer:
                 the persisted ``Process``. Set on the orchestrator so that
                 ``Akgent.createActor`` propagates it to every agent spawned
                 during the restore — the create path's identity, recovered.
+                Required and keyword-only on purpose: the defect this closes was
+                an identity that defaulted away unnoticed, and a default here
+                would let the next caller reintroduce it in silence.
             user_email: Email of the same user, propagated the same way.
 
         Returns:

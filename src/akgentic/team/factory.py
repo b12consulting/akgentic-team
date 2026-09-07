@@ -134,6 +134,11 @@ class TeamFactory:
             # which is the intended stronger behaviour — a metadata-derived
             # resource must not silently resolve against a team whose metadata
             # never arrived.
+            #
+            # ``orchestrator_proxy`` is the ASK proxy, and that is load-bearing:
+            # the call blocks until the orchestrator has applied the value, so
+            # "before the first member spawns" is a guarantee rather than a
+            # hope, and a failure surfaces here instead of on a mailbox.
             if metadata is not None:
                 orchestrator_proxy.set_metadata(metadata)
 

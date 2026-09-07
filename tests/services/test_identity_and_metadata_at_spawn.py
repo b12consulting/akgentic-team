@@ -65,6 +65,11 @@ class IdentityAgent(Akgent[BaseConfig, BaseState]):
     """
 
     spawn_recorded: bool = False
+    # ``Any`` with a reason: ``Akgent.__init__`` still declares
+    # ``user_id: uuid.UUID | None`` while a ``str`` is what actually flows
+    # through ``createActor``. Either concrete annotation would be a lie about
+    # one end of that disagreement; ``str | None`` becomes correct once
+    # akgentic-core's widening lands, and this line is where to change it.
     seen_user_id: Any = None
     seen_user_email: str | None = None
     seen_metadata: SerializableBaseModel | None = None
