@@ -85,9 +85,10 @@ __all__: list[str] = [
 
 _mongo_available = False
 try:
-    from akgentic.team.repositories import MongoEventStore  # noqa: F401
+    from akgentic.team.repositories import MongoEventStore, MongoResourceStore  # noqa: F401
 
     __all__.append("MongoEventStore")
+    __all__.append("MongoResourceStore")
     _mongo_available = True
 except ImportError:
     pass
