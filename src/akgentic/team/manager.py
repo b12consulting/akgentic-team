@@ -119,6 +119,10 @@ class TeamManager:
     ) -> None:
         """Push a validated metadata value to the live orchestrator, best-effort.
 
+        The UPDATE path only — ``create_team`` hands the value to
+        ``TeamFactory.build``, which sets it on the orchestrator before spawning
+        any member, so there is nothing left for this to do there.
+
         Called only AFTER the value and its re-derived index are persisted. A
         failure here is logged and swallowed: the database — which is what team
         listing filters on — stays truthful, and the orchestrator repopulates
@@ -174,8 +178,12 @@ class TeamManager:
             metadata: Optional business metadata, an instance of the card's
                 declared ``metadata_type``. Validated FIRST, before any actor is
                 started or any ``Process`` written, so a rejected value never
-                leaves a half-created team behind. Persisted alongside its
-                derived index, then pushed to the orchestrator best-effort.
+                leaves a half-created team behind. Then handed to
+                ``TeamFactory.build``, which sets it on the orchestrator before
+                spawning any member, and finally persisted alongside its derived
+                index. It is not pushed best-effort on this path: a value that
+                cannot be set fails the build, and the failed build persists no
+                ``Process``.
 
         Returns:
             A TeamRuntime handle to the running team.
@@ -207,7 +215,15 @@ class TeamManager:
 
         # Build the team — if this raises, no Process is persisted
         try:
-            runtime = TeamFactory.build(team_card, self._actor_system, subscribers, team_id=team_id)
+            runtime = TeamFactory.build(
+                team_card,
+                self._actor_system,
+                subscribers,
+                team_id=team_id,
+                user_id=user_id,
+                user_email=user_email,
+                metadata=validated_metadata,
+            )
         except Exception:
             # The idle-stop countdown is armed in the subscriber's constructor,
             # above, but a team that never built has no orchestrator to dispatch
@@ -253,10 +269,6 @@ class TeamManager:
             metadata_type=projection.metadata_type,
         )
         self._event_store.save_team(process)
-
-        # Database first, actor second — see _push_metadata
-        if validated_metadata is not None:
-            self._push_metadata(team_id, runtime, validated_metadata)
 
         # Register with service discovery
         self._service_registry.register_team(self._instance_id, team_id)

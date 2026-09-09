@@ -231,6 +231,9 @@ class TeamRestorer:
         orchestrator_start: StartMessage,
         team_id: uuid.UUID,
         spawned_addrs: list[ActorAddress],
+        *,
+        user_id: str | None,
+        user_email: str | None,
     ) -> tuple[ActorAddress, Orchestrator]:
         """Create the orchestrator actor from its persisted StartMessage.
 
@@ -238,6 +241,14 @@ class TeamRestorer:
             orchestrator_start: The StartMessage for the orchestrator.
             team_id: The team identifier.
             spawned_addrs: Shared list for rollback tracking.
+            user_id: Identifier of the user the team belongs to, read back from
+                the persisted ``Process``. Set on the orchestrator so that
+                ``Akgent.createActor`` propagates it to every agent spawned
+                during the restore — the create path's identity, recovered.
+                Required and keyword-only on purpose: the defect this closes was
+                an identity that defaulted away unnoticed, and a default here
+                would let the next caller reintroduce it in silence.
+            user_email: Email of the same user, propagated the same way.
 
         Returns:
             A tuple of (orchestrator_addr, orchestrator_proxy).
@@ -261,6 +272,8 @@ class TeamRestorer:
             restoring=True,
             agent_id=orchestrator_start.sender.agent_id,
             team_id=team_id,
+            user_id=user_id,
+            user_email=user_email,
             config=orchestrator_start.config.model_copy(),
         )
         spawned_addrs.append(orchestrator_addr)
@@ -398,7 +411,8 @@ class TeamRestorer:
 
         Steps 2a-2g:
           a. Determine live agents (StartMessage/StopMessage filtering)
-          b. Rebuild Orchestrator first
+          b. Rebuild Orchestrator first, carrying the owning user's identity
+             from the Process so every agent respawned below it inherits it
           b-bis. Repopulate the orchestrator's team metadata from the Process
           c. Spawn remaining agents through resolved parents
           d. Restore agent states from snapshots
@@ -444,7 +458,11 @@ class TeamRestorer:
 
         # 2b. Rebuild Orchestrator first
         orchestrator_addr, orchestrator_proxy = self._create_orchestrator(
-            orchestrator_start, team_id, spawned_addrs
+            orchestrator_start,
+            team_id,
+            spawned_addrs,
+            user_id=process.user_id,
+            user_email=process.user_email,
         )
 
         # 2b-bis. Repopulate the team metadata from the Process — the database is

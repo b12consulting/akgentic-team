@@ -7,7 +7,10 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+import pytest
 from akgentic.core.agent_card import AgentCard
+from akgentic.core.orchestrator import Orchestrator
+from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
@@ -15,6 +18,37 @@ from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 
 logger = logging.getLogger(__name__)
+
+
+def record_orchestrator_metadata_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[SerializableBaseModel | None]:
+    """Record every value handed to ``Orchestrator.set_metadata``, in order.
+
+    The real implementation still runs, so a team observed through this wrapper
+    behaves exactly as it otherwise would — only the call sequence becomes
+    visible. That sequence is the whole point: one writer and two writers leave
+    an identical end state, so counting is the only thing that separates them.
+
+    Patched on the class rather than on a proxy because the write can arrive
+    through either proxy flavour (``proxy_ask`` from the build, ``proxy_tell``
+    from the update path), and the class is where both land.
+
+    Args:
+        monkeypatch: Fixture used to restore ``set_metadata`` after the test.
+
+    Returns:
+        A live list of the values written, appended to as writes happen.
+    """
+    writes: list[SerializableBaseModel | None] = []
+    real_set_metadata = Orchestrator.set_metadata
+
+    def recording_set_metadata(self: Orchestrator, metadata: SerializableBaseModel | None) -> None:
+        writes.append(metadata)
+        real_set_metadata(self, metadata)
+
+    monkeypatch.setattr(Orchestrator, "set_metadata", recording_set_metadata)
+    return writes
 
 
 class InMemoryEventStore:

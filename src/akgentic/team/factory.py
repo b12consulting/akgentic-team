@@ -12,6 +12,7 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.core.orchestrator import STOP_TIMEOUT, EventSubscriber, Orchestrator
+from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.team.messages import WelcomeMessage
 from akgentic.team.models import TeamCard, TeamCardMember, TeamRuntime, spawned_names
 from akgentic.team.projection import derive_team_projection
@@ -28,10 +29,12 @@ GRACE_TIMEOUT_SECONDS = STOP_TIMEOUT
 class TeamFactory:
     """Build running teams from TeamCard + ActorSystem.
 
-    Static builder: TeamFactory.build(team_card, actor_system, subscribers) -> TeamRuntime.
-    Creates the Orchestrator, spawns the member tree, registers the team's whole
-    role-keyed card set with the orchestrator, registers subscribers, and rolls
-    back on partial failure (tearing down every actor spawned so far).
+    Static builder: TeamFactory.build(team_card, actor_system, subscribers, *,
+    user_id, user_email, metadata) -> TeamRuntime.
+    Creates the Orchestrator — carrying the owning user's identity and the
+    team's business metadata — spawns the member tree, registers the team's
+    whole role-keyed card set with the orchestrator, registers subscribers, and
+    rolls back on partial failure (tearing down every actor spawned so far).
     """
 
     @staticmethod
@@ -40,6 +43,10 @@ class TeamFactory:
         actor_system: ActorSystem,
         subscribers: list[EventSubscriber] | None = None,
         team_id: uuid.UUID | None = None,
+        *,
+        user_id: str | None = None,
+        user_email: str | None = None,
+        metadata: SerializableBaseModel | None = None,
     ) -> TeamRuntime:
         """Build a running team from a declarative TeamCard.
 
@@ -66,6 +73,14 @@ class TeamFactory:
             team_id: Optional pre-generated team identifier. If None, a new UUID
                 is generated. Allows callers (e.g. TeamManager) to know the team_id
                 before build completes.
+            user_id: Identifier of the user the team belongs to. Set on the
+                Orchestrator, from which ``Akgent.createActor`` propagates it to
+                every agent in the tree — including agents hired later through a
+                live member. ``None`` reproduces the pre-identity behaviour.
+            user_email: Email of the same user, propagated the same way.
+            metadata: The team's validated business metadata, set on the
+                Orchestrator BEFORE any member is spawned so that an agent
+                resolving its tools during the spawn can already consult it.
 
         Returns:
             A TeamRuntime with all actor addresses populated and proxies rebuilt.
@@ -90,6 +105,8 @@ class TeamFactory:
                 Orchestrator,
                 config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
                 team_id=team_id,
+                user_id=user_id,
+                user_email=user_email,
             )
             spawned_addrs.append(orchestrator_addr)
 
@@ -98,6 +115,32 @@ class TeamFactory:
                 orchestrator_addr, Orchestrator
             )
             TeamFactory._register_subscribers(orchestrator_proxy, subscribers)
+
+            # 2-bis. Set the team metadata before a single member is spawned —
+            # the exact mirror of the restore path's step 2b-bis, and for the
+            # same reason: an agent resolves its tools during its spawn, so a
+            # metadata-derived resource has to be readable by then. Pushing
+            # after the build would make the same card work on resume and fail
+            # on create.
+            #
+            # This deliberately sets the actor BEFORE the Process is written,
+            # relaxing the "database first, actor second" ordering
+            # ``_push_metadata`` states for the update path. It is safe here for
+            # one specific reason: a build that raises rolls back and
+            # ``create_team`` re-raises before ``save_team``, so no Process is
+            # persisted at all. There is no window in which the database and the
+            # actor disagree, because there is no team. Unlike the update path's
+            # push this one is not best-effort: a failure here fails the build,
+            # which is the intended stronger behaviour — a metadata-derived
+            # resource must not silently resolve against a team whose metadata
+            # never arrived.
+            #
+            # ``orchestrator_proxy`` is the ASK proxy, and that is load-bearing:
+            # the call blocks until the orchestrator has applied the value, so
+            # "before the first member spawns" is a guarantee rather than a
+            # hope, and a failure surfaces here instead of on a mailbox.
+            if metadata is not None:
+                orchestrator_proxy.set_metadata(metadata)
 
             # 3. Walk TeamCard tree and spawn all agents, recording the first
             #    layer as it goes. ``supervisor_addrs`` is keyed by the names

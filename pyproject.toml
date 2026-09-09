@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-team"
-version = "1.7.0"
+version = "1.8.0"
 description = "Team lifecycle management — create, resume, stop, delete teams with event-sourced persistence"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,12 +22,12 @@ keywords = ["agents", "ai", "akgentic", "teams", "lifecycle"]
 dependencies = [
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
-    "akgentic-core>=1.5.13",
+    "akgentic-core>=1.5.14",
 ]
 
 [project.optional-dependencies]
 mongo = ["pymongo>=4.0.0"]
-postgres = ["nagra>=0.5", "psycopg[binary]>=3.1"]
+postgres = ["nagra>=0.5", "psycopg[binary,pool]>=3.1"]
 cli = ["typer>=0.9.0", "rich>=13.0.0"]
 dev = [
     "pytest>=8.0.0",
@@ -39,7 +39,7 @@ dev = [
     "mongomock>=4.0.0",
     "python-dotenv>=1.0.0",
     "nagra>=0.5",
-    "psycopg[binary]>=3.1",
+    "psycopg[binary,pool]>=3.1",
     "testcontainers[postgres]>=4.0.0",
     "types-PyYAML>=6.0",
 ]
