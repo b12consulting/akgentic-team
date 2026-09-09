@@ -98,6 +98,20 @@ def _twin_from_module_b() -> type[Akgent[Any, Any]]:
     return Twin
 
 
+def _same_name_from_package(package: str) -> type[Akgent[Any, Any]]:
+    """A class whose ``__qualname__`` is ``Same`` in whichever *package* the caller names.
+
+    Two calls with two packages give two classes that differ in ``__module__`` only — the
+    half of the kind derivation the twins above cannot pin.
+    """
+
+    class Same(Akgent[BaseConfig, _WorkspaceLikeState]):
+        __module__ = package
+        __qualname__ = "Same"
+
+    return Same
+
+
 # --- Helpers ------------------------------------------------------------------
 
 
@@ -311,6 +325,22 @@ class TestEncoding:
         assert isinstance(loaded, _BetaState)
         assert loaded.label == "100%2E"
 
+    def test_a_value_is_returned_verbatim_even_when_its_own_keys_look_encoded(
+        self, store: MongoResourceStore
+    ) -> None:
+        """Only the member key is decoded; a value is never inspected.
+
+        A decoder that recursed into the value would turn ``100%2E`` into ``100.`` and pass
+        every other spec here, because no other value carries a percent sequence.
+        """
+        value: dict[str, JsonValue] = {"100%2E": {"%2F": "%2E"}, "plain": "50%25"}
+        store.apply(_AlphaActor, "P", StateDelta(set={"documents.notes/a.pdf": value}))
+
+        loaded = store.load(_AlphaActor, "P")
+        assert isinstance(loaded, _WorkspaceLikeState)
+        assert loaded.documents, "an empty map would make the value assertion vacuous"
+        assert loaded.documents == {"notes/a.pdf": value}
+
 
 # --- apply --------------------------------------------------------------------
 
@@ -492,6 +522,29 @@ class TestTwoKindsAtOneScope:
         assert len(kinds) == 2
 
         loaded_a = store.load(twin_a, "P")
+        assert isinstance(loaded_a, _WorkspaceLikeState)
+        assert loaded_a.counter == 1
+
+    def test_two_classes_sharing_a_qualified_name_in_two_packages_are_two_documents(
+        self, store: MongoResourceStore, mongo_db: Any
+    ) -> None:
+        """The module half of the kind: the twins above differ in ``__qualname__`` and would
+        still pass under a derivation that dropped the module, which is the collision across
+        packages the derivation exists to prevent.
+        """
+        same_a = _same_name_from_package("acme_a.resources")
+        same_b = _same_name_from_package("acme_b.resources")
+        assert same_a.__qualname__ == same_b.__qualname__ == "Same"
+        assert same_a.__module__ != same_b.__module__
+
+        store.apply(same_a, "P", StateDelta(set={"counter": 1}))
+        assert store.load(same_b, "P") is None, "the other package must not see this document"
+        store.apply(same_b, "P", StateDelta(set={"counter": 2}))
+
+        kinds = {doc["kind"] for doc in _raw_documents(mongo_db, "P")}
+        assert len(kinds) == 2
+
+        loaded_a = store.load(same_a, "P")
         assert isinstance(loaded_a, _WorkspaceLikeState)
         assert loaded_a.counter == 1
 
