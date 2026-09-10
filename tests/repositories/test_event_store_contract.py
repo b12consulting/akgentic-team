@@ -1033,7 +1033,9 @@ class TestEventStoreContract:
         naming a since-deleted class failed the load for the whole team while
         YAML and Mongo skipped it. Pinned on all three so they cannot diverge
         again. The good snapshots straddle the stale one, so a loader that stops
-        at the first bad row loses ``agent-z`` and goes red here.
+        at the first bad row loses ``agent-z`` and goes red here. The ids are
+        compared as a sorted list, not a set: a loop that forgets ``continue``
+        re-appends ``agent-a`` in the stale row's place, which a set cannot see.
         """
         team_id = uuid.uuid4()
         event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="agent-a"))
@@ -1045,7 +1047,7 @@ class TestEventStoreContract:
         with caplog.at_level(logging.WARNING):
             loaded = event_store.load_agent_states(team_id)
 
-        assert {s.agent_id for s in loaded} == {"agent-a", "agent-z"}
+        assert sorted(s.agent_id for s in loaded) == ["agent-a", "agent-z"]
         assert [
             r
             for r in caplog.records

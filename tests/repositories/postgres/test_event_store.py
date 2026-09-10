@@ -881,7 +881,7 @@ class TestNagraAgentStateStore:
         with caplog.at_level(logging.WARNING, logger=logger_name):
             loaded = store.load_agent_states(team_id)
 
-        assert {s.agent_id for s in loaded} == {"agent-a"}
+        assert [s.agent_id for s in loaded] == ["agent-a"]
         assert [
             r
             for r in caplog.records
