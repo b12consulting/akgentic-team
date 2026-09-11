@@ -394,17 +394,30 @@ class NagraEventStore:
             )
 
     def load_agent_states(self, team_id: uuid.UUID) -> list[AgentStateSnapshot]:
-        """Return every agent-state snapshot for a team. Order unspecified."""
+        """Return every agent-state snapshot for a team. Order unspecified.
+
+        A row that does not validate is logged at ``WARNING``, naming its agent,
+        and skipped, as on the YAML and Mongo backends. One stale snapshot (a
+        state class since deleted) costs that agent its state, never the team
+        its load. Pydantic's ``ValidationError`` is a ``ValueError``.
+        """
+        # ``agent_id`` rides along only so a skipped row can be NAMED in the log;
+        # the ``data`` dict cannot supply it, since that is what failed to validate.
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(
-                "SELECT data FROM agent_state_entries WHERE team_id = %s",
+                "SELECT agent_id, data FROM agent_state_entries WHERE team_id = %s",
                 (str(team_id),),
             )
             rows = cursor.fetchall()
-        return [
-            AgentStateSnapshot.model_validate(decode_jsonb_column(r[0]))
-            for r in rows
-        ]
+        snapshots: list[AgentStateSnapshot] = []
+        for row in rows:
+            try:
+                snapshots.append(AgentStateSnapshot.model_validate(decode_jsonb_column(row[1])))
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Skipping corrupted agent state %s for team %s: %s", row[0], team_id, exc
+                )
+        return snapshots
 
     # --- agent cards (agent_card_entries) ----------------------------------
 
@@ -455,9 +468,9 @@ class NagraEventStore:
             not parse — logged and skipped, the way ``yaml.py`` and ``mongo.py``
             treat a corrupted card, so it surfaces as
             ``AgentCardNotFoundError`` naming the ROLE at resolution rather than
-            as a bare ``ValidationError`` naming nothing. This is the one
-            ``NagraEventStore`` reader that tolerates a bad row, deliberately:
-            it is the only one whose miss the caller turns into a better error.
+            as a bare ``ValidationError`` naming nothing. A skipped card row is
+            what lets the caller name the role, as a skipped agent-state row is
+            what lets the rest of its team load.
         """
         if not hashes:
             return {}

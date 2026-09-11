@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from tests.models.conftest import (
     AcmeTeamMetadata,
     make_agent_card,
+    make_agent_state_snapshot,
     make_indexed_process,
     make_persisted_event,
     make_process,
@@ -833,8 +834,8 @@ class TestNagraAgentCardStore:
         A bad row raising a bare ``ValidationError`` out of the store names
         neither the role nor the hash. Skipping it lets ``resolve_agent_cards``
         raise ``AgentCardNotFoundError``, which names both — the whole point of
-        FR14. This is the one ``NagraEventStore`` reader that tolerates a bad
-        row, deliberately.
+        FR14. The card and agent-state readers both skip a bad row; this pins
+        the card half.
         """
         store = NagraEventStore(postgres_clean_tables)
         good = _card_fixture()
@@ -852,3 +853,37 @@ class TestNagraAgentCardStore:
 
         assert set(loaded) == {hash_agent_card(good)}
         assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]
+
+
+class TestNagraAgentStateStore:
+    """Postgres-only: the row identity a skipped agent-state row is logged under."""
+
+    def test_a_stale_agent_state_row_is_named_in_the_warning(
+        self, postgres_clean_tables: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The skip is pinned on every backend; the NAME only Postgres can lose.
+
+        The agent id reaches the log only through the ``agent_id`` column the
+        query selects. The payload deliberately does not carry it: pydantic's
+        error text echoes its input, so an id inside the payload would satisfy
+        this assertion even with the id dropped from the log call.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        team_id = uuid.uuid4()
+        store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="agent-a"))
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute(
+                "INSERT INTO agent_state_entries (team_id, agent_id, data) VALUES (%s, %s, %s)",
+                (str(team_id), "agent-m", json.dumps({"not": "a snapshot"})),
+            )
+
+        logger_name = "akgentic.team.repositories.postgres.event_store"
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            loaded = store.load_agent_states(team_id)
+
+        assert [s.agent_id for s in loaded] == ["agent-a"]
+        assert [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "agent-m" in r.getMessage()
+        ], "the warning must name the skipped row's agent"

@@ -39,7 +39,11 @@ from tests.models.conftest import (
     make_team_card,
     to_legacy_document,
 )
-from tests.repositories.conftest import RawTeamSeeder
+from tests.repositories.conftest import (
+    RawAgentStateSeeder,
+    RawTeamSeeder,
+    stale_agent_state_document,
+)
 
 
 def _unmigrated_document(team_id: uuid.UUID) -> dict[str, Any]:
@@ -1008,6 +1012,47 @@ class TestEventStoreContract:
 
         assert any(record.levelno >= logging.WARNING for record in caplog.records)
         assert str(unloadable_id) in caplog.text
+
+    @pytest.mark.parametrize(
+        "stale_path",
+        [
+            pytest.param("akgentic.core.agent_state.DeletedAgentState", id="missing-class"),
+            pytest.param("akgentic.core.no_such_module.DeletedAgentState", id="missing-module"),
+        ],
+    )
+    def test_load_agent_states_skips_a_stale_snapshot_and_returns_the_others(
+        self,
+        event_store: EventStore,
+        seed_raw_agent_state: RawAgentStateSeeder,
+        caplog: pytest.LogCaptureFixture,
+        stale_path: str,
+    ) -> None:
+        """One deleted state class costs one agent its state, never the team its load.
+
+        Postgres validated every row in one comprehension, so a single snapshot
+        naming a since-deleted class failed the load for the whole team while
+        YAML and Mongo skipped it. Pinned on all three so they cannot diverge
+        again. The good snapshots straddle the stale one, so a loader that stops
+        at the first bad row loses ``agent-z`` and goes red here. The ids are
+        compared as a sorted list, not a set: a loop that forgets ``continue``
+        re-appends ``agent-a`` in the stale row's place, which a set cannot see.
+        """
+        team_id = uuid.uuid4()
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="agent-a"))
+        seed_raw_agent_state(
+            team_id, "agent-m", stale_agent_state_document(team_id, "agent-m", stale_path)
+        )
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="agent-z"))
+
+        with caplog.at_level(logging.WARNING):
+            loaded = event_store.load_agent_states(team_id)
+
+        assert sorted(s.agent_id for s in loaded) == ["agent-a", "agent-z"]
+        assert [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and stale_path in r.getMessage()
+        ], "the warning must name the deleted class, or the operator cannot tell what went"
 
     # --- Validation failure on corrupted payload --------------------------
 
