@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 import akgentic.team
 
 
@@ -78,3 +80,20 @@ def test_the_card_store_surface_is_exported() -> None:
     for name in ("AgentCardNotFoundError", "resolve_agent_cards", "storable_agent_card"):
         assert name in akgentic.team.__all__, f"{name} missing from __all__"
         assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
+
+
+def test_the_resource_store_is_exported_with_the_mongo_extra() -> None:
+    """``MongoResourceStore`` sits under the same optional-import guard as ``MongoEventStore``.
+
+    The generic loop above iterates whatever ``__all__`` holds, so it cannot notice an
+    export that was never added. This names the symbol, at both levels of the guard.
+    """
+    pytest.importorskip("pymongo")
+    from akgentic.team import repositories
+
+    # Membership and importability, not object identity: the import-guard specs reload
+    # ``akgentic.team.repositories`` mid-suite, so the class object is legitimately rebuilt.
+    assert "MongoResourceStore" in akgentic.team.__all__
+    assert "MongoResourceStore" in repositories.__all__
+    assert isinstance(akgentic.team.MongoResourceStore, type)
+    assert isinstance(repositories.MongoResourceStore, type)
