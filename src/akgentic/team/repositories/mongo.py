@@ -21,6 +21,7 @@ import os
 import re
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 try:
@@ -35,7 +36,13 @@ from pymongo.errors import PyMongoError
 
 from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
+from akgentic.team.models import (
+    AgentCardEntry,
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamStatus,
+)
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 
@@ -54,6 +61,8 @@ AGENT_CARDS_COLLECTION = "agent_cards"
 """Collection holding the content-addressed card store. Public: tests assert it."""
 
 _CARD_HASH_KEY = "card_hash"
+_CARD_KEY = "card"
+_FIRST_SEEN_KEY = "first_seen_at"
 _CARD_HASH_INDEX = "agent_cards_card_hash_idx"
 
 _AUTO_INDEX_ENV = "MONGO_TEAM_AUTO_INDEX"
@@ -69,6 +78,24 @@ _TEAM_INDEX_SPECS: tuple[tuple[str, str], ...] = (
     ("status", "teams_status_idx"),
     ("metadata_indexes", "teams_metadata_indexes_idx"),
 )
+
+
+def _as_utc(value: object) -> datetime | None:
+    """Return *value* as a tz-aware UTC datetime, or ``None`` if it is not one.
+
+    BSON stores a datetime as UTC milliseconds and carries no zone, so pymongo
+    hands one back **naive** unless the client was built with ``tz_aware=True``
+    — which this backend does not control, since the database is injected. The
+    naive value is UTC by definition of the format, so the zone is attached
+    rather than assumed.
+
+    Anything that is not a datetime — an absent key, or a field a foreign
+    writer put there in another type — is ``None``: unknown age, which the
+    consumer must treat as too young to reclaim.
+    """
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _resolve_auto_index(explicit: bool | None) -> bool:
@@ -539,10 +566,22 @@ class MongoEventStore:
     def save_agent_cards(self, cards: list[AgentCard]) -> None:
         """Upsert agent cards into the ``agent_cards`` collection by hash.
 
-        ``replace_one(..., upsert=True)`` rather than ``insert_one``: the store
+        ``update_one(..., upsert=True)`` rather than ``insert_one``: the store
         is content-addressed, so a card arriving a second time — from a re-save
         or from another team — must land on the same document with the same
         bytes instead of raising a duplicate-key error against the unique index.
+
+        ``update_one`` rather than ``replace_one``, which is what this used to
+        be: the write has two halves with different lifetimes. ``$set`` carries
+        the card, rewritten on every save; ``$setOnInsert`` carries
+        ``first_seen_at``, written when the document is created and never again.
+        A *replacement* document has no insert-only half, so it cannot express
+        that at all — it would make the stamp last-written, and a blob a live
+        fleet keeps re-saving would then never be old enough to reclaim.
+
+        The filter supplies ``card_hash``: Mongo derives an upsert's equality
+        fields from the filter into the inserted document, so naming it in
+        ``$setOnInsert`` as well would be redundant.
 
         One statement per card rather than one ``bulk_write``. The batching that
         matters is on the read side, which a restore does per team; the write
@@ -558,9 +597,12 @@ class MongoEventStore:
         for card in cards:
             storable = storable_agent_card(card)
             card_hash = hash_agent_card(storable)
-            self._agent_cards.replace_one(
+            self._agent_cards.update_one(
                 {_CARD_HASH_KEY: card_hash},
-                {_CARD_HASH_KEY: card_hash, "card": storable.model_dump()},
+                {
+                    "$set": {_CARD_KEY: storable.model_dump()},
+                    "$setOnInsert": {_FIRST_SEEN_KEY: datetime.now(UTC)},
+                },
                 upsert=True,
             )
         logger.debug("Saved %d agent cards", len(cards))
@@ -584,8 +626,43 @@ class MongoEventStore:
         resolved: dict[str, AgentCard] = {}
         for doc in self._agent_cards.find({_CARD_HASH_KEY: {"$in": list(hashes)}}):
             try:
-                resolved[doc[_CARD_HASH_KEY]] = AgentCard.model_validate(doc["card"])
+                resolved[doc[_CARD_HASH_KEY]] = AgentCard.model_validate(doc[_CARD_KEY])
             except (ValueError, TypeError, KeyError) as exc:
                 logger.warning("Skipping corrupted agent card document: %s", exc)
         logger.debug("Resolved %d of %d agent cards", len(resolved), len(hashes))
         return resolved
+
+    def list_agent_card_entries(self) -> list[AgentCardEntry]:
+        """Enumerate the card store with one projected ``find``.
+
+        The projection names ``card_hash`` and ``first_seen_at`` and suppresses
+        ``_id``; the ``card`` field is deliberately absent, so the cursor never
+        carries a card payload and nothing here validates one. A blob whose card
+        no longer parses still enumerates — it is precisely the kind a sweep
+        exists to reclaim.
+
+        A document with no ``first_seen_at`` key yields ``None``, which is the
+        shape of every blob written before the stamp existed. It is never
+        defaulted to an epoch: see the Protocol docstring for why.
+
+        Returns:
+            One entry per stored blob, unordered; ``[]`` for an empty store.
+        """
+        projection = {"_id": 0, _CARD_HASH_KEY: 1, _FIRST_SEEN_KEY: 1}
+        entries: list[AgentCardEntry] = []
+        for doc in self._agent_cards.find({}, projection):
+            card_hash = doc.get(_CARD_HASH_KEY)
+            if not isinstance(card_hash, str):
+                # Keyless, so unreachable by load_agent_cards and unclaimable by
+                # any Process. Skipped with a warning the way a corrupted card
+                # document is, rather than enumerated as a blob nothing can name.
+                logger.warning("Skipping agent card document with no usable %s", _CARD_HASH_KEY)
+                continue
+            entries.append(
+                AgentCardEntry(
+                    card_hash=card_hash,
+                    first_seen_at=_as_utc(doc.get(_FIRST_SEEN_KEY)),
+                )
+            )
+        logger.debug("Enumerated %d agent card entries", len(entries))
+        return entries
