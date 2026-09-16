@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -13,7 +14,13 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.team.metadata import make_index_prefix_groups
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
+from akgentic.team.models import (
+    AgentCardEntry,
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamStatus,
+)
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 
@@ -70,6 +77,12 @@ class InMemoryEventStore:
         # Content-addressed and SHARED across teams — deliberately not keyed by
         # team_id, and deliberately untouched by delete_team.
         self.agent_cards: dict[str, AgentCard] = {}
+        # First-seen stamps, keyed by the same hash. A SECOND dict rather than a
+        # field on the card, so the fake honours insert-only semantics the way
+        # the real backends do: the key is written when it is absent and never
+        # rewritten. A fake that answered a constant -- always None, always now --
+        # could not fail a spec the real backends would fail.
+        self.agent_card_first_seen: dict[str, datetime | None] = {}
         self.load_agent_cards_calls = 0
         # Write-method names in call order. The projection migration must write
         # cards BEFORE the document that references them (FR13), and both orders
@@ -230,7 +243,13 @@ class InMemoryEventStore:
         self.write_calls.append("save_agent_cards")
         for card in cards:
             storable = storable_agent_card(card)
-            self.agent_cards[hash_agent_card(storable)] = storable
+            card_hash = hash_agent_card(storable)
+            self.agent_cards[card_hash] = storable
+            # setdefault, never assignment: the stamp is written on insert and
+            # NEVER on a re-save, which is Mongo's ``$setOnInsert`` and Postgres'
+            # survives-by-omission ``DO UPDATE`` in dict form. A blob planted
+            # without a stamp keeps its None -- re-saving it must not backfill.
+            self.agent_card_first_seen.setdefault(card_hash, datetime.now(UTC))
 
     def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
         """Resolve card hashes; a hash the store does not hold is simply absent.
@@ -243,3 +262,18 @@ class InMemoryEventStore:
         if not hashes:
             return {}
         return {h: self.agent_cards[h] for h in hashes if h in self.agent_cards}
+
+    def list_agent_card_entries(self) -> list[AgentCardEntry]:
+        """Enumerate the dict-backed store without touching a card.
+
+        Answers from the keys and the stamp dict alone — no card is read, so a
+        blob whose payload is unusable still enumerates, as on every real
+        backend. An unstamped key reports ``None``.
+        """
+        return [
+            AgentCardEntry(
+                card_hash=card_hash,
+                first_seen_at=self.agent_card_first_seen.get(card_hash),
+            )
+            for card_hash in self.agent_cards
+        ]

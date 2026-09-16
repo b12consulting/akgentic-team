@@ -27,3 +27,8 @@ natural_key = ["card_hash"]
 [agent_card_entries.columns]
 card_hash = "str"
 data = "json"
+# Written on INSERT only. The ON CONFLICT ... DO UPDATE deliberately does not
+# name this column, so an existing row's value survives by omission -- that is
+# what makes it first-seen rather than last-written. Rows written before this
+# column existed hold NULL, which means "age unknown", never "old".
+first_seen_at = "timestamptz"

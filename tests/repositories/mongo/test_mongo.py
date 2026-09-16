@@ -15,7 +15,9 @@ once per backend. This module retains only Mongo-specific invariants:
 from __future__ import annotations
 
 import logging
+import time
 import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
@@ -1279,3 +1281,98 @@ class TestMongoAgentCardStore:
 
         assert loaded == {}
         assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]
+
+    def test_the_stamp_is_written_on_insert_only(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """The call-shape half of the contract spec: ``$setOnInsert``, not ``$set``.
+
+        Asserted on the stored document rather than on the call, so it holds
+        whatever the driver does with the update operators. ``replace_one`` — what
+        this used to be — cannot pass: a replacement document has no insert-only
+        half, so the stamp would move with the card.
+        """
+        card = _card_fixture()
+        mongo_store.save_agent_cards([card])
+        stamped = mongo_db[AGENT_CARDS_COLLECTION].find_one({"card_hash": hash_agent_card(card)})
+        assert stamped is not None
+        first_seen = stamped["first_seen_at"]
+
+        # BSON truncates to milliseconds, so a last-written stamp written inside
+        # the same tick is byte-identical to the right one. Without this the
+        # mutation passes.
+        time.sleep(0.01)
+        mongo_store.save_agent_cards([card])
+
+        again = mongo_db[AGENT_CARDS_COLLECTION].find_one({"card_hash": hash_agent_card(card)})
+        assert again is not None
+        assert again["first_seen_at"] == first_seen
+
+    def test_the_enumeration_projects_the_card_field_away(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """The cursor must not carry a card payload back at all.
+
+        A store with fifty thousand blobs answers "what do you hold" from the key
+        and the stamp; pulling the payload and then ignoring it is the same wire
+        cost as a full scan. Spying on the collection's ``find`` is the only way
+        to see the projection — the returned entries look identical either way.
+        """
+        mongo_store.save_agent_cards([_card_fixture()])
+        collection = mongo_db[AGENT_CARDS_COLLECTION]
+        real_find = type(collection).find
+        projections: list[Any] = []
+
+        def recording_find(self: Any, *args: Any, **kwargs: Any) -> Any:
+            projections.append(args[1] if len(args) > 1 else kwargs.get("projection"))
+            return real_find(self, *args, **kwargs)
+
+        with patch.object(type(collection), "find", recording_find):
+            entries = mongo_store.list_agent_card_entries()
+
+        assert len(entries) == 1
+        assert len(projections) == 1
+        projection = projections[0]
+        assert projection is not None
+        assert "card" not in projection
+        assert projection["card_hash"] == 1
+        assert projection["first_seen_at"] == 1
+        assert projection["_id"] == 0
+
+    def test_a_document_with_no_card_hash_is_skipped_with_a_warning(
+        self, mongo_store: MongoEventStore, mongo_db: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A keyless document names no blob, so it must not become an entry.
+
+        Nothing can reference it and ``load_agent_cards`` can never reach it;
+        enumerating it would hand the sweep a hash-shaped hole to reason about.
+        """
+        mongo_db[AGENT_CARDS_COLLECTION].insert_one({"card": {"not": "a card"}})
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.mongo"):
+            entries = mongo_store.list_agent_card_entries()
+
+        assert entries == []
+        assert [r for r in caplog.records if "no usable card_hash" in r.getMessage()]
+
+    def test_a_naive_stored_stamp_reads_back_as_utc(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """BSON carries no zone, so the driver hands a datetime back NAIVE.
+
+        The format is UTC by definition, so the zone is reattached on read rather
+        than assumed away. Without this the consumer subtracts a naive stamp from
+        ``datetime.now(UTC)`` and gets a ``TypeError`` — or, worse, a comparison
+        that silently means something else after a client is reconfigured.
+        """
+        mongo_db[AGENT_CARDS_COLLECTION].insert_one(
+            {
+                "card_hash": "c" * 64,
+                "card": {},
+                "first_seen_at": datetime(2026, 1, 2, 3, 4, 5),  # noqa: DTZ001 — naive on purpose
+            }
+        )
+
+        (entry,) = mongo_store.list_agent_card_entries()
+
+        assert entry.first_seen_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)

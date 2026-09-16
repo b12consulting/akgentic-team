@@ -357,9 +357,13 @@ class TestEventStoreConformance:
     no stronger than this.
     """
 
-    def test_the_protocol_declares_the_two_card_methods(self) -> None:
+    def test_the_protocol_declares_the_card_store_methods(self) -> None:
         """Guards the guard: if the members vanish, the sweep below is vacuous."""
-        assert {"save_agent_cards", "load_agent_cards"} <= set(_protocol_members())
+        assert {
+            "save_agent_cards",
+            "load_agent_cards",
+            "list_agent_card_entries",
+        } <= set(_protocol_members())
 
     @pytest.mark.parametrize(
         "double",

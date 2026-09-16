@@ -8,6 +8,7 @@ from typing import Protocol, runtime_checkable
 
 from akgentic.core.agent_card import AgentCard
 from akgentic.team.models import (
+    AgentCardEntry,
     AgentStateSnapshot,
     PersistedEvent,
     Process,
@@ -287,14 +288,27 @@ class EventStore(Protocol):
           decides what every other team reads back. Hireability is carried by
           the ``Process``'s ``AgentCardRef`` alone.
         * **Immutable.** A blob at a hash is the bytes that hash names, forever.
-          A re-save rewrites the same bytes; it never appends and never mutates
-          a card in place. Editing a catalog entry produces a *new* card with a
-          *new* hash, which is what leaves every existing team pointing at
-          exactly what it was built from (ADR-26 §Consequences, NFR2).
+          A re-save rewrites the same *card* bytes; it never appends and never
+          mutates a card in place. Editing a catalog entry produces a *new* card
+          with a *new* hash, which is what leaves every existing team pointing at
+          exactly what it was built from (ADR-26 §Consequences, NFR2). The
+          **envelope** around the card is not rewritten either: it carries
+          exactly one field, written once on insert (see below).
+        * **Stamped once, on insert.** The stored envelope carries a
+          ``first_seen_at`` timestamp, written when the blob is first inserted
+          and NEVER on a re-save — not from a second save of the same card, and
+          not from a second team reaching the same content. Last-written would
+          make a blob shared by an active fleet perpetually young and therefore
+          never reclaimable. A blob stored before this field existed carries no
+          stamp, and re-saving it does not add one; it enumerates as ``None``.
+          Read it back through :meth:`list_agent_card_entries`.
         * **Never deleted.** NO ``EventStore`` method removes a card,
           ``delete_team`` included. Another team may share it, no refcount is
           introduced, cards are small, and garbage collection is out of scope
-          (FR13).
+          **for this package** (FR13). What the stamp above changes is that a
+          consumer now has enough to perform it safely from outside: the reverse
+          sweep in ``akgentic-infra`` (ADR-042 §9) computes the reference set
+          across live teams and reclaims only what nothing claims.
 
         Args:
             cards: The cards to persist. Order is irrelevant; duplicates are
@@ -326,6 +340,38 @@ class EventStore(Protocol):
         team and state documents already are — logged, absent from the mapping —
         so it surfaces as FR14's loud failure at resolution rather than as an
         exception escaping the store.
+        """
+        ...
+
+    def list_agent_card_entries(self) -> list[AgentCardEntry]:
+        """Enumerate every blob the card store holds, in ONE round trip.
+
+        The counterpart of :meth:`load_agent_cards`, which resolves hashes a
+        caller already knows. This one answers *what does the store hold* — the
+        question the reverse sweep in ``akgentic-infra`` (ADR-042 §9) asks
+        before it computes a reference set across live teams and reclaims what
+        nothing claims.
+
+        Returns:
+            One :class:`~akgentic.team.models.AgentCardEntry` per stored blob,
+            in unspecified order, and ``[]`` when the store holds none.
+
+        Implementations MUST answer in ONE backend round trip — a ``find`` with
+        a projection, a two-column ``SELECT``, one directory listing — and MUST
+        NOT read or deserialise card bytes. A store with fifty thousand blobs
+        must not validate fifty thousand cards to say what it holds, and a blob
+        whose card no longer parses must still be enumerated: it is exactly the
+        kind of blob a sweep exists to reclaim.
+
+        ``first_seen_at`` is tz-aware UTC and is written **on insert only** (see
+        :meth:`save_agent_cards`), so it is the blob's age and not its last
+        write. ``None`` means the store does not KNOW the blob's age — every
+        blob written before the stamp existed reads ``None``, and it is never
+        faked with an epoch or a ``datetime.min``. A consumer MUST treat unknown
+        as **too young to reclaim**: reading it as "ancient, therefore safe"
+        makes the sweep's first run condemn every pre-existing blob in one pass.
+        That rule is documented here and enforced by the consumer; this package
+        only promises never to lie about what it knows.
         """
         ...
 

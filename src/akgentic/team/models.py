@@ -1,7 +1,7 @@
 """Domain models for team lifecycle management.
 
 TeamCard, TeamCardMember, TeamRuntime, TeamStatus, AgentRef, AgentCardRef,
-Process, PersistedEvent, AgentStateSnapshot.
+AgentCardEntry, Process, PersistedEvent, AgentStateSnapshot.
 """
 
 from __future__ import annotations
@@ -560,6 +560,32 @@ class AgentCardRef(SerializableBaseModel):
     can_be_hired: bool = Field(
         default=False,
         description="Whether an agent may hire this role at runtime",
+    )
+
+
+class AgentCardEntry(SerializableBaseModel):
+    """One blob the content-addressed card store holds, and how old it is.
+
+    What :meth:`akgentic.team.ports.EventStore.list_agent_card_entries` answers
+    with, one per stored blob. A model rather than a tuple because it crosses a
+    package boundary: the consumer (``akgentic-infra``'s reverse sweep) reads
+    ``entry.first_seen_at``, never ``entry[1]``.
+
+    Attributes:
+        card_hash: Content hash of the stored card — the key the blob is filed
+            under, produced by ``akgentic.team.projection.hash_agent_card``.
+        first_seen_at: When the store first saw this blob, tz-aware UTC, or
+            ``None`` when it does not know. The stamp is written on insert and
+            never on a re-save, so a blob shared by an active fleet does not
+            stay perpetually young. ``None`` means *unknown age*, never *old*:
+            every blob written before the stamp existed reads ``None``, and a
+            consumer MUST treat unknown as too young to reclaim. There is
+            deliberately no default — a constructor states the answer.
+    """
+
+    card_hash: str = Field(description="Content hash of the stored card; the store's key")
+    first_seen_at: datetime | None = Field(
+        description="When the store first saw this blob (tz-aware UTC), or None if unknown"
     )
 
 

@@ -15,7 +15,9 @@ payload-authority invariants) stay in the per-backend modules under
 from __future__ import annotations
 
 import logging
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -25,9 +27,13 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import UserMessage
 
-from akgentic.team.models import AgentCardRef, Process, TeamStatus
+from akgentic.team.models import AgentCardEntry, AgentCardRef, Process, TeamStatus
 from akgentic.team.ports import AgentCardNotFoundError, EventNotFoundError, EventStore
-from akgentic.team.projection import hash_agent_card, resolve_agent_cards
+from akgentic.team.projection import (
+    hash_agent_card,
+    resolve_agent_cards,
+    storable_agent_card,
+)
 from tests.models.conftest import (
     AcmeTeamMetadata,
     SampleAgentState,
@@ -40,6 +46,7 @@ from tests.models.conftest import (
     to_legacy_document,
 )
 from tests.repositories.conftest import (
+    RawAgentCardSeeder,
     RawAgentStateSeeder,
     RawTeamSeeder,
     stale_agent_state_document,
@@ -1096,6 +1103,10 @@ class ContractStubAgent(Akgent[BaseConfig, BaseState]):
     """
 
 
+_MILLISECOND = timedelta(milliseconds=1)
+"""Slack for the stamp window: BSON stores a datetime to millisecond resolution."""
+
+
 def _make_card(name: str, role: str) -> AgentCard:
     """An AgentCard whose ``agent_class`` survives a store round trip."""
     return make_agent_card(name=name, role=role, agent_class=ContractStubAgent)
@@ -1299,3 +1310,184 @@ class TestAgentCardStoreContract:
 
         assert "Ghost" in str(excinfo.value)
         assert missing in str(excinfo.value)
+
+    # --- enumeration (list_agent_card_entries) ----------------------------
+
+    def test_an_empty_store_enumerates_to_nothing(self, event_store: EventStore) -> None:
+        """No blobs means no entries — not a raise, and not a missing directory."""
+        assert event_store.list_agent_card_entries() == []
+
+    def test_the_enumeration_covers_every_saved_blob_and_no_others(
+        self, event_store: EventStore
+    ) -> None:
+        """Two teams' card sets enumerate as exactly their union.
+
+        The shared role contributes ONE blob, so a backend that keyed the store
+        per team — or that enumerated per team — cannot produce this set.
+        """
+        shared = _make_card("lead", "Lead")
+        team_a = [shared, _make_card("analyst", "Analyst")]
+        team_b = [shared, _make_card("writer", "Writer")]
+        event_store.save_agent_cards(team_a)
+        event_store.save_agent_cards(team_b)
+
+        expected = {hash_agent_card(c) for c in (*team_a, *team_b)}
+        assert len(expected) == 3
+        assert {e.card_hash for e in event_store.list_agent_card_entries()} == expected
+
+    def test_the_enumeration_answers_entries_not_tuples(
+        self, event_store: EventStore
+    ) -> None:
+        """The consumer reads ``entry.first_seen_at``, never ``entry[1]`` (Golden Rule #1)."""
+        event_store.save_agent_cards([_make_card("lead", "Lead")])
+
+        entries = event_store.list_agent_card_entries()
+
+        assert [type(e) for e in entries] == [AgentCardEntry]
+
+    def test_a_saved_blob_carries_a_tz_aware_utc_stamp(
+        self, event_store: EventStore
+    ) -> None:
+        """The stamp round-trips tz-aware through every backend's storage.
+
+        A naive datetime read back from a store that wrote an aware one is a
+        silently wrong comparison at the consumer, where the stamp is subtracted
+        from ``datetime.now(UTC)``.
+        """
+        before = datetime.now(UTC)
+        event_store.save_agent_cards([_make_card("lead", "Lead")])
+        after = datetime.now(UTC)
+
+        (entry,) = event_store.list_agent_card_entries()
+
+        assert entry.first_seen_at is not None
+        assert entry.first_seen_at.tzinfo is not None
+        assert entry.first_seen_at.utcoffset() == UTC.utcoffset(None)
+        # Storage resolutions differ (BSON truncates to milliseconds), so the
+        # window is widened by one millisecond on each side rather than asserted
+        # exactly. It is still tight enough that a stamp from another save fails.
+        assert before - _MILLISECOND <= entry.first_seen_at <= after + _MILLISECOND
+
+    def test_saving_the_same_card_from_a_second_team_does_not_move_the_stamp(
+        self, event_store: EventStore
+    ) -> None:
+        """THE spec. First-seen, not last-written — on all three backends.
+
+        The write is an idempotent upsert by design, so a blob a live fleet keeps
+        re-saving would be perpetually young under a last-written stamp and never
+        old enough to reclaim: the primitive would exist and do nothing, which is
+        worse than absent because it looks delivered.
+
+        Mutation-verified: ``$set`` in place of Mongo's ``$setOnInsert``, naming
+        ``first_seen_at`` in the Postgres ``DO UPDATE``, or dropping YAML's
+        carry-forward each turn this red and NOTHING else in this story.
+        """
+        card = _make_card("lead", "Lead")
+        event_store.save_agent_cards([card])
+        (first,) = event_store.list_agent_card_entries()
+
+        # Measurable time must pass before the re-saves, or a last-written
+        # implementation writes an IDENTICAL stamp and this spec goes green
+        # against the very defect it exists for. Mutation-verified: without the
+        # sleep the Mongo parametrization survives the mutation, because BSON
+        # stores a datetime to millisecond resolution and three saves in a row
+        # land inside one tick.
+        time.sleep(0.01)
+
+        # The same content arriving again — a re-save, and then a second team
+        # reaching the same catalog entry alongside a card of its own.
+        event_store.save_agent_cards([card])
+        event_store.save_agent_cards([card, _make_card("writer", "Writer")])
+
+        entries = {e.card_hash: e for e in event_store.list_agent_card_entries()}
+        assert entries[first.card_hash].first_seen_at == first.first_seen_at
+
+    # --- pre-existing, unstamped blobs ------------------------------------
+
+    def test_a_blob_with_no_stamp_enumerates_as_unknown(
+        self, event_store: EventStore, seed_raw_agent_card: RawAgentCardSeeder
+    ) -> None:
+        """An unstamped blob reports ``None``, never a faked age.
+
+        Every blob in every deployment predates the stamp. ``None`` means
+        *unknown*, and a consumer must treat unknown as too young to reclaim; an
+        epoch or a ``datetime.min`` is "ancient, therefore safe" wearing a
+        different hat, and it would condemn the whole store on the first sweep.
+        """
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        seed_raw_agent_card(card_hash, storable_agent_card(card).model_dump())
+
+        (entry,) = event_store.list_agent_card_entries()
+
+        assert entry.card_hash == card_hash
+        assert entry.first_seen_at is None
+
+    def test_re_saving_an_unstamped_blob_does_not_stamp_it(
+        self, event_store: EventStore, seed_raw_agent_card: RawAgentCardSeeder
+    ) -> None:
+        """A re-save is not a first sight, so it must not claim one.
+
+        This is what ``$setOnInsert`` and a ``DO UPDATE`` that omits the column
+        already do; YAML has to match them deliberately. Stamping here would be
+        a backfill by the back door, and backfill is a separate decision.
+        """
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        seed_raw_agent_card(card_hash, storable_agent_card(card).model_dump())
+
+        event_store.save_agent_cards([card])
+
+        (entry,) = event_store.list_agent_card_entries()
+        assert entry.first_seen_at is None
+        # The card itself is still resolvable: the re-save healed nothing away.
+        assert set(event_store.load_agent_cards([card_hash])) == {card_hash}
+
+    def test_a_pre_existing_blob_still_resolves_as_a_card(
+        self, event_store: EventStore, seed_raw_agent_card: RawAgentCardSeeder
+    ) -> None:
+        """A blob written before the envelope loads, and is not a corrupted document."""
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        seed_raw_agent_card(card_hash, storable_agent_card(card).model_dump())
+
+        loaded = event_store.load_agent_cards([card_hash])
+
+        assert set(loaded) == {card_hash}
+        assert hash_agent_card(loaded[card_hash]) == card_hash
+
+    # --- the enumeration never deserialises a card ------------------------
+
+    def test_the_enumeration_does_not_deserialise_cards(
+        self, event_store: EventStore, seed_raw_agent_card: RawAgentCardSeeder
+    ) -> None:
+        """A blob no ``AgentCard`` would validate still enumerates.
+
+        Behavioural rather than a timing assertion, and it holds on all three
+        backends. A blob whose payload has rotted is precisely what a sweep
+        exists to reclaim — an enumeration that validated would drop it from the
+        answer and make it unreclaimable forever. ``load_agent_cards`` still
+        refuses it, which is the half that proves the payload really is junk.
+        """
+        card_hash = "a" * 64
+        seed_raw_agent_card(card_hash, {"not": "a card"})
+
+        assert {e.card_hash for e in event_store.list_agent_card_entries()} == {card_hash}
+        assert event_store.load_agent_cards([card_hash]) == {}
+
+    def test_save_list_and_load_agree_on_the_hash(self, event_store: EventStore) -> None:
+        """AC 12: the card payload and its key are untouched by the envelope.
+
+        The hash a card is filed under, the hash the enumeration reports and the
+        hash it loads back under are one value — so no blob written before this
+        story is orphaned by it.
+        """
+        card = _make_card("analyst", "Analyst")
+        expected = hash_agent_card(storable_agent_card(card))
+
+        event_store.save_agent_cards([card])
+
+        (entry,) = event_store.list_agent_card_entries()
+        assert entry.card_hash == expected
+        assert hash_agent_card(event_store.load_agent_cards([expected])[expected]) == expected
+

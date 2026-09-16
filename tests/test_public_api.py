@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+from pydantic import ValidationError
+
 import akgentic.team
 
 
@@ -78,6 +81,29 @@ def test_the_card_store_surface_is_exported() -> None:
     for name in ("AgentCardNotFoundError", "resolve_agent_cards", "storable_agent_card"):
         assert name in akgentic.team.__all__, f"{name} missing from __all__"
         assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
+
+
+def test_the_card_store_enumeration_model_is_exported() -> None:
+    """``AgentCardEntry`` is what ``list_agent_card_entries`` hands across the boundary.
+
+    The consumer is out of package — ``akgentic-infra``'s reverse sweep — and it
+    reads ``entry.first_seen_at``. A type it cannot name is a type it cannot
+    annotate, which leaves the sweep passing a ``list[Any]`` around and losing
+    the one distinction the model exists to make (a real ``None`` versus an age).
+    """
+    assert "AgentCardEntry" in akgentic.team.__all__
+    assert hasattr(akgentic.team, "AgentCardEntry")
+
+
+def test_the_enumeration_entry_never_defaults_its_age() -> None:
+    """``first_seen_at`` is required, and ``None`` is an answer a caller STATES.
+
+    A default would let a construction site omit the field and silently mean
+    "unknown" when it simply forgot to ask — the one value that must never be
+    produced by accident, since a consumer keys a deletion decision on it.
+    """
+    with pytest.raises(ValidationError):
+        akgentic.team.AgentCardEntry(card_hash="a" * 64)  # type: ignore[call-arg]
 
 
 def test_the_event_log_error_is_exported() -> None:

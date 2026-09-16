@@ -43,6 +43,15 @@ RawTeamSeeder = Callable[[uuid.UUID, dict[str, Any]], None]
 RawAgentStateSeeder = Callable[[uuid.UUID, str, dict[str, Any]], None]
 """Writes one raw agent-state document straight into the backend's storage."""
 
+RawAgentCardSeeder = Callable[[str, dict[str, Any]], None]
+"""Writes one UNSTAMPED card blob straight into the backend's storage.
+
+The shape every blob in every deployment has today: a card payload under its
+hash and no ``first_seen_at`` anywhere. ``save_agent_cards`` cannot produce it
+any more -- it stamps on insert -- so the pre-existing-blob contract can only be
+exercised by writing past it, per backend, exactly where that backend reads.
+"""
+
 
 def stale_agent_state_document(
     team_id: uuid.UUID, agent_id: str, class_path: str
@@ -175,6 +184,55 @@ def seed_raw_agent_state(
             trn.execute(
                 "INSERT INTO agent_state_entries (team_id, agent_id, data) VALUES (%s, %s, %s)",
                 (str(team_id), agent_id, json.dumps(document)),
+            )
+
+    return _seed
+
+
+@pytest.fixture
+def seed_raw_agent_card(
+    request: pytest.FixtureRequest,
+    event_store: EventStore,
+    tmp_path: Path,
+) -> RawAgentCardSeeder:
+    """Return a function that plants an unstamped card blob in the yielded backend.
+
+    The card twin of ``seed_raw_team``. The payload is written verbatim, so the
+    same fixture seeds both a legacy-but-valid card and one that no ``AgentCard``
+    would validate -- which is how the enumeration's never-deserialise contract
+    is asserted behaviourally rather than by timing.
+    """
+    del event_store  # requested so the backend's storage exists and is clean
+    backend: str = request.node.callspec.params["event_store"]
+
+    def _seed(card_hash: str, card_payload: dict[str, Any]) -> None:
+        if backend == "yaml":
+            from akgentic.team.repositories.yaml import CARDS_DIRNAME
+
+            cards_dir = tmp_path / CARDS_DIRNAME
+            cards_dir.mkdir(parents=True, exist_ok=True)
+            # The BARE shape: the file IS the card, with no envelope around it.
+            with open(cards_dir / f"{card_hash}.yaml", "w") as handle:
+                yaml.dump(card_payload, handle, default_flow_style=False)
+            return
+        if backend == "mongo":
+            mongo_db = request.getfixturevalue("mongo_db")
+            from akgentic.team.repositories.mongo import AGENT_CARDS_COLLECTION
+
+            # No ``first_seen_at`` key at all -- a document written before it existed.
+            mongo_db[AGENT_CARDS_COLLECTION].insert_one(
+                {"card_hash": card_hash, "card": dict(card_payload)}
+            )
+            return
+        conn = request.getfixturevalue("postgres_clean_tables")
+        from nagra import Transaction  # type: ignore[import-untyped]
+
+        with Transaction(conn) as trn:
+            # ``first_seen_at`` unnamed, so the row holds NULL: a row written
+            # before the column was added.
+            trn.execute(
+                "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
+                (card_hash, json.dumps(card_payload)),
             )
 
     return _seed

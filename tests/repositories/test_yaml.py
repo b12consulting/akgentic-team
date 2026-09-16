@@ -39,8 +39,13 @@ from pydantic import BaseModel, Field
 
 from akgentic.team.models import PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
-from akgentic.team.projection import hash_agent_card
-from akgentic.team.repositories.yaml import CARDS_DIRNAME, YamlEventStore
+from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories.yaml import (
+    CARD_ENVELOPE_KEY,
+    CARD_FIRST_SEEN_KEY,
+    CARDS_DIRNAME,
+    YamlEventStore,
+)
 
 if TYPE_CHECKING:
     from akgentic.team.ports import EventStore
@@ -778,6 +783,148 @@ class TestYamlAgentCardStoreLayout:
 
         assert loaded == {}
         assert [r for r in caplog.records if "corrupted agent card" in r.getMessage()]
+
+    # --- the envelope, and the bare files that predate it --------------------
+
+    def test_a_saved_card_file_is_an_envelope_around_the_card(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """The card sits UNDER a key, with the stamp beside it, not merged into it.
+
+        Merging the stamp into the card's own mapping would put a key on disk
+        that ``AgentCard`` does not declare, and ``load_agent_cards`` validates
+        that mapping — so the blob would stop loading, on every backend at once.
+        """
+        card = _card_fixture()
+        yaml_store.save_agent_cards([card])
+
+        on_disk = yaml.safe_load(
+            (tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml").read_text()
+        )
+
+        assert set(on_disk) == {CARD_ENVELOPE_KEY, CARD_FIRST_SEEN_KEY}
+        assert on_disk[CARD_ENVELOPE_KEY] == storable_agent_card(card).model_dump()
+        assert isinstance(on_disk[CARD_FIRST_SEEN_KEY], datetime)
+        assert on_disk[CARD_FIRST_SEEN_KEY].tzinfo is not None
+
+    def test_a_re_save_carries_the_stamp_on_disk_forward_verbatim(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """``_atomic_write`` rewrites the file WHOLESALE, so the save must read first.
+
+        This is the YAML expression of ``$setOnInsert``. Asserted on the bytes on
+        disk rather than through the enumeration, because the enumeration reads
+        whatever the save wrote and cannot tell a carried-forward stamp from one
+        the reader invented.
+        """
+        card = _card_fixture()
+        card_path = tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml"
+        yaml_store.save_agent_cards([card])
+        first = yaml.safe_load(card_path.read_text())[CARD_FIRST_SEEN_KEY]
+
+        yaml_store.save_agent_cards([card])
+
+        assert yaml.safe_load(card_path.read_text())[CARD_FIRST_SEEN_KEY] == first
+
+    def test_a_bare_pre_existing_card_file_loads_without_a_complaint(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every card file in every deployment today is a BARE card, not an envelope.
+
+        A reader that assumed the envelope would turn all of them into "corrupted
+        document, skipped" — FR14's loud failure arriving for a reason that is
+        not the card's fault. The ``caplog`` half is the one that catches it: a
+        reader that routes legacy files through the corrupted path still returns
+        ``{}`` quietly on some spellings and a log is the only witness.
+        """
+        card = _card_fixture()
+        card_hash = hash_agent_card(card)
+        cards_dir = tmp_path / CARDS_DIRNAME
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        # Exactly the bytes ``save_agent_cards`` wrote before the envelope.
+        with open(cards_dir / f"{card_hash}.yaml", "w") as handle:
+            yaml.dump(storable_agent_card(card).model_dump(), handle, default_flow_style=False)
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            loaded = yaml_store.load_agent_cards([card_hash])
+            entries = yaml_store.list_agent_card_entries()
+
+        assert set(loaded) == {card_hash}
+        assert hash_agent_card(loaded[card_hash]) == card_hash
+        assert [(e.card_hash, e.first_seen_at) for e in entries] == [(card_hash, None)]
+        assert caplog.records == [], [r.getMessage() for r in caplog.records]
+
+    def test_a_file_the_store_did_not_write_is_not_an_entry(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """The enumeration applies ``load_agent_cards``' own name guard.
+
+        A stray file is not a blob this store holds, and handing its name to a
+        consumer that deletes what nothing claims is how an unrelated file gets
+        reclaimed.
+        """
+        yaml_store.save_agent_cards([_card_fixture()])
+        (tmp_path / CARDS_DIRNAME / "notes.yaml").write_text("just: a file\n")
+        (tmp_path / CARDS_DIRNAME / "README.md").write_text("not yaml at all\n")
+
+        entries = yaml_store.list_agent_card_entries()
+
+        assert [e.card_hash for e in entries] == [hash_agent_card(_card_fixture())]
+
+    def test_an_unparseable_card_file_is_skipped_by_the_enumeration(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Logged and skipped, as everywhere else in this module."""
+        card = _card_fixture()
+        yaml_store.save_agent_cards([card])
+        (tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml").write_text("{[not: yaml")
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
+            entries = yaml_store.list_agent_card_entries()
+
+        assert entries == []
+        assert [r for r in caplog.records if "unreadable agent card" in r.getMessage()]
+
+    def test_enumerating_an_absent_card_directory_is_empty_not_an_error(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """A store that has never saved a card has no directory to list."""
+        assert not (tmp_path / CARDS_DIRNAME).exists()
+        assert yaml_store.list_agent_card_entries() == []
+
+    def test_a_save_over_an_unreadable_file_heals_it_without_inventing_a_stamp(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A half-written file heals on the next save, but its age stays unknown.
+
+        The file exists, so this is not a first sight and the save must not claim
+        one; the stamp it held (if any) is unreadable, so the honest answer is
+        ``None``. Stamping ``now`` here would date the blob from the crash that
+        damaged it.
+        """
+        card = _card_fixture()
+        card_hash = hash_agent_card(card)
+        cards_dir = tmp_path / CARDS_DIRNAME
+        cards_dir.mkdir(parents=True, exist_ok=True)
+        (cards_dir / f"{card_hash}.yaml").write_text("{[not: yaml")
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            yaml_store.save_agent_cards([card])
+
+        assert set(yaml_store.load_agent_cards([card_hash])) == {card_hash}
+        assert [(e.card_hash, e.first_seen_at) for e in yaml_store.list_agent_card_entries()] == [
+            (card_hash, None)
+        ]
+        assert [r for r in caplog.records if "Could not read existing card file" in r.getMessage()]
 
     def test_loading_from_a_store_with_no_card_directory_returns_empty(
         self, yaml_store: YamlEventStore
