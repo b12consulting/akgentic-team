@@ -3320,3 +3320,89 @@ class TestRestoreBuildsTheRuntimeFromTheProjection:
         sent = _sent_recipients(recording, baseline, expected=3)
         assert len(sent) == 3
         assert {m.recipient.name for m in sent} == expected
+
+
+class TestTheRestorerNamesWhichFaultItFound:
+    """An empty log and a log without an orchestrator are different faults.
+
+    They used to share one message. That is how an event store answering ``[]``
+    for a log it could not parse surfaced to the operator as "No Orchestrator
+    StartMessage found" — an error about the orchestrator for a fault in
+    persistence, pointing at the wrong subsystem entirely.
+
+    The store now raises rather than answering ``[]`` for an unreadable log, but
+    an empty list stays reachable (a team directory with no events.yaml at all),
+    and it still deserves to be named for what it is.
+    """
+
+    def test_an_empty_event_log_says_the_log_is_empty(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        _, process = _populate_stopped_team(event_store)
+        event_store.events.clear()
+        event_store._event_dicts.clear()
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        with pytest.raises(ValueError, match="event log is empty") as caught:
+            restorer.restore(process)
+
+        assert str(process.team_id) in str(caught.value)
+
+    def test_events_without_an_orchestrator_keep_todays_message(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """The genuine no-orchestrator case is preserved verbatim in meaning."""
+        team_id, process = _populate_stopped_team(event_store)
+        event_store.events.clear()
+        event_store._event_dicts.clear()
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=1,
+                event=UserMessage(content="a log that is not empty"),
+                timestamp=datetime.now(UTC),
+            )
+        )
+
+        restorer = TeamRestorer(actor_system, event_store)
+
+        with pytest.raises(ValueError, match="No Orchestrator StartMessage found") as caught:
+            restorer.restore(process)
+
+        assert str(team_id) in str(caught.value)
+
+    def test_the_two_faults_do_not_share_a_message(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """Whole point of the split, asserted as a difference rather than twice.
+
+        Two tests that each match their own substring would both still pass if
+        one message were widened to contain the other.
+        """
+        team_id, process = _populate_stopped_team(event_store)
+        restorer = TeamRestorer(actor_system, event_store)
+
+        event_store.events.clear()
+        event_store._event_dicts.clear()
+        with pytest.raises(ValueError) as empty:
+            restorer.restore(process)
+
+        event_store.save_event(
+            PersistedEvent(
+                team_id=team_id,
+                sequence=1,
+                event=UserMessage(content="not empty"),
+                timestamp=datetime.now(UTC),
+            )
+        )
+        with pytest.raises(ValueError) as no_orch:
+            restorer.restore(process)
+
+        assert str(empty.value) != str(no_orch.value)

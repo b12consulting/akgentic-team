@@ -78,3 +78,20 @@ def test_the_card_store_surface_is_exported() -> None:
     for name in ("AgentCardNotFoundError", "resolve_agent_cards", "storable_agent_card"):
         assert name in akgentic.team.__all__, f"{name} missing from __all__"
         assert hasattr(akgentic.team, name), f"{name} not importable from akgentic.team"
+
+
+def test_the_event_log_error_is_exported() -> None:
+    """``EventLogUnreadableError`` must be nameable from outside the package.
+
+    An out-of-package caller — the infra events endpoint above all — has to be
+    able to tell "this log will not parse" from "your cursor is stale" and from
+    every other failure. Without the export, the only way to catch it is
+    ``except Exception``, which is how a loud failure becomes a quiet one again.
+    """
+    assert "EventLogUnreadableError" in akgentic.team.__all__
+    assert hasattr(akgentic.team, "EventLogUnreadableError")
+    # The type identity is half the contract: a caller that catches
+    # EventNotFoundError must NOT also catch this one.
+    assert not issubclass(
+        akgentic.team.EventLogUnreadableError, akgentic.team.EventNotFoundError
+    )

@@ -36,7 +36,7 @@ import yaml
 from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
-from akgentic.team.ports import EventNotFoundError
+from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 
 logger = logging.getLogger(__name__)
@@ -89,14 +89,30 @@ class YamlEventStore:
 
         Prevents corrupted partial files if the process crashes mid-write.
 
+        Serializes through ``yaml.safe_dump``, which is the same dialect
+        ``yaml.safe_load`` reads: the unsafe dumper emits a ``!!python/object``
+        tag for any value it has no representer for, and the safe loader every
+        read path here uses then refuses to construct it — a pair that can write
+        a file it cannot read back. A value the reader could not reconstruct now
+        fails the write instead, while the data is still in hand.
+
+        The existing ``except BaseException`` gives that refusal its no-partial-
+        write property for free: the dump raises into the temp file, the temp is
+        unlinked, and ``path`` is never touched, so the previous good document
+        survives intact.
+
         Args:
             path: Destination file path.
             data: Dictionary to serialize as YAML.
+
+        Raises:
+            yaml.YAMLError: If *data* holds a value the safe dumper cannot
+                represent. ``path`` is left byte-identical.
         """
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
             with open(fd, "w") as f:
-                yaml.dump(data, f, default_flow_style=False)
+                yaml.safe_dump(data, f, default_flow_style=False)
             Path(tmp).replace(path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
@@ -351,28 +367,58 @@ class YamlEventStore:
         Uses multi-document YAML format (documents separated by ``---``)
         for append-only semantics. Creates the team directory if needed.
 
+        Serialized to a string FIRST, then written in one call — not dumped into
+        an open handle. Two reasons, and only the second is about this story:
+
+        * ``safe_dump`` refuses a value ``safe_load_all`` could not construct.
+          Dumping into the handle would have already written ``"---\\n"`` and
+          possibly half a document before that refusal, leaving a stray
+          separator on an append-only log that no later read can tell from a
+          real one.
+        * One ``write`` of separator-plus-body is also one append, so a
+          concurrent appender cannot interleave into the middle of a document.
+
+        The failure therefore happens before the file is opened at all, and
+        ``events.yaml`` is byte-identical to what it was.
+
         Args:
             event: The event to append.
+
+        Raises:
+            yaml.YAMLError: If the event's ``model_dump()`` holds a value the
+                safe dumper cannot represent. Nothing is appended.
+
+                This propagates to ``PersistenceSubscriber`` and out to the
+                orchestrator, which logs one ERROR per failed subscriber call
+                and keeps the team running — one dropped event, not a dead
+                team, and above all not a log that reads back as ``[]``. The
+                subscriber has already consumed the sequence number, so a
+                refused write leaves a **gap**; that is harmless here (reads
+                sort by ``sequence``, ``get_max_sequence`` takes the max) where
+                a duplicate would not be.
         """
         team_dir = self._team_dir(event.team_id)
         team_dir.mkdir(parents=True, exist_ok=True)
         events_path = team_dir / "events.yaml"
-        data = event.model_dump()
+        body = yaml.safe_dump(event.model_dump(), default_flow_style=False)
         with open(events_path, "a") as f:
-            f.write("---\n")
-            yaml.dump(data, f, default_flow_style=False)
+            f.write(f"---\n{body}")
         logger.debug("Appended event seq=%d for team %s", event.sequence, event.team_id)
 
     @staticmethod
-    def _unreadable_log(
-        team_id: uuid.UUID, after_event_id: uuid.UUID | None
-    ) -> list[PersistedEvent]:
-        """Result for a team whose events.yaml is absent or unparseable.
+    def _absent_log(team_id: uuid.UUID, after_event_id: uuid.UUID | None) -> list[PersistedEvent]:
+        """Result for a team that has NO events.yaml at all.
+
+        A team that has never persisted an event has an empty log, and an empty
+        log is ``[]``. This is emphatically NOT the answer for a log that exists
+        and will not parse — that raises ``EventLogUnreadableError`` at the
+        parse site. The two used to share this helper, which is how a storage
+        fault came to be indistinguishable from a brand-new team.
 
         Raises:
-            EventNotFoundError: If a cursor was passed — an unreadable log
-                cannot resolve an anchor, and ``[]`` would be read by the
-                caller as "you are already up to date".
+            EventNotFoundError: If a cursor was passed — an absent log cannot
+                resolve an anchor, and ``[]`` would be read by the caller as
+                "you are already up to date".
         """
         if after_event_id is not None:
             raise EventNotFoundError(f"Event {after_event_id} not found for team {team_id}")
@@ -394,18 +440,30 @@ class YamlEventStore:
 
         Raises:
             EventNotFoundError: If ``after_event_id`` does not resolve to an
-                event of this team, including when the events file is absent
-                or unparseable.
+                event of this team, including when the events file is absent.
+            EventLogUnreadableError: If events.yaml exists but will not parse,
+                on both the cursor and the no-cursor path. Returning ``[]`` here
+                is what turned a 186 KB log into ``200 {"events": []}`` and then
+                into a "no orchestrator" error against a team whose orchestrator
+                was on disk the whole time.
+
+        A document that parses but fails ``PersistedEvent.model_validate`` is a
+        different case again and stays a per-document WARNING skip: one event
+        lost rather than the log. That tolerance is deliberate.
         """
         events_path = self._team_dir(team_id) / "events.yaml"
         if not events_path.exists():
-            return self._unreadable_log(team_id, after_event_id)
+            return self._absent_log(team_id, after_event_id)
         try:
             with open(events_path) as f:
                 docs = list(yaml.safe_load_all(f))
         except yaml.YAMLError as exc:
+            # The ERROR line stays — it names the team and is what an operator
+            # greps for — but it is no longer the ONLY signal. Raising is.
             logger.error("Corrupted events.yaml for team %s: %s", team_id, exc)
-            return self._unreadable_log(team_id, after_event_id)
+            raise EventLogUnreadableError(
+                f"events.yaml for team {team_id} exists but could not be parsed: {exc}"
+            ) from exc
         events: list[PersistedEvent] = []
         for doc in docs:
             if doc is None:
@@ -439,6 +497,12 @@ class YamlEventStore:
 
         Returns:
             The highest sequence number, or 0 if no events exist.
+
+        Raises:
+            EventLogUnreadableError: Propagated from ``load_events`` when the
+                log exists and will not parse. Deliberately not caught:
+                answering 0 would restart the sequence at 1 and overwrite the
+                numbering of a log that is still on disk.
         """
         events = self.load_events(team_id)
         return max((e.sequence for e in events), default=0)
