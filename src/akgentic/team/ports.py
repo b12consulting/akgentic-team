@@ -23,6 +23,26 @@ class EventNotFoundError(LookupError):
     """
 
 
+class EventLogUnreadableError(RuntimeError):
+    """Raised when a team's stored event log exists but cannot be parsed.
+
+    Deliberately NOT a ``ValueError``: the corrupted-document handlers in the
+    backends — ``_load_team_data``, ``_validate_team_data``, ``load_agent_states``,
+    ``load_agent_cards``, and the per-document skip inside ``load_events``
+    itself — all catch ``ValueError``, so a ``ValueError`` here would be
+    swallowed on the very path it exists to fail loudly on.
+
+    Deliberately NOT an ``EventNotFoundError`` or any other ``LookupError``
+    either: the infra read path reads ``EventNotFoundError`` as "your cursor is
+    stale, resync from the top". An unreadable log answering with that type
+    would send a client into a resync loop against a log that will never parse.
+
+    "The file is absent" and "the file will not parse" are different facts and
+    must not share an answer. An absent log is an empty log — ``[]`` with no
+    cursor, ``EventNotFoundError`` with one. A log that will not parse is this.
+    """
+
+
 class AgentCardNotFoundError(LookupError):
     """Raised when an ``AgentCardRef``'s hash resolves to no card in the store.
 
@@ -71,6 +91,14 @@ class EventStore(Protocol):
             EventNotFoundError: If ``after_event_id`` is not an event of this
                 team. A stale cursor MUST fail loudly, never silently degrade
                 into a full-log return.
+            EventLogUnreadableError: If the team HAS a stored event log and it
+                cannot be parsed. On **both** paths — with a cursor and without
+                one. A log that will not parse MUST NOT be reported as zero
+                events: the no-cursor path is what ``TeamRestorer`` replays on
+                resume, so ``[]`` there turns a storage fault into "this team
+                has no orchestrator", which is a message about the wrong
+                subsystem. An **absent** log is a different fact and keeps its
+                answer: ``[]`` with no cursor, ``EventNotFoundError`` with one.
 
         Implementations MUST resolve the anchor to its ``sequence`` and push a
         ``sequence > N`` range filter down to the backend (SQL WHERE, Mongo find

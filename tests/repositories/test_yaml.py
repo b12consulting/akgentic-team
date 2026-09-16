@@ -11,14 +11,21 @@ once per backend. This module retains only YAML-specific invariants:
 * List-teams filtering the raw parsed mapping ahead of validation —
   a YAML-only property, since the other backends push the filter into
   the query.
-* Corrupted-file resilience (YAML parser errors → ``None`` / ``[]`` /
-  skip rather than raise — this is the YamlEventStore contract).
+* Corrupted-file resilience for teams, states and cards (YAML parser
+  errors → ``None`` / skip rather than raise — this is the YamlEventStore
+  contract). The EVENT LOG is the deliberate exception: a log that exists
+  and will not parse raises ``EventLogUnreadableError``, because ``[]``
+  there is read by every caller as "this team has no history".
+* The writer and the reader speak one dialect — a value the safe loader
+  could not construct fails the write instead of landing on disk.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,8 +33,12 @@ import pytest
 import yaml
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
+from akgentic.core.agent_state import BaseState
+from akgentic.core.messages.message import Message
+from pydantic import BaseModel, Field
 
-from akgentic.team.models import Process, TeamStatus
+from akgentic.team.models import PersistedEvent, Process, TeamStatus
+from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card
 from akgentic.team.repositories.yaml import CARDS_DIRNAME, YamlEventStore
 
@@ -493,14 +504,22 @@ class TestYamlEventStoreYamlSpecific:
             good.team_id
         ]
 
-    def test_load_events_returns_empty_for_corrupted_yaml(self, tmp_path: Path) -> None:
-        """Corrupted ``events.yaml`` returns empty list instead of raising."""
+    def test_load_events_raises_for_corrupted_yaml(self, tmp_path: Path) -> None:
+        """Corrupted ``events.yaml`` raises instead of answering with an empty list.
+
+        The inverse of what this test used to assert. Its old docstring —
+        "returns empty list instead of raising" — was the defect written down as
+        a specification: a 186 KB log of 40 events answered ``[]``, the restorer
+        found no orchestrator in it, and the operator was handed an error about
+        the orchestrator for a fault in the event store.
+        """
         store = YamlEventStore(tmp_path)
         team_id = uuid.uuid4()
         team_dir = tmp_path / str(team_id)
         team_dir.mkdir()
         (team_dir / "events.yaml").write_text("{{invalid: yaml: [}")
-        assert store.load_events(team_id) == []
+        with pytest.raises(EventLogUnreadableError, match=str(team_id)):
+            store.load_events(team_id)
 
     def test_load_agent_states_skips_corrupted_files(self, tmp_path: Path) -> None:
         """A corrupted state file is skipped; valid ones are still loaded."""
@@ -800,3 +819,338 @@ class TestYamlAgentCardStoreLayout:
         assert set(yaml_store.load_agent_cards([hash_agent_card(card)])) == {
             hash_agent_card(card)
         }
+
+
+class _MatchKind(StrEnum):
+    """A ``StrEnum`` standing in for the one that triggered this in the field.
+
+    The specific enum is incidental and already fixed at its source. What
+    matters is the shape: a value that is an instance of a class PyYAML has no
+    safe representer for, which the unsafe dumper happily writes as
+    ``!!python/object/apply:`` and the safe loader then refuses to construct.
+    """
+
+    EXACT = "exact"
+
+
+class _PlainNested(BaseModel):
+    """A plain ``BaseModel`` — deliberately NOT a ``SerializableBaseModel``.
+
+    That distinction is the leak. ``serialize()`` converts UUID, datetime,
+    ``ActorAddress`` and bytes to plain forms, but for a nested ``BaseModel`` it
+    calls ``value.model_dump()`` in *python* mode and returns the result as-is,
+    so anything exotic inside survives into the dict handed to the dumper.
+    """
+
+    kind: _MatchKind = _MatchKind.EXACT
+
+
+class _LeakyMessage(Message):
+    """A Message whose ``model_dump()`` genuinely carries a non-plain value."""
+
+    payload: _PlainNested = Field(default_factory=_PlainNested)
+
+
+class _LeakyState(BaseState):
+    """The same leak, on the other write path.
+
+    ``save_event`` is not the only writer: ``_atomic_write`` backs team.yaml,
+    ``states/`` and ``agent_cards/``, and AC#1 covers it too. A snapshot is the
+    shortest public route to it that can carry a value the safe dumper refuses.
+    """
+
+    payload: _PlainNested = Field(default_factory=_PlainNested)
+
+
+def _leaky_event(team_id: uuid.UUID, sequence: int = 1) -> PersistedEvent:
+    return PersistedEvent(
+        team_id=team_id,
+        sequence=sequence,
+        event=_LeakyMessage(),
+        timestamp=datetime.now(UTC),
+    )
+
+
+_PYTHON_TAGGED_LOG = """---
+team_id: 6a3d1f9c-6f1e-4a2e-9a1a-2d4e6f8a0b1c
+sequence: 1
+event: !!python/object/apply:builtins.getattr
+- !!python/name:builtins.str ''
+- upper
+timestamp: '2026-09-15T10:00:00+00:00'
+"""
+"""The exact shape the field logs carried: a tag ``safe_load_all`` refuses.
+
+Written by the unsafe dumper, unreadable by the safe loader — the asymmetry this
+story closes from the writing side.
+"""
+
+
+class TestTheWriterRefusesWhatTheReaderWouldRefuse:
+    """The write path and the read path must agree on one YAML dialect.
+
+    ``yaml.dump`` emits a ``!!python/`` tag for any value it has no representer
+    for; ``yaml.safe_load_all`` refuses to construct one. The pair could write a
+    file it could not read back, and every layer above compounded that rather
+    than containing it: the whole log answered ``[]``, the restorer reported a
+    missing orchestrator, and the operator was pointed at the wrong subsystem.
+    """
+
+    # --- (a) Write-time refusal ---------------------------------------------
+
+    def test_the_leak_this_guard_stands_on_is_real(self) -> None:
+        """Pin the premise, so the refusal guard below cannot go vacuous.
+
+        If ``serialize()`` ever learns to flatten a nested plain ``BaseModel``,
+        this fails first and says so — rather than leaving the refusal guard
+        passing because there is nothing left to refuse.
+        """
+        dumped = _leaky_event(uuid.uuid4()).model_dump()
+
+        leaked = dumped["event"]["payload"]["kind"]
+        assert type(leaked) is _MatchKind, (
+            "the nested plain BaseModel no longer leaks a non-plain value; "
+            "rebuild this guard on a shape that still does"
+        )
+
+    def test_an_unrepresentable_value_fails_the_write(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """``save_event`` raises rather than writing what it cannot read back."""
+        team_id = uuid.uuid4()
+
+        with pytest.raises(yaml.YAMLError):
+            yaml_store.save_event(_leaky_event(team_id))
+
+        assert not (tmp_path / str(team_id) / "events.yaml").exists()
+
+    def test_a_refused_write_leaves_the_log_byte_identical(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """AC#2's negative, and the reason the dump happens before the open.
+
+        Dumping into an already-open handle would have appended ``"---\\n"`` —
+        and possibly half a document — before the refusal, leaving a stray
+        separator on an append-only log that no later read can distinguish from
+        a real one.
+        """
+        team_id = uuid.uuid4()
+        good = make_persisted_event(team_id=team_id, sequence=1)
+        yaml_store.save_event(good)
+
+        events_path = tmp_path / str(team_id) / "events.yaml"
+        before = events_path.read_bytes()
+
+        with pytest.raises(yaml.YAMLError):
+            yaml_store.save_event(_leaky_event(team_id, sequence=2))
+
+        assert events_path.read_bytes() == before
+        assert [e.sequence for e in yaml_store.load_events(team_id)] == [1]
+
+    def test_no_file_this_store_writes_carries_a_python_tag(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """AC#1 across all four file kinds, asserted on the bytes on disk.
+
+        ``_atomic_write`` backs team.yaml, states/ and agent_cards/; ``save_event``
+        backs events.yaml. Both dialects are checked where it is observable.
+        """
+        process = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(process)
+        yaml_store.save_event(make_persisted_event(team_id=process.team_id, sequence=1))
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=process.team_id, agent_id="a1")
+        )
+        yaml_store.save_agent_cards([_card_fixture()])
+
+        written = sorted(tmp_path.rglob("*.yaml"))
+        assert len(written) == 4, [str(p) for p in written]
+        for path in written:
+            assert "!!python/" not in path.read_text(), path
+
+    def test_the_atomic_write_path_refuses_it_too(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """AC#1's other half: ``_atomic_write``, not ``save_event``.
+
+        The guard above cannot see which dumper ``_atomic_write`` uses — every
+        payload the suite writes through it is representable, and the two
+        dumpers agree on all of those. Measured: reverting that one call to
+        ``yaml.dump`` and leaving ``save_event`` alone left the whole package
+        suite green. So this write site had no guard at all, for exactly the
+        reason AC#8 gives about the round-trip one.
+
+        It also pins what Task 3 asserted only in a prose comment: the existing
+        ``except BaseException`` leaves the previous good document in place and
+        unlinks the temp, so a refusal costs nothing that was already on disk.
+        """
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="a1"))
+        state_path = tmp_path / str(team_id) / "states" / "a1.yaml"
+        before = state_path.read_bytes()
+
+        with pytest.raises(yaml.YAMLError):
+            yaml_store.save_agent_state(
+                make_agent_state_snapshot(team_id=team_id, agent_id="a1", state=_LeakyState())
+            )
+
+        assert state_path.read_bytes() == before
+        assert not list(state_path.parent.glob("*.tmp"))
+
+    # --- (b) Round trip — the guard Task 9 mutates ---------------------------
+
+    def test_anything_the_writer_accepts_the_reader_reads_back(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """The story's title, stated as one falsifiable property.
+
+        Not "every event survives" — an event carrying an unrepresentable value
+        is *supposed* to be refused, and a guard that only writes representable
+        payloads cannot tell the two dumpers apart: they agree on everything a
+        plain ``UserMessage`` contains. That guard passes with ``yaml.dump``
+        restored, which makes it a test of the model rather than of the pair.
+
+        The property that does separate them is the asymmetry itself: **a write
+        the store ACCEPTS must be a write the store can read back.** Refusing is
+        a legal outcome; accepting-then-failing-to-read is not. Restore
+        ``yaml.dump`` and the leaky event is accepted, the log gains a
+        ``!!python/`` tag, and ``load_events`` raises instead of returning it.
+        """
+        team_id = uuid.uuid4()
+        candidates = [
+            make_persisted_event(team_id=team_id, sequence=1),
+            _leaky_event(team_id, sequence=2),
+            make_persisted_event(team_id=team_id, sequence=3),
+        ]
+
+        accepted: list[int] = []
+        for event in candidates:
+            try:
+                yaml_store.save_event(event)
+            except yaml.YAMLError:
+                # Refused at write time, while the data was still in hand.
+                continue
+            accepted.append(event.sequence)
+
+        # Whatever the store took, it must hand back — through the real reader.
+        assert [e.sequence for e in yaml_store.load_events(team_id)] == accepted
+        assert accepted == [1, 3]
+
+    def test_written_events_read_back_through_the_real_pair(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """Write through ``save_event``, read through ``load_events``, lose nothing.
+
+        Deliberately the real writer and the real reader, never a model
+        comparison: the defect lived *between* them, in the dialect mismatch, and
+        a model round-trip cannot see it.
+        """
+        team_id = uuid.uuid4()
+        written = [make_persisted_event(team_id=team_id, sequence=n) for n in (1, 2, 3)]
+        for event in written:
+            yaml_store.save_event(event)
+
+        loaded = yaml_store.load_events(team_id)
+
+        assert [e.sequence for e in loaded] == [1, 2, 3]
+        assert [str(e.event.id) for e in loaded] == [str(e.event.id) for e in written]
+
+    # --- (c) A log that will not parse raises --------------------------------
+
+    @pytest.mark.parametrize(
+        "content",
+        [_PYTHON_TAGGED_LOG, "{{invalid: yaml: [}"],
+        ids=["python-tag", "malformed"],
+    )
+    def test_an_unparseable_log_raises_on_both_paths(self, tmp_path: Path, content: str) -> None:
+        """With a cursor and without one — the no-cursor path is the resume path.
+
+        ``ports.py`` already stated the rule for the cursor path ("MUST fail
+        loudly, never silently degrade"). The no-cursor path did exactly what
+        that forbids, at the one call site where it matters.
+        """
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "events.yaml").write_text(content)
+
+        with pytest.raises(EventLogUnreadableError, match=str(team_id)):
+            store.load_events(team_id)
+        with pytest.raises(EventLogUnreadableError, match=str(team_id)):
+            store.load_events(team_id, after_event_id=uuid.uuid4())
+
+    def test_an_unparseable_log_is_not_a_stale_cursor(self, tmp_path: Path) -> None:
+        """The new error must NOT be catchable as ``EventNotFoundError``.
+
+        The infra read path reads ``EventNotFoundError`` as "your cursor is
+        stale, resync from the top". An unreadable log answering with that type
+        sends a client into a resync loop against a log that will never parse —
+        the failure mode this story exists to remove, wearing a different mask.
+        """
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "events.yaml").write_text(_PYTHON_TAGGED_LOG)
+
+        assert not issubclass(EventLogUnreadableError, EventNotFoundError)
+        assert not issubclass(EventLogUnreadableError, LookupError)
+        assert not issubclass(EventLogUnreadableError, ValueError)
+        with pytest.raises(EventLogUnreadableError):
+            store.load_events(team_id, after_event_id=uuid.uuid4())
+
+    def test_get_max_sequence_propagates_rather_than_answering_zero(self, tmp_path: Path) -> None:
+        """Answering 0 would restart numbering over a log still on disk."""
+        store = YamlEventStore(tmp_path)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        (team_dir / "events.yaml").write_text(_PYTHON_TAGGED_LOG)
+
+        with pytest.raises(EventLogUnreadableError):
+            store.get_max_sequence(team_id)
+
+    # --- (d) Regression surface, both halves ---------------------------------
+
+    def test_an_absent_log_is_still_an_empty_log(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """An absent file and an unparseable one must not share an answer."""
+        team_id = uuid.uuid4()
+        (tmp_path / str(team_id)).mkdir()
+
+        assert yaml_store.load_events(team_id) == []
+        with pytest.raises(EventNotFoundError):
+            yaml_store.load_events(team_id, after_event_id=uuid.uuid4())
+
+    def test_an_intact_log_still_loads_every_event_in_sequence_order(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """Written out of order, read back in order, nothing dropped."""
+        team_id = uuid.uuid4()
+        for sequence in (3, 1, 4, 2):
+            yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=sequence))
+
+        assert [e.sequence for e in yaml_store.load_events(team_id)] == [1, 2, 3, 4]
+
+    def test_a_document_that_parses_but_fails_validation_is_still_skipped(
+        self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC#5: per-document tolerance is deliberate and survives this change.
+
+        One event lost rather than the whole log. This is a *different* fact
+        from a log that will not parse, and it keeps its own answer.
+        """
+        team_id = uuid.uuid4()
+        yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=1))
+        events_path = tmp_path / str(team_id) / "events.yaml"
+        with open(events_path, "a") as handle:
+            handle.write("---\nsequence: not-an-int\n")
+        yaml_store.save_event(make_persisted_event(team_id=team_id, sequence=2))
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            loaded = yaml_store.load_events(team_id)
+
+        assert [e.sequence for e in loaded] == [1, 2]
+        assert any("Skipping corrupted event" in r.getMessage() for r in caplog.records)

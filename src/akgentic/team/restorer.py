@@ -452,6 +452,17 @@ class TeamRestorer:
         # See ADR-010.
         agent_starts.sort(key=lambda sm: sm.config.role != _TOOL_ACTOR_ROLE)
 
+        # Two different faults, two different messages. "No orchestrator" used
+        # to be the answer to both, so an event store that handed back an empty
+        # list — which it did for any log it could not parse — sent the operator
+        # looking at the orchestrator for a fault in persistence. The store now
+        # raises rather than returning [] for an unreadable log, but an empty
+        # list remains reachable (a team directory with no events.yaml), and it
+        # still deserves to be named for what it is.
+        if not events:
+            msg = f"No events found for team {team_id}: the event log is empty"
+            raise ValueError(msg)
+
         if orchestrator_start is None:
             msg = f"No Orchestrator StartMessage found for team {team_id}"
             raise ValueError(msg)

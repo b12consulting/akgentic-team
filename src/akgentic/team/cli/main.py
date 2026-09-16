@@ -21,7 +21,7 @@ from rich.console import Console
 
 from akgentic.team.cli._output import OutputFormat, render
 from akgentic.team.models import TeamCard, TeamStatus
-from akgentic.team.ports import EventStore
+from akgentic.team.ports import EventLogUnreadableError, EventStore
 
 if TYPE_CHECKING:
     from akgentic.team.manager import TeamManager
@@ -234,7 +234,15 @@ def inspect_cmd(
         )
         raise typer.Exit(code=1)
 
-    event_count = len(event_store.load_events(parsed_id))
+    try:
+        event_count = len(event_store.load_events(parsed_id))
+    except EventLogUnreadableError as exc:
+        # Printing "0 events" for a log that is on disk and will not parse is
+        # the same silent lie this command exists to help diagnose. Say what
+        # went wrong and exit non-zero, so a script calling `inspect` notices.
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
     agent_state_count = len(event_store.load_agent_states(parsed_id))
 
     render(

@@ -29,6 +29,7 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import (
     AgentCardNotFoundError,
+    EventLogUnreadableError,
     EventNotFoundError,
     EventStore,
     NullServiceRegistry,
@@ -54,6 +55,7 @@ __all__: list[str] = [
     "AgentCardRef",
     "AgentRef",
     "AgentStateSnapshot",
+    "EventLogUnreadableError",
     "EventNotFoundError",
     "EventStore",
     "NullServiceRegistry",
