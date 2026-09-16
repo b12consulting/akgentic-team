@@ -53,6 +53,16 @@ exercised by writing past it, per backend, exactly where that backend reads.
 """
 
 
+DamagedAgentCardSeeder = Callable[[str], None]
+"""Writes one card blob whose PAYLOAD is beyond reading, under a known hash.
+
+Not the same damage as a payload no ``AgentCard`` validates: this is a blob the
+backend's own reader raises on. Each backend gets its native form of it -- bytes
+PyYAML refuses, a value that is not a document at all -- because the point of
+the contract is that the hash survives the payload in all three.
+"""
+
+
 def stale_agent_state_document(
     team_id: uuid.UUID, agent_id: str, class_path: str
 ) -> dict[str, Any]:
@@ -233,6 +243,54 @@ def seed_raw_agent_card(
             trn.execute(
                 "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
                 (card_hash, json.dumps(card_payload)),
+            )
+
+    return _seed
+
+
+@pytest.fixture
+def seed_damaged_agent_card(
+    request: pytest.FixtureRequest,
+    event_store: EventStore,
+    tmp_path: Path,
+) -> DamagedAgentCardSeeder:
+    """Return a function that plants a blob whose payload is beyond reading.
+
+    What a crash mid-write leaves behind. The damage has to be spelled per
+    backend because "unreadable" is a property of the backend's reader: PyYAML
+    raises on bytes that are not a document, while BSON and JSONB always parse,
+    so their nearest truth is a payload that is not a card document at all. In
+    every case the hash is written where that backend keeps it -- the file name,
+    the ``card_hash`` field, the ``card_hash`` column -- which is the whole
+    point: the key outlives the payload, so the blob stays nameable.
+    """
+    del event_store  # requested so the backend's storage exists and is clean
+    backend: str = request.node.callspec.params["event_store"]
+
+    def _seed(card_hash: str) -> None:
+        if backend == "yaml":
+            from akgentic.team.repositories.yaml import CARDS_DIRNAME
+
+            cards_dir = tmp_path / CARDS_DIRNAME
+            cards_dir.mkdir(parents=True, exist_ok=True)
+            # Not YAML at all: safe_load raises rather than returning a mapping.
+            (cards_dir / f"{card_hash}.yaml").write_text("{[not: yaml")
+            return
+        if backend == "mongo":
+            mongo_db = request.getfixturevalue("mongo_db")
+            from akgentic.team.repositories.mongo import AGENT_CARDS_COLLECTION
+
+            mongo_db[AGENT_CARDS_COLLECTION].insert_one(
+                {"card_hash": card_hash, "card": "{[not: yaml"}
+            )
+            return
+        conn = request.getfixturevalue("postgres_clean_tables")
+        from nagra import Transaction  # type: ignore[import-untyped]
+
+        with Transaction(conn) as trn:
+            trn.execute(
+                "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
+                (card_hash, json.dumps("{[not: yaml")),
             )
 
     return _seed

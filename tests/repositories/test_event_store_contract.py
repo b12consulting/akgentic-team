@@ -46,6 +46,7 @@ from tests.models.conftest import (
     to_legacy_document,
 )
 from tests.repositories.conftest import (
+    DamagedAgentCardSeeder,
     RawAgentCardSeeder,
     RawAgentStateSeeder,
     RawTeamSeeder,
@@ -1473,6 +1474,29 @@ class TestAgentCardStoreContract:
         seed_raw_agent_card(card_hash, {"not": "a card"})
 
         assert {e.card_hash for e in event_store.list_agent_card_entries()} == {card_hash}
+        assert event_store.load_agent_cards([card_hash]) == {}
+
+    def test_a_blob_whose_payload_will_not_read_still_enumerates(
+        self, event_store: EventStore, seed_damaged_agent_card: DamagedAgentCardSeeder
+    ) -> None:
+        """A blob damaged past its backend's own reader is still one the store holds.
+
+        One step past the case above: there the payload parsed and merely was
+        not a card, here the reader itself raises on it — the file a crash
+        mid-write leaves behind. The key lives outside the payload in all three
+        backends (the file name, the ``card_hash`` field, the ``card_hash``
+        column), so the blob stays nameable however rotten its bytes are, and a
+        backend that dropped it would make it unreclaimable forever. That is the
+        one hole this store exists to close, and it is worth holding all three
+        to: two of them satisfy it by construction, and the third did not.
+        """
+        card_hash = "b" * 64
+        seed_damaged_agent_card(card_hash)
+
+        entries = event_store.list_agent_card_entries()
+
+        assert [(e.card_hash, e.first_seen_at) for e in entries] == [(card_hash, None)]
+        # The other half, which proves the payload really is beyond reading.
         assert event_store.load_agent_cards([card_hash]) == {}
 
     def test_save_list_and_load_agree_on_the_hash(self, event_store: EventStore) -> None:

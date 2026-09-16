@@ -753,6 +753,22 @@ class YamlEventStore:
         blob it holds, and must not become an entry a consumer then tries to
         reclaim.
 
+        A file that cannot be read splits two ways, and the split is the whole
+        point — under-reporting is the unsafe direction here, because a blob the
+        enumeration omits is one no sweep can ever reclaim:
+
+        * **The bytes are junk** — ``yaml.YAMLError``, a non-UTF-8 file, or any
+          other read failure on a file that is there. The hash is the *file
+          name*, already validated above, so it is known even though nothing
+          inside is: the entry is reported with ``first_seen_at=None``. A card
+          half-written by a crash mid-``_atomic_write`` is exactly the blob a
+          sweep exists to reclaim, and Mongo and Postgres enumerate their
+          equivalent by construction — their key lives outside the payload.
+        * **The file is gone** — ``FileNotFoundError``, i.e. it was deleted
+          between the directory listing and the read. That blob is not one this
+          store still holds, and reporting it would invent a blob rather than
+          omit one; a concurrent delete is a reclaim that already happened.
+
         Returns:
             One entry per card file, unordered; ``[]`` when the directory is
             absent or holds none. A bare pre-envelope file reports
@@ -768,8 +784,15 @@ class YamlEventStore:
             try:
                 with open(card_path) as f:
                     document = yaml.safe_load(f)
+            except FileNotFoundError:
+                # Gone between the listing and the read: not a blob still held.
+                logger.debug("Agent card file %s vanished during enumeration", card_path.name)
+                continue
             except (OSError, yaml.YAMLError, ValueError) as exc:
-                logger.error("Skipping unreadable agent card file %s: %s", card_path.name, exc)
+                # The blob is there and its hash is its name; only the bytes are
+                # beyond reading, so the stamp — and only the stamp — is unknown.
+                logger.error("Enumerating unreadable agent card file %s: %s", card_path.name, exc)
+                entries.append(AgentCardEntry(card_hash=card_path.stem, first_seen_at=None))
                 continue
             entries.append(
                 AgentCardEntry(

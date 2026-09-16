@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from akgentic.team.models import PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories import yaml as yaml_repository
 from akgentic.team.repositories.yaml import (
     CARD_ENVELOPE_KEY,
     CARD_FIRST_SEEN_KEY,
@@ -874,22 +875,62 @@ class TestYamlAgentCardStoreLayout:
 
         assert [e.card_hash for e in entries] == [hash_agent_card(_card_fixture())]
 
-    def test_an_unparseable_card_file_is_skipped_by_the_enumeration(
+    def test_an_unparseable_card_file_still_enumerates_with_an_unknown_stamp(
         self,
         yaml_store: YamlEventStore,
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Logged and skipped, as everywhere else in this module."""
+        """Logged, and reported anyway — the hash is the file name, not the bytes.
+
+        ``load_agent_cards`` skips a corrupted card because the caller asked for
+        a card and there is none. The enumeration is asked what the store
+        *holds*, and it holds this blob: a file damaged by a crash mid-write is
+        exactly what a sweep exists to reclaim, and dropping it here is what
+        makes it unreclaimable forever. Mongo and Postgres enumerate the
+        equivalent blob by construction — their key lives outside the payload —
+        so a YAML store that omitted it would be the one backend with a hole.
+        """
         card = _card_fixture()
         yaml_store.save_agent_cards([card])
-        (tmp_path / CARDS_DIRNAME / f"{hash_agent_card(card)}.yaml").write_text("{[not: yaml")
+        card_hash = hash_agent_card(card)
+        (tmp_path / CARDS_DIRNAME / f"{card_hash}.yaml").write_text("{[not: yaml")
 
         with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
             entries = yaml_store.list_agent_card_entries()
 
-        assert entries == []
+        assert [(e.card_hash, e.first_seen_at) for e in entries] == [(card_hash, None)]
         assert [r for r in caplog.records if "unreadable agent card" in r.getMessage()]
+        # The other half: the payload really is junk, so the card does not load.
+        assert yaml_store.load_agent_cards([card_hash]) == {}
+
+    def test_a_card_file_that_vanishes_mid_enumeration_is_not_reported_as_held(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The one read failure that is NOT enumerated, and the reason it differs.
+
+        An unreadable file is still a blob the store holds; a deleted one is
+        not. Reporting it would invent a blob rather than omit one, and a delete
+        landing between the listing and the read is a reclaim that has already
+        happened.
+        """
+        yaml_store.save_agent_cards([_card_fixture()])
+        card_path = tmp_path / CARDS_DIRNAME / f"{hash_agent_card(_card_fixture())}.yaml"
+        real_open = open
+
+        def _delete_then_open(file: object, *args: object, **kwargs: object) -> object:
+            """Stand in for a concurrent reclaim landing inside the read window."""
+            card_path.unlink(missing_ok=True)
+            return real_open(file, *args, **kwargs)  # type: ignore[call-overload]
+
+        # Injected as a module global, which shadows the builtin for this module
+        # alone: a builtins-wide patch would also intercept pytest's own reads.
+        monkeypatch.setattr(yaml_repository, "open", _delete_then_open, raising=False)
+
+        assert yaml_store.list_agent_card_entries() == []
 
     def test_enumerating_an_absent_card_directory_is_empty_not_an_error(
         self, yaml_store: YamlEventStore, tmp_path: Path
