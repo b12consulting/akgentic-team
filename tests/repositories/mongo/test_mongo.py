@@ -1308,6 +1308,43 @@ class TestMongoAgentCardStore:
         assert again is not None
         assert again["first_seen_at"] == first_seen
 
+    def test_the_write_puts_the_stamp_in_the_insert_only_half(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """The same asymmetry as the spec above, asserted without a clock.
+
+        The stored-document spec can only see a last-written stamp when
+        measurable time passes between the two saves: BSON truncates to
+        milliseconds, so two saves inside one tick write a byte-identical value
+        and the mutation survives. It is guarded there by a ``time.sleep``,
+        which makes the mutation detectable rather than making the assertion
+        independent of timing.
+
+        This is the Mongo counterpart of
+        ``TestAgentCardStatementShape::test_the_insert_names_the_stamp_and_the_do_update_does_not``:
+        it reads the operators the driver is handed, so it fails on ``$set`` in
+        place of ``$setOnInsert`` however fast the machine runs and however many
+        saves land in one tick.
+        """
+        collection = mongo_db[AGENT_CARDS_COLLECTION]
+        real_update_one = type(collection).update_one
+        updates: list[Any] = []
+
+        def recording_update_one(self: Any, *args: Any, **kwargs: Any) -> Any:
+            updates.append(args[1] if len(args) > 1 else kwargs.get("update"))
+            return real_update_one(self, *args, **kwargs)
+
+        with patch.object(type(collection), "update_one", recording_update_one):
+            mongo_store.save_agent_cards([_card_fixture()])
+
+        assert len(updates) == 1
+        update = updates[0]
+        assert "first_seen_at" in update["$setOnInsert"], update
+        assert "first_seen_at" not in update.get("$set", {}), (
+            f"the stamp rides the rewritten half, making it last-written: {update}"
+        )
+        assert "card" in update["$set"], update
+
     def test_the_enumeration_projects_the_card_field_away(
         self, mongo_store: MongoEventStore, mongo_db: Any
     ) -> None:
