@@ -67,3 +67,16 @@ class ReferenceTeamMetadata(TeamMetadata):
         description="Service tier the team runs under.",
     )
     note: str = ""
+
+
+class FolderTeamMetadata(TeamMetadata):
+    folder: str = Field(
+        default="Documents",
+        pattern=r"^[a-zA-Z][a-zA-Z0-9-]{2,31}$",
+        json_schema_extra={"indexed": True},
+        description="Workspace folder",
+    )
+    description: str | None = Field(
+        default=None,
+        description="Descsription of the workspace folder"
+    )
