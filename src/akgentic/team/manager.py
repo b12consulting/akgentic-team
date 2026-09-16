@@ -337,6 +337,13 @@ class TeamManager:
         Raises:
             ValueError: If the team is not found, is currently RUNNING,
                 or is already DELETED.
+            EventLogUnreadableError: If the team HAS a stored event log and it
+                cannot be parsed. Propagated from ``get_max_sequence`` below,
+                which is reached before any actor is spawned — so the resume
+                aborts with nothing to roll back, and the operator is told the
+                event store is at fault rather than the orchestrator. This is
+                the entry point an out-of-package caller reaches the error
+                through, which is why it is exported from ``akgentic.team``.
         """
         process = self._event_store.load_team(team_id)
         if process is None:

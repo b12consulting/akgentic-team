@@ -33,6 +33,7 @@ import pytest
 import yaml
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
+from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from pydantic import BaseModel, Field
 
@@ -850,6 +851,17 @@ class _LeakyMessage(Message):
     payload: _PlainNested = Field(default_factory=_PlainNested)
 
 
+class _LeakyState(BaseState):
+    """The same leak, on the other write path.
+
+    ``save_event`` is not the only writer: ``_atomic_write`` backs team.yaml,
+    ``states/`` and ``agent_cards/``, and AC#1 covers it too. A snapshot is the
+    shortest public route to it that can carry a value the safe dumper refuses.
+    """
+
+    payload: _PlainNested = Field(default_factory=_PlainNested)
+
+
 def _leaky_event(team_id: uuid.UUID, sequence: int = 1) -> PersistedEvent:
     return PersistedEvent(
         team_id=team_id,
@@ -955,6 +967,35 @@ class TestTheWriterRefusesWhatTheReaderWouldRefuse:
         assert len(written) == 4, [str(p) for p in written]
         for path in written:
             assert "!!python/" not in path.read_text(), path
+
+    def test_the_atomic_write_path_refuses_it_too(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """AC#1's other half: ``_atomic_write``, not ``save_event``.
+
+        The guard above cannot see which dumper ``_atomic_write`` uses — every
+        payload the suite writes through it is representable, and the two
+        dumpers agree on all of those. Measured: reverting that one call to
+        ``yaml.dump`` and leaving ``save_event`` alone left the whole package
+        suite green. So this write site had no guard at all, for exactly the
+        reason AC#8 gives about the round-trip one.
+
+        It also pins what Task 3 asserted only in a prose comment: the existing
+        ``except BaseException`` leaves the previous good document in place and
+        unlinks the temp, so a refusal costs nothing that was already on disk.
+        """
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="a1"))
+        state_path = tmp_path / str(team_id) / "states" / "a1.yaml"
+        before = state_path.read_bytes()
+
+        with pytest.raises(yaml.YAMLError):
+            yaml_store.save_agent_state(
+                make_agent_state_snapshot(team_id=team_id, agent_id="a1", state=_LeakyState())
+            )
+
+        assert state_path.read_bytes() == before
+        assert not list(state_path.parent.glob("*.tmp"))
 
     # --- (b) Round trip — the guard Task 9 mutates ---------------------------
 
