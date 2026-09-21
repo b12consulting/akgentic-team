@@ -10,13 +10,17 @@ drift fails a test instead of going unnoticed.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from akgentic.team.models import TeamStatus
+from akgentic.team.projection import hash_agent_card, storable_agent_card
 from tests.models.conftest import AcmeTeamMetadata, make_indexed_process, make_process
 from tests.repositories.test_event_store_contract import (
     METADATA_FILTER_IDS,
     METADATA_FILTER_MATRIX,
+    _make_card,
     build_metadata_fixture_set,
 )
 from tests.services.conftest import InMemoryEventStore
@@ -220,3 +224,68 @@ class TestInMemoryEventStoreMatchesTheSharedMatrix:
 
         with pytest.raises(TypeError, match="tenant"):
             store.list_teams(metadata={"tenant": "acme"})  # type: ignore[dict-item]
+
+
+class TestInMemoryEventStoreCardEnumeration:
+    """The fake's card store must answer what the real backends would answer.
+
+    The conformance sweep proves the method EXISTS; only a spec proves it does
+    not lie. A fake that returned a constant — always ``None``, always ``now`` —
+    would pass the sweep and could never fail a test the real backends fail,
+    which is the exact shape of drift this module was written for.
+    """
+
+    def test_an_empty_store_enumerates_to_nothing(self) -> None:
+        assert InMemoryEventStore().list_agent_card_entries() == []
+
+    def test_every_saved_card_enumerates_once_with_a_tz_aware_stamp(self) -> None:
+        store = InMemoryEventStore()
+        cards = [_make_card("lead", "Lead"), _make_card("writer", "Writer")]
+
+        store.save_agent_cards(cards)
+
+        entries = store.list_agent_card_entries()
+        assert {e.card_hash for e in entries} == {hash_agent_card(c) for c in cards}
+        for entry in entries:
+            assert entry.first_seen_at is not None
+            assert entry.first_seen_at.tzinfo is not None
+
+    def test_a_re_save_does_not_move_the_stamp(self) -> None:
+        """Insert-only, as on all three real backends — ``setdefault``, not assignment.
+
+        Mutation-verified: an assignment in ``save_agent_cards`` turns this red
+        and nothing else in the suite.
+        """
+        store = InMemoryEventStore()
+        card = _make_card("lead", "Lead")
+        store.save_agent_cards([card])
+        (first,) = store.list_agent_card_entries()
+
+        time.sleep(0.01)
+        store.save_agent_cards([card])
+        store.save_agent_cards([card, _make_card("writer", "Writer")])
+
+        entries = {e.card_hash: e for e in store.list_agent_card_entries()}
+        assert entries[first.card_hash].first_seen_at == first.first_seen_at
+
+    def test_a_blob_planted_without_a_stamp_enumerates_as_unknown(self) -> None:
+        """The fake's version of a pre-existing blob: a key with no stamp beside it."""
+        store = InMemoryEventStore()
+        card = _make_card("lead", "Lead")
+        store.agent_cards[hash_agent_card(card)] = storable_agent_card(card)
+
+        (entry,) = store.list_agent_card_entries()
+
+        assert entry.first_seen_at is None
+
+    def test_re_saving_an_unstamped_blob_does_not_stamp_it(self) -> None:
+        store = InMemoryEventStore()
+        card = _make_card("lead", "Lead")
+        card_hash = hash_agent_card(card)
+        store.agent_cards[card_hash] = storable_agent_card(card)
+        store.agent_card_first_seen[card_hash] = None
+
+        store.save_agent_cards([card])
+
+        (entry,) = store.list_agent_card_entries()
+        assert entry.first_seen_at is None

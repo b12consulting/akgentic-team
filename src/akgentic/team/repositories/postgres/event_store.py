@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the eleven :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the twelve :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -19,12 +19,19 @@ import json
 import logging
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 
 from nagra import Transaction  # type: ignore[import-untyped]
 
 from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
+from akgentic.team.models import (
+    AgentCardEntry,
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamStatus,
+)
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
@@ -431,6 +438,10 @@ class NagraEventStore:
         provisions that key from ``schema.toml``, which is what makes the
         ``ON CONFLICT`` target valid.
 
+        The ``INSERT`` names ``first_seen_at``; the ``DO UPDATE`` deliberately
+        does NOT. That asymmetry is the whole mechanism — see the comment at the
+        statement.
+
         The whole batch runs in ONE transaction, so a team's cards land
         together or not at all.
 
@@ -439,14 +450,22 @@ class NagraEventStore:
         """
         if not cards:
             return
+        now = datetime.now(UTC)
         with Transaction(self._conn_string) as trn:
             for card in cards:
                 storable = storable_agent_card(card)
                 trn.execute(
-                    "INSERT INTO agent_card_entries (card_hash, data) "
-                    "VALUES (%s, %s) "
+                    # The DO UPDATE sets `data` and NOTHING else. `first_seen_at`
+                    # survives an upsert BY OMISSION: an existing row keeps the
+                    # value it was inserted with, and a row that predates the
+                    # column keeps its NULL. Naming it here "for completeness"
+                    # silently converts first-seen into last-written -- a blob a
+                    # live fleet keeps re-saving would then never be old enough
+                    # to reclaim, and every spec but the second-team one passes.
+                    "INSERT INTO agent_card_entries (card_hash, data, first_seen_at) "
+                    "VALUES (%s, %s, %s) "
                     "ON CONFLICT (card_hash) DO UPDATE SET data = EXCLUDED.data",
-                    (hash_agent_card(storable), json.dumps(storable.model_dump())),
+                    (hash_agent_card(storable), json.dumps(storable.model_dump()), now),
                 )
 
     def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
@@ -489,3 +508,23 @@ class NagraEventStore:
             except (ValueError, TypeError) as exc:
                 logger.error("Skipping corrupted agent card %s: %s", row[0], exc)
         return resolved
+
+    def list_agent_card_entries(self) -> list[AgentCardEntry]:
+        """Enumerate the card store with a two-column ``SELECT``.
+
+        ``data`` is deliberately not in the projection: the statement never
+        pulls a card payload back, and nothing here validates one. A row whose
+        card no longer parses still enumerates — it is precisely the kind of
+        blob a sweep exists to reclaim.
+
+        ``first_seen_at`` is a ``TIMESTAMPTZ``, so psycopg returns it tz-aware
+        already and it needs none of ``decode_jsonb_column``'s handling. A row
+        written before the column existed holds ``NULL`` and reports ``None``.
+
+        Returns:
+            One entry per stored row, unordered; ``[]`` for an empty table.
+        """
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute("SELECT card_hash, first_seen_at FROM agent_card_entries")
+            rows = cursor.fetchall()
+        return [AgentCardEntry(card_hash=row[0], first_seen_at=row[1]) for row in rows]

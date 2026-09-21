@@ -16,6 +16,7 @@ from akgentic.team.metadata import (
     make_index_prefix_groups,
 )
 from akgentic.team.models import (
+    AgentCardEntry,
     AgentCardRef,
     AgentRef,
     AgentStateSnapshot,
@@ -51,6 +52,7 @@ __version__ = "1.0.0-alpha.2"
 
 __all__: list[str] = [
     "__version__",
+    "AgentCardEntry",
     "AgentCardNotFoundError",
     "AgentCardRef",
     "AgentRef",

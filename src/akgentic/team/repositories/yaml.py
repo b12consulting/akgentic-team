@@ -28,6 +28,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,13 @@ import yaml
 
 from akgentic.core.agent_card import AgentCard
 from akgentic.team.metadata import make_index_prefix_groups
-from akgentic.team.models import AgentStateSnapshot, PersistedEvent, Process, TeamStatus
+from akgentic.team.models import (
+    AgentCardEntry,
+    AgentStateSnapshot,
+    PersistedEvent,
+    Process,
+    TeamStatus,
+)
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 
@@ -48,8 +55,61 @@ Public because ``list_teams`` must skip it by name and tests assert the layout.
 A team directory is always a UUID, so the two namespaces cannot collide.
 """
 
+CARD_ENVELOPE_KEY = "card"
+"""Key holding the card payload inside a card file's envelope.
+
+Also the **discriminator** between the two shapes a card file can have. A file
+written before the envelope existed *is* the bare card, whose top-level keys are
+``AgentCard``'s own — ``agent_class``, ``skills``, ``description``, ``config``,
+``can_be_hired``, ``metadata`` and the ``__model__`` tag. None of them is
+``card``, so its presence cannot be confused with a bare card. Public because
+the YAML layout specs assert it.
+"""
+
+CARD_FIRST_SEEN_KEY = "first_seen_at"
+"""Key holding the first-seen stamp inside a card file's envelope.
+
+Written once, when the file is created, and carried forward verbatim by every
+later save. Public for the same reason as :data:`CARD_ENVELOPE_KEY`.
+
+The file's mtime is NOT a substitute: ``_atomic_write`` rewrites the file
+wholesale on every save, so the mtime moves exactly when this must not.
+"""
+
 _HEX_DIGITS = frozenset("0123456789abcdef")
 _CARD_HASH_LENGTH = 64
+
+
+def _read_card_document(document: object) -> tuple[object, datetime | None]:
+    """Split one loaded card file into its card payload and its stamp.
+
+    THE reader for both shapes a card file can have, used by
+    ``load_agent_cards`` and ``list_agent_card_entries`` alike so the two can
+    never disagree about what a legacy file means:
+
+    * an **envelope** — ``{card: ..., first_seen_at: ...}`` — which every save
+      since the stamp landed writes;
+    * a **bare card**, which is every card file written before it and therefore
+      every card file in every deployment today. It is NOT corrupted, and must
+      not be logged as such; it simply has no stamp, so its age is unknown.
+
+    A stamp that is not a datetime — absent, or some other type from a foreign
+    writer — reads as ``None``, never as an epoch: unknown age, which a consumer
+    must treat as too young to reclaim.
+
+    Returns:
+        ``(card_payload, first_seen_at)``. The payload is handed on unvalidated;
+        the caller decides whether it needs to be an ``AgentCard``.
+    """
+    if not isinstance(document, Mapping) or CARD_ENVELOPE_KEY not in document:
+        return document, None
+    stamp = document.get(CARD_FIRST_SEEN_KEY)
+    if not isinstance(stamp, datetime):
+        return document[CARD_ENVELOPE_KEY], None
+    # PyYAML hands back a tz-aware value for the offset this module writes; a
+    # naive one can only come from a file written by something else, and UTC is
+    # the only zone this store ever stamps in.
+    return document[CARD_ENVELOPE_KEY], stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
 
 def _is_card_hash(value: str) -> bool:
@@ -576,6 +636,19 @@ class YamlEventStore:
         ``_atomic_write``, so a half-written file left by an earlier crash heals
         on the next save instead of being trusted forever.
 
+        The file is an **envelope** — the card under :data:`CARD_ENVELOPE_KEY`
+        and a first-seen stamp beside it. Because ``_atomic_write`` rewrites the
+        file wholesale, the save must READ the existing stamp and carry it
+        forward; only a file that does not exist yet is stamped with ``now``.
+        That is this backend's expression of Mongo's ``$setOnInsert`` and
+        Postgres' survives-by-omission ``DO UPDATE``, and it is what keeps the
+        stamp first-seen rather than last-written.
+
+        A file that exists but carries no readable stamp — every card file
+        written before the envelope, and any file too damaged to parse — is
+        rewritten WITHOUT one. Stamping it here would be a backfill by the back
+        door, claiming a first sight the store never had.
+
         Args:
             cards: The cards to persist. An empty list touches no filesystem.
         """
@@ -586,8 +659,36 @@ class YamlEventStore:
         for card in cards:
             storable = storable_agent_card(card)
             card_path = cards_dir / f"{hash_agent_card(storable)}.yaml"
-            self._atomic_write(card_path, storable.model_dump())
+            first_seen = (
+                self._existing_first_seen(card_path)
+                if card_path.exists()
+                else datetime.now(UTC)
+            )
+            self._atomic_write(
+                card_path,
+                {
+                    CARD_ENVELOPE_KEY: storable.model_dump(),
+                    CARD_FIRST_SEEN_KEY: first_seen,
+                },
+            )
         logger.debug("Saved %d agent cards to %s", len(cards), cards_dir)
+
+    @staticmethod
+    def _existing_first_seen(card_path: Path) -> datetime | None:
+        """Return the stamp already on disk at *card_path*, or ``None``.
+
+        ``None`` covers a bare pre-envelope file, an envelope whose stamp is
+        absent, and a file that will not parse at all — all of which are ages
+        this store does not know. Unknown fails closed downstream (too young to
+        reclaim), so guessing here would be the one unsafe direction.
+        """
+        try:
+            with open(card_path) as f:
+                document = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            logger.warning("Could not read existing card file %s: %s", card_path.name, exc)
+            return None
+        return _read_card_document(document)[1]
 
     def load_agent_cards(self, hashes: list[str]) -> dict[str, AgentCard]:
         """Resolve card hashes against the card directory, one read per hash.
@@ -598,6 +699,12 @@ class YamlEventStore:
         with a log exactly as a corrupted team or state file is — either way it
         surfaces as ``AgentCardNotFoundError`` at resolution rather than as an
         exception escaping the store.
+
+        Both file shapes resolve, through :func:`_read_card_document`: the
+        envelope this backend writes today, and the bare card every deployment's
+        store is full of. A bare file is NOT corrupted and is not logged as
+        such — a reader that assumed the envelope would turn every existing card
+        into FR14's loud failure for a reason that is not the card's fault.
 
         Args:
             hashes: The content hashes to resolve; empty returns ``{}``.
@@ -622,7 +729,8 @@ class YamlEventStore:
                 continue
             try:
                 with open(card_path) as f:
-                    resolved[card_hash] = AgentCard.model_validate(yaml.safe_load(f))
+                    payload, _ = _read_card_document(yaml.safe_load(f))
+                resolved[card_hash] = AgentCard.model_validate(payload)
             except (yaml.YAMLError, ValueError) as exc:
                 # ValueError covers both a non-UTF-8 file (UnicodeDecodeError
                 # out of the text stream) and Pydantic's ValidationError, the
@@ -630,3 +738,67 @@ class YamlEventStore:
                 logger.error("Skipping corrupted agent card %s: %s", card_hash, exc)
         logger.debug("Resolved %d of %d agent cards", len(resolved), len(hashes))
         return resolved
+
+    def list_agent_card_entries(self) -> list[AgentCardEntry]:
+        """Enumerate the card directory, reading each file for its stamp only.
+
+        "One round trip" is one directory listing plus one small read per file;
+        there is no query to push down. The card payload is never validated —
+        :func:`_read_card_document` hands it back untouched and it is dropped —
+        so a blob whose card no longer parses still enumerates, which is exactly
+        the kind a sweep exists to reclaim.
+
+        File names are filtered through :func:`_is_card_hash`, the same guard
+        ``load_agent_cards`` applies: a file this store did not write is not a
+        blob it holds, and must not become an entry a consumer then tries to
+        reclaim.
+
+        A file that cannot be read splits two ways, and the split is the whole
+        point — under-reporting is the unsafe direction here, because a blob the
+        enumeration omits is one no sweep can ever reclaim:
+
+        * **The bytes are junk** — ``yaml.YAMLError``, a non-UTF-8 file, or any
+          other read failure on a file that is there. The hash is the *file
+          name*, already validated above, so it is known even though nothing
+          inside is: the entry is reported with ``first_seen_at=None``. A card
+          half-written by a crash mid-``_atomic_write`` is exactly the blob a
+          sweep exists to reclaim, and Mongo and Postgres enumerate their
+          equivalent by construction — their key lives outside the payload.
+        * **The file is gone** — ``FileNotFoundError``, i.e. it was deleted
+          between the directory listing and the read. That blob is not one this
+          store still holds, and reporting it would invent a blob rather than
+          omit one; a concurrent delete is a reclaim that already happened.
+
+        Returns:
+            One entry per card file, unordered; ``[]`` when the directory is
+            absent or holds none. A bare pre-envelope file reports
+            ``first_seen_at=None`` and is not a failure.
+        """
+        cards_dir = self._cards_dir()
+        if not cards_dir.exists():
+            return []
+        entries: list[AgentCardEntry] = []
+        for card_path in cards_dir.glob("*.yaml"):
+            if not _is_card_hash(card_path.stem):
+                continue
+            try:
+                with open(card_path) as f:
+                    document = yaml.safe_load(f)
+            except FileNotFoundError:
+                # Gone between the listing and the read: not a blob still held.
+                logger.debug("Agent card file %s vanished during enumeration", card_path.name)
+                continue
+            except (OSError, yaml.YAMLError, ValueError) as exc:
+                # The blob is there and its hash is its name; only the bytes are
+                # beyond reading, so the stamp — and only the stamp — is unknown.
+                logger.error("Enumerating unreadable agent card file %s: %s", card_path.name, exc)
+                entries.append(AgentCardEntry(card_hash=card_path.stem, first_seen_at=None))
+                continue
+            entries.append(
+                AgentCardEntry(
+                    card_hash=card_path.stem,
+                    first_seen_at=_read_card_document(document)[1],
+                )
+            )
+        logger.debug("Enumerated %d agent card entries in %s", len(entries), cards_dir)
+        return entries

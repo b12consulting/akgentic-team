@@ -81,6 +81,10 @@ def test_agent_card_entries_shape() -> None:
     A ``team_id`` column here would be the whole design gone — the store is
     shared across every team that references a card, which is what makes
     "one blob per card" and "never deleted with a team" possible at all.
+
+    ``first_seen_at`` is a ``timestamptz`` and nothing else: the type is what
+    makes psycopg hand the value back tz-aware, and a naive stamp is a silently
+    wrong subtraction at the consumer that keys a deletion on it.
     """
     schema = _load_schema()
     table = schema["agent_card_entries"]
@@ -88,4 +92,8 @@ def test_agent_card_entries_shape() -> None:
     assert table["natural_key"] == ["card_hash"]
     columns = table["columns"]
     assert isinstance(columns, dict)
-    assert columns == {"card_hash": "str", "data": "json"}
+    assert columns == {
+        "card_hash": "str",
+        "data": "json",
+        "first_seen_at": "timestamptz",
+    }

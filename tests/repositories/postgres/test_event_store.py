@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -887,3 +888,130 @@ class TestNagraAgentStateStore:
             for r in caplog.records
             if r.levelno == logging.WARNING and "agent-m" in r.getMessage()
         ], "the warning must name the skipped row's agent"
+
+
+class TestAgentCardStatementShape:
+    """The statements the card store BUILDS, independent of what they return.
+
+    ``TestMetadataStatementShape`` above is the precedent. What is asserted here
+    cannot be seen in a result: a ``DO UPDATE`` that also set ``first_seen_at``
+    returns exactly the rows the correct one does until a blob is re-saved, and
+    a ``SELECT *`` answers the same entries as a two-column one while pulling
+    every card payload over the wire.
+    """
+
+    def test_the_insert_names_the_stamp_and_the_do_update_does_not(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """The asymmetry IS the mechanism: first-seen survives an upsert by omission.
+
+        Adding ``first_seen_at`` to the ``DO UPDATE`` "for completeness" converts
+        first-seen into last-written silently, and every other Postgres spec
+        still passes.
+        """
+        NagraEventStore("postgresql://recorded/cards").save_agent_cards([_card_fixture()])
+
+        sql, params = recorded_sql[-1]
+        insert_clause, _, update_clause = sql.partition("ON CONFLICT")
+        assert "first_seen_at" in insert_clause, sql
+        assert "first_seen_at" not in update_clause, (
+            f"the DO UPDATE names the stamp, making it last-written: {sql}"
+        )
+        assert update_clause.count("SET") == 1
+        assert "data = EXCLUDED.data" in update_clause, sql
+        # The stamp travels as a bound parameter, beside the hash and the payload.
+        assert len(params) == 3
+        assert isinstance(params[2], datetime)
+        assert params[2].tzinfo is not None
+
+    def test_the_enumeration_selects_two_columns_and_never_the_payload(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        """``data`` must not appear in the projection, nor a ``SELECT *`` stand in for it."""
+        NagraEventStore("postgresql://recorded/list").list_agent_card_entries()
+
+        sql, params = recorded_sql[-1]
+        assert "card_hash" in sql, sql
+        assert "first_seen_at" in sql, sql
+        assert "data" not in sql, f"the enumeration pulls card payloads: {sql}"
+        assert "*" not in sql, sql
+        assert params == ()
+
+
+class TestAgentCardColumnProvisioning:
+    """``first_seen_at`` must exist as a ``TIMESTAMPTZ``, not as text or JSON."""
+
+    def test_the_stamp_column_is_a_timestamptz(self, postgres_clean_tables: str) -> None:
+        """The type is what makes psycopg hand the value back tz-aware.
+
+        A ``TIMESTAMP`` column would round-trip the same value NAIVE, and the
+        consumer subtracts it from ``datetime.now(UTC)``.
+        """
+        with Transaction(postgres_clean_tables) as trn:
+            cursor = trn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'agent_card_entries' AND column_name = 'first_seen_at'"
+            )
+            row = cursor.fetchone()
+
+        assert row is not None, "first_seen_at was never provisioned on agent_card_entries"
+        assert row[0] == "timestamp with time zone"
+
+    def test_init_db_adds_the_column_to_an_already_provisioned_table(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """The upgrade path, exercised rather than assumed.
+
+        Every existing deployment reaches this column through ``init_db`` on a
+        table that already holds rows, not through a fresh ``CREATE TABLE`` —
+        which is the only path the other fixtures ever take. The column is
+        dropped to put the table back in its pre-upgrade shape, a row is written
+        as it would have been written then, and ``init_db`` is asked to upgrade.
+
+        ``metadata_indexes`` is the precedent: the same nagra ``ADD COLUMN``
+        path carried it, and the add succeeds on a populated table because the
+        column is nullable — so rows written earlier keep ``NULL``, which is
+        exactly "age unknown".
+        """
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute("ALTER TABLE agent_card_entries DROP COLUMN first_seen_at")
+            trn.execute(
+                "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
+                ("e" * 64, json.dumps({"not": "a card"})),
+            )
+
+        init_db(postgres_clean_tables)
+
+        (entry,) = NagraEventStore(postgres_clean_tables).list_agent_card_entries()
+        assert entry.card_hash == "e" * 64
+        assert entry.first_seen_at is None
+
+    def test_a_row_written_without_the_stamp_holds_null(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """The shape of a row written before the column existed, read back.
+
+        The upgrade path itself is exercised above; this pins the READ: a
+        stamp-less row reports unknown rather than some default the store
+        invented on the way out.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute(
+                "INSERT INTO agent_card_entries (card_hash, data) VALUES (%s, %s)",
+                ("d" * 64, json.dumps({"not": "a card"})),
+            )
+
+        (entry,) = store.list_agent_card_entries()
+
+        assert entry.card_hash == "d" * 64
+        assert entry.first_seen_at is None
+
+    def test_a_stored_stamp_reads_back_tz_aware(self, postgres_clean_tables: str) -> None:
+        store = NagraEventStore(postgres_clean_tables)
+        store.save_agent_cards([_card_fixture()])
+
+        (entry,) = store.list_agent_card_entries()
+
+        assert entry.first_seen_at is not None
+        assert entry.first_seen_at.tzinfo is not None
