@@ -578,6 +578,8 @@ class YamlEventStore:
         """
         states_dir = self._team_dir(snapshot.team_id) / "states"
         states_dir.mkdir(parents=True, exist_ok=True)
+        # Same path ``load_agent_state`` builds, from a free ``str`` id: it comes from
+        # the actor system, not a request. The read is closed by its ``uuid.UUID`` type.
         state_path = states_dir / f"{snapshot.agent_id}.yaml"
         self._atomic_write(state_path, snapshot.model_dump())
         logger.debug(

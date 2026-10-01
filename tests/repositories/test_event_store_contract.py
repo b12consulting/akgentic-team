@@ -989,6 +989,7 @@ class TestEventStoreContract:
             make_agent_state_snapshot(team_id=team_id, agent_id="@Manager")
         )
 
+        assert event_store.load_agent_state(team_id, uuid.uuid4()) is None
         assert [s.agent_id for s in event_store.load_agent_states(team_id)] == ["@Manager"]
 
     @pytest.mark.parametrize(
