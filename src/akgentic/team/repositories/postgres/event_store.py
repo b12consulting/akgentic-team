@@ -34,6 +34,7 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories._agent_ids import is_canonical_agent_uuid
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
 
 logger = logging.getLogger(__name__)
@@ -429,12 +430,11 @@ class NagraEventStore:
     def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
         """Return one agent's snapshot by its ``(team_id, agent_id)`` key, or ``None``.
 
-        A row that does not validate is logged at ``WARNING`` naming the agent and
-        the team, and reads as ``None``, as on the YAML and Mongo backends.
+        An id that is not a canonical UUID is a miss without a query. A row that
+        does not validate is logged at ``WARNING`` naming the agent and the team,
+        and reads as ``None``, as on the YAML and Mongo backends.
         """
-        # PostgreSQL ``text`` cannot hold a NUL, so no row can match, and psycopg
-        # refuses to bind one (``DataError``) — a query string must not become a 500.
-        if "\x00" in agent_id:
+        if not is_canonical_agent_uuid(agent_id):
             return None
         with Transaction(self._conn_string) as trn:
             cursor = trn.execute(

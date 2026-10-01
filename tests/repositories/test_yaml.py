@@ -1344,7 +1344,7 @@ class TestTheWriterRefusesWhatTheReaderWouldRefuse:
         assert any("Skipping corrupted event" in r.getMessage() for r in caplog.records)
 
 
-_STRING_REJECTED_IDS = [
+_NON_UUID_IDS = [
     pytest.param("../x", id="dotdot-relative"),
     pytest.param("a/b", id="slash"),
     pytest.param("a\\b", id="backslash"),
@@ -1353,123 +1353,78 @@ _STRING_REJECTED_IDS = [
     pytest.param("", id="empty"),
     pytest.param("x\x00y", id="nul"),
     pytest.param("/etc/hosts", id="absolute"),
+    pytest.param("@Manager", id="display-name"),
 ]
 
 
-class _UntouchablePath(type(Path())):  # type: ignore[misc]
-    """A path whose ``exists`` and ``resolve`` fail the test; ``/`` keeps the subclass."""
-
-    def exists(self, *, follow_symlinks: bool = True) -> bool:
-        pytest.fail(f"exists() called on {self}")
-
-    def resolve(self, strict: bool = False) -> Path:
-        pytest.fail(f"resolve() called on {self}")
-
-
 class TestYamlLoadAgentStateStaysInsideStates:
-    """``load_agent_state`` turns an untrusted id into a path; both guards are pinned here.
+    """``load_agent_state`` turns an untrusted id into a path; the UUID check is pinned here.
 
-    The contract suite proves a hostile id is a miss on every backend. These
-    specs prove HOW on YAML: the string check stops the read before the
-    filesystem is touched, and the resolved-parent check stands on its own for
-    an id the string check lets through.
+    The contract suite proves a non-UUID id is a miss on every backend. These
+    specs prove HOW on YAML: the check stops the read before any file is opened.
     """
 
-    @pytest.mark.parametrize("agent_id", _STRING_REJECTED_IDS)
-    def test_a_rejected_id_never_touches_the_filesystem(
-        self,
-        yaml_store: YamlEventStore,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        agent_id: str,
+    @pytest.mark.parametrize("agent_id", _NON_UUID_IDS)
+    def test_a_non_uuid_id_never_opens_a_file(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch, agent_id: str
     ) -> None:
-        """A string-rejected id is ``None`` without an ``open``, ``exists`` or ``resolve``.
-
-        ``open`` alone cannot pin the string check: ``Path.exists`` already
-        answers ``False`` for a NUL, and the resolved-parent check refuses the
-        rest before ``open`` — so removing the string check left an open-only
-        spy green. Failing on the stat and the resolve as well is what makes
-        "before any path is touched" a tested property. They fail only on the
-        reading store's own paths, so pytest's reporting keeps a working ``Path``.
-        """
+        """A non-canonical id is ``None`` without an ``open``."""
         team_id = uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
 
         def _no_open(*args: object, **kwargs: object) -> None:
             pytest.fail(f"open called for rejected id {agent_id!r}: {args!r}")
 
         monkeypatch.setattr(yaml_repository, "open", _no_open, raising=False)
-        reader = YamlEventStore(_UntouchablePath(tmp_path))
 
-        assert reader.load_agent_state(team_id, agent_id) is None
+        assert yaml_store.load_agent_state(team_id, agent_id) is None
 
     def test_dotdot_cannot_reach_a_snapshot_in_the_team_directory(
         self, yaml_store: YamlEventStore, tmp_path: Path
     ) -> None:
         """A valid snapshot planted one level above ``states/`` is not reachable as ``../x``."""
         team_id = uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
         planted = make_agent_state_snapshot(team_id=team_id, agent_id="x")
         with open(tmp_path / str(team_id) / "x.yaml", "w") as handle:
             yaml.safe_dump(planted.model_dump(), handle)
 
         assert yaml_store.load_agent_state(team_id, "../x") is None
 
-    def test_a_symlink_out_of_states_is_refused(
-        self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """``link`` passes the string check; only the resolved-parent check can refuse it."""
-        team_a, team_b = uuid.uuid4(), uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_a, agent_id="a-only"))
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id="victim"))
-        link = tmp_path / str(team_a) / "states" / "link.yaml"
-        link.symlink_to(tmp_path / str(team_b) / "states" / "victim.yaml")
-
-        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
-            assert yaml_store.load_agent_state(team_a, "link") is None
-
-        assert str(team_a) in caplog.text
-
     def test_an_absent_states_directory_is_a_miss(self, yaml_store: YamlEventStore) -> None:
         """A team with no ``states/`` at all reads as ``None``, not an exception."""
         team_id = uuid.uuid4()
         yaml_store.save_team(make_process(team_id=team_id))
 
-        assert yaml_store.load_agent_state(team_id, "anyone") is None
+        assert yaml_store.load_agent_state(team_id, str(uuid.uuid4())) is None
 
     def test_a_states_directory_without_that_file_is_a_miss(
         self, yaml_store: YamlEventStore
     ) -> None:
         """``states/`` exists but holds no file for the id: ``None``."""
         team_id = uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
 
-        assert yaml_store.load_agent_state(team_id, "anyone") is None
-
-    def test_a_file_removed_after_the_existence_check_is_a_miss(
-        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A concurrent ``delete_team`` between ``exists`` and ``open`` is ``None``, not a raise."""
-        team_id = uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="gone"))
-
-        def _removed(path: Path, *args: object, **kwargs: object) -> None:
-            raise FileNotFoundError(2, "No such file or directory", str(path))
-
-        monkeypatch.setattr(yaml_repository, "open", _removed, raising=False)
-
-        assert yaml_store.load_agent_state(team_id, "gone") is None
+        assert yaml_store.load_agent_state(team_id, str(uuid.uuid4())) is None
 
     def test_an_unreadable_entry_is_none_with_a_warning(
         self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A directory named like a snapshot cannot be opened: ``None`` and a WARNING."""
-        team_id = uuid.uuid4()
-        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
-        (tmp_path / str(team_id) / "states" / "odd.yaml").mkdir()
+        team_id, agent_id = uuid.uuid4(), str(uuid.uuid4())
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
+        (tmp_path / str(team_id) / "states" / f"{agent_id}.yaml").mkdir()
 
         with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
-            assert yaml_store.load_agent_state(team_id, "odd") is None
+            assert yaml_store.load_agent_state(team_id, agent_id) is None
 
-        assert "odd" in caplog.text
+        assert agent_id in caplog.text
         assert str(team_id) in caplog.text

@@ -272,9 +272,12 @@ class EventStore(Protocol):
         and the team and returns ``None`` — never raises — as ``load_agent_states``
         skips it.
 
-        ``agent_id`` is a ``str`` and is never coerced to a UUID: older snapshots
-        are keyed by display name (``@Manager``). It may arrive from an HTTP query
-        string, so a backend that turns it into a path must treat it as untrusted.
+        ``agent_id`` must be a canonical UUID string, exactly as ``str(uuid)``
+        writes it; anything else, including braced, upper-case or hyphen-free
+        forms, is a miss and returns ``None`` before any I/O. It may arrive from an
+        HTTP query string. Legacy snapshots keyed by display name (``@Manager``)
+        are reachable only through ``load_agent_states``, and self-heal to a
+        UUID key on the agent's next state change.
         """
         ...
 
