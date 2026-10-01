@@ -1342,3 +1342,106 @@ class TestTheWriterRefusesWhatTheReaderWouldRefuse:
 
         assert [e.sequence for e in loaded] == [1, 2]
         assert any("Skipping corrupted event" in r.getMessage() for r in caplog.records)
+
+
+_STRING_REJECTED_IDS = [
+    pytest.param("../x", id="dotdot-relative"),
+    pytest.param("a/b", id="slash"),
+    pytest.param("a\\b", id="backslash"),
+    pytest.param(".", id="dot"),
+    pytest.param("..", id="dotdot"),
+    pytest.param("", id="empty"),
+    pytest.param("x\x00y", id="nul"),
+    pytest.param("/etc/hosts", id="absolute"),
+]
+
+
+class _UntouchablePath(type(Path())):  # type: ignore[misc]
+    """A path whose ``exists`` and ``resolve`` fail the test; ``/`` keeps the subclass."""
+
+    def exists(self, *, follow_symlinks: bool = True) -> bool:
+        pytest.fail(f"exists() called on {self}")
+
+    def resolve(self, strict: bool = False) -> Path:
+        pytest.fail(f"resolve() called on {self}")
+
+
+class TestYamlLoadAgentStateStaysInsideStates:
+    """``load_agent_state`` turns an untrusted id into a path; both guards are pinned here.
+
+    The contract suite proves a hostile id is a miss on every backend. These
+    specs prove HOW on YAML: the string check stops the read before the
+    filesystem is touched, and the resolved-parent check stands on its own for
+    an id the string check lets through.
+    """
+
+    @pytest.mark.parametrize("agent_id", _STRING_REJECTED_IDS)
+    def test_a_rejected_id_never_touches_the_filesystem(
+        self,
+        yaml_store: YamlEventStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agent_id: str,
+    ) -> None:
+        """A string-rejected id is ``None`` without an ``open``, ``exists`` or ``resolve``.
+
+        ``open`` alone cannot pin the string check: ``Path.exists`` already
+        answers ``False`` for a NUL, and the resolved-parent check refuses the
+        rest before ``open`` — so removing the string check left an open-only
+        spy green. Failing on the stat and the resolve as well is what makes
+        "before any path is touched" a tested property. They fail only on the
+        reading store's own paths, so pytest's reporting keeps a working ``Path``.
+        """
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+
+        def _no_open(*args: object, **kwargs: object) -> None:
+            pytest.fail(f"open called for rejected id {agent_id!r}: {args!r}")
+
+        monkeypatch.setattr(yaml_repository, "open", _no_open, raising=False)
+        reader = YamlEventStore(_UntouchablePath(tmp_path))
+
+        assert reader.load_agent_state(team_id, agent_id) is None
+
+    def test_dotdot_cannot_reach_a_snapshot_in_the_team_directory(
+        self, yaml_store: YamlEventStore, tmp_path: Path
+    ) -> None:
+        """A valid snapshot planted one level above ``states/`` is not reachable as ``../x``."""
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+        planted = make_agent_state_snapshot(team_id=team_id, agent_id="x")
+        with open(tmp_path / str(team_id) / "x.yaml", "w") as handle:
+            yaml.safe_dump(planted.model_dump(), handle)
+
+        assert yaml_store.load_agent_state(team_id, "../x") is None
+
+    def test_a_symlink_out_of_states_is_refused(
+        self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``link`` passes the string check; only the resolved-parent check can refuse it."""
+        team_a, team_b = uuid.uuid4(), uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_a, agent_id="a-only"))
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id="victim"))
+        link = tmp_path / str(team_a) / "states" / "link.yaml"
+        link.symlink_to(tmp_path / str(team_b) / "states" / "victim.yaml")
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            assert yaml_store.load_agent_state(team_a, "link") is None
+
+        assert str(team_a) in caplog.text
+
+    def test_an_absent_states_directory_is_a_miss(self, yaml_store: YamlEventStore) -> None:
+        """A team with no ``states/`` at all reads as ``None``, not an exception."""
+        team_id = uuid.uuid4()
+        yaml_store.save_team(make_process(team_id=team_id))
+
+        assert yaml_store.load_agent_state(team_id, "anyone") is None
+
+    def test_a_states_directory_without_that_file_is_a_miss(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """``states/`` exists but holds no file for the id: ``None``."""
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+
+        assert yaml_store.load_agent_state(team_id, "anyone") is None

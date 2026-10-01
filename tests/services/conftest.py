@@ -228,6 +228,13 @@ class InMemoryEventStore:
             if snapshot_team_id == team_id
         ]
 
+    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+        """Load one agent's snapshot by its key, detached exactly as ``load_agent_states``."""
+        snapshot = self.agent_states.get((team_id, agent_id))
+        if snapshot is None:
+            return None
+        return snapshot.model_copy(update={"state": snapshot.state.serializable_copy()})
+
     def save_agent_cards(self, cards: list[AgentCard]) -> None:
         """Persist agent cards into the dict-backed content-addressed store.
 

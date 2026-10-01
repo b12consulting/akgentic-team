@@ -263,6 +263,21 @@ class EventStore(Protocol):
         """
         ...
 
+    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+        """Load one agent's state snapshot through a point read on ``(team_id, agent_id)``.
+
+        Returns ``None`` when the team holds no snapshot for that agent. It never
+        returns another team's snapshot, whatever ``agent_id`` holds. A stored
+        snapshot that does not validate is logged at ``WARNING`` naming the agent
+        and the team and returns ``None`` — never raises — as ``load_agent_states``
+        skips it.
+
+        ``agent_id`` is a ``str`` and is never coerced to a UUID: older snapshots
+        are keyed by display name (``@Manager``). It may arrive from an HTTP query
+        string, so a backend that turns it into a path must treat it as untrusted.
+        """
+        ...
+
     def save_agent_cards(self, cards: list[AgentCard]) -> None:
         """Persist agent cards into the content-addressed card store.
 

@@ -18,6 +18,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -883,6 +884,172 @@ class TestEventStoreContract:
     ) -> None:
         """Protocol contract: no agent states for a team yields ``[]``."""
         assert event_store.load_agent_states(uuid.uuid4()) == []
+
+    # --- load_agent_state (one agent) -------------------------------------
+
+    @pytest.mark.parametrize(
+        "agent_id",
+        [
+            pytest.param(str(uuid.UUID(int=7)), id="uuid-id"),
+            pytest.param("@Manager", id="name-id"),
+        ],
+    )
+    def test_load_agent_state_returns_the_saved_snapshot(
+        self, event_store: EventStore, agent_id: str
+    ) -> None:
+        """A hit returns the snapshot saved, its state rebuilt as the concrete class.
+
+        The name-style id is the shape older snapshots are keyed by, so an
+        implementation that coerces the id to a UUID goes red here.
+        """
+        team_id = uuid.uuid4()
+        event_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id="other-agent")
+        )
+        saved = make_agent_state_snapshot(
+            team_id=team_id,
+            agent_id=agent_id,
+            name="@Manager",
+            state=SampleAgentState(task_count=11),
+        )
+        event_store.save_agent_state(saved)
+
+        loaded = event_store.load_agent_state(team_id, agent_id)
+
+        assert loaded is not None
+        assert (loaded.team_id, loaded.agent_id, loaded.name) == (team_id, agent_id, "@Manager")
+        assert isinstance(loaded.state, SampleAgentState)
+        assert loaded.state.task_count == 11
+
+    def test_load_agent_state_returns_the_latest_save(self, event_store: EventStore) -> None:
+        """Two saves for one ``(team_id, agent_id)``: the read returns the second."""
+        team_id = uuid.uuid4()
+        for task_count in (1, 2):
+            event_store.save_agent_state(
+                make_agent_state_snapshot(
+                    team_id=team_id,
+                    agent_id="agent-a",
+                    state=SampleAgentState(task_count=task_count),
+                )
+            )
+
+        loaded = event_store.load_agent_state(team_id, "agent-a")
+
+        assert loaded is not None
+        assert isinstance(loaded.state, SampleAgentState)
+        assert loaded.state.task_count == 2
+
+    def test_load_agent_state_misses_return_none(self, event_store: EventStore) -> None:
+        """An agent the team has no snapshot for, and an unknown team, are both ``None``."""
+        team_id = uuid.uuid4()
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="known"))
+
+        assert event_store.load_agent_state(team_id, "unknown") is None
+        assert event_store.load_agent_state(uuid.uuid4(), "known") is None
+
+    def test_load_agent_state_never_crosses_teams(self, event_store: EventStore) -> None:
+        """Only team B holds ``shared``: team A's read is ``None``, team B's is B's."""
+        team_a, team_b = uuid.uuid4(), uuid.uuid4()
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_a, agent_id="a-only"))
+        event_store.save_agent_state(
+            make_agent_state_snapshot(
+                team_id=team_b, agent_id="shared", state=SampleAgentState(task_count=2)
+            )
+        )
+
+        assert event_store.load_agent_state(team_a, "shared") is None
+        loaded_b = event_store.load_agent_state(team_b, "shared")
+        assert loaded_b is not None
+        assert loaded_b.team_id == team_b
+
+    def test_load_agent_state_returns_each_teams_own_value(self, event_store: EventStore) -> None:
+        """Both teams hold ``shared`` with different values: each read gets its own."""
+        team_a, team_b = uuid.uuid4(), uuid.uuid4()
+        for team_id, task_count in ((team_a, 1), (team_b, 2)):
+            event_store.save_agent_state(
+                make_agent_state_snapshot(
+                    team_id=team_id,
+                    agent_id="shared",
+                    state=SampleAgentState(task_count=task_count),
+                )
+            )
+
+        for team_id, task_count in ((team_a, 1), (team_b, 2)):
+            loaded = event_store.load_agent_state(team_id, "shared")
+            assert loaded is not None
+            assert loaded.team_id == team_id
+            assert isinstance(loaded.state, SampleAgentState)
+            assert loaded.state.task_count == task_count
+
+    @pytest.mark.parametrize(
+        "stale_path",
+        [
+            pytest.param("akgentic.core.agent_state.DeletedAgentState", id="missing-class"),
+            pytest.param("akgentic.core.no_such_module.DeletedAgentState", id="missing-module"),
+        ],
+    )
+    def test_load_agent_state_returns_none_for_a_stale_snapshot(
+        self,
+        event_store: EventStore,
+        seed_raw_agent_state: RawAgentStateSeeder,
+        caplog: pytest.LogCaptureFixture,
+        stale_path: str,
+    ) -> None:
+        """A snapshot naming a deleted state class reads as ``None``, logged once — no raise."""
+        team_id = uuid.uuid4()
+        seed_raw_agent_state(
+            team_id, "agent-m", stale_agent_state_document(team_id, "agent-m", stale_path)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert event_store.load_agent_state(team_id, "agent-m") is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "agent-m" in warnings[0].getMessage()
+        assert str(team_id) in warnings[0].getMessage()
+
+    @pytest.mark.parametrize(
+        "agent_id",
+        [
+            pytest.param("../x", id="dotdot-relative"),
+            pytest.param("a/b", id="slash"),
+            pytest.param("a\\b", id="backslash"),
+            pytest.param(".", id="dot"),
+            pytest.param("..", id="dotdot"),
+            pytest.param("", id="empty"),
+            pytest.param("x\x00y", id="nul"),
+            pytest.param("/etc/hosts", id="absolute"),
+        ],
+    )
+    def test_load_agent_state_hostile_id_is_a_miss(
+        self, event_store: EventStore, agent_id: str
+    ) -> None:
+        """An id that cannot name a stored snapshot is ``None`` on every backend, never a raise."""
+        team_id = uuid.uuid4()
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+
+        assert event_store.load_agent_state(team_id, agent_id) is None
+
+    def test_load_agent_state_cannot_traverse_into_another_team(
+        self, event_store: EventStore, tmp_path: Path
+    ) -> None:
+        """A traversal id cannot read team B's snapshot through team A (T1, security).
+
+        On YAML ``victim`` lands at ``{data_dir}/{team_b}/states/victim.yaml``,
+        which both ids below address from team A's ``states/``. ``tmp_path`` is
+        the directory the ``event_store`` fixture handed ``YamlEventStore``.
+        """
+        team_a, team_b = uuid.uuid4(), uuid.uuid4()
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_a, agent_id="a-only"))
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id="victim"))
+
+        for hostile in (
+            f"../../{team_b}/states/victim",
+            str(tmp_path / str(team_b) / "states" / "victim"),
+        ):
+            assert event_store.load_agent_state(team_a, hostile) is None, hostile
+        assert event_store.load_agent_state(team_b, "victim") is not None
 
     # --- delete_team ------------------------------------------------------
 

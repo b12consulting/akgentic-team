@@ -129,6 +129,25 @@ def _is_card_hash(value: str) -> bool:
     return len(value) == _CARD_HASH_LENGTH and _HEX_DIGITS.issuperset(value)
 
 
+_UNSAFE_STEM_CHARACTERS = ("/", "\\", "\x00")
+
+
+def _is_safe_state_stem(agent_id: str) -> bool:
+    """Return whether *agent_id* may name a file directly under ``states/``.
+
+    ``load_agent_state`` receives its id from an HTTP query string, and this
+    backend is the one that turns it into a path: ``../../{team}/states/victim``
+    and an absolute path are valid ``str`` values that read another team's
+    snapshot. An id that is empty, ``.``, ``..``, or carries a separator or a NUL
+    cannot be a file in ``states/`` and is a clean miss before any path is built.
+    The backslash is a legal filename character on POSIX; it is rejected anyway,
+    because a Windows host would read it as a separator.
+    """
+    if agent_id in ("", ".", ".."):
+        return False
+    return not any(character in agent_id for character in _UNSAFE_STEM_CHARACTERS)
+
+
 class YamlEventStore:
     """File-based EventStore using YAML serialization with per-team directories.
 
@@ -578,6 +597,8 @@ class YamlEventStore:
         """
         states_dir = self._team_dir(snapshot.team_id) / "states"
         states_dir.mkdir(parents=True, exist_ok=True)
+        # Same path ``load_agent_state`` builds, deliberately unguarded: this id
+        # comes from the actor system, not from a request.
         state_path = states_dir / f"{snapshot.agent_id}.yaml"
         self._atomic_write(state_path, snapshot.model_dump())
         logger.debug(
@@ -612,6 +633,44 @@ class YamlEventStore:
                 )
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
+
+    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+        """Load one agent state snapshot from ``states/{agent_id}.yaml``.
+
+        Reads that one file; never globs ``states/``. The id is untrusted, so two
+        layers keep the read inside this team's ``states/``: the string check of
+        :func:`_is_safe_state_stem`, before any path is built, and a resolved-
+        parent check, which also catches a symlink planted in ``states/``.
+
+        Args:
+            team_id: Unique identifier of the team.
+            agent_id: The agent's id, as ``save_agent_state`` keyed it.
+
+        Returns:
+            The snapshot, or ``None`` if the id is rejected, the file is absent,
+            or it does not load (logged at WARNING).
+        """
+        if not _is_safe_state_stem(agent_id):
+            return None
+        states_dir = self._team_dir(team_id) / "states"
+        state_path = states_dir / f"{agent_id}.yaml"
+        if not state_path.exists():
+            return None
+        # Resolve BOTH sides: ``data_dir`` itself may sit under a symlink.
+        if state_path.resolve().parent != states_dir.resolve():
+            logger.warning(
+                "Refusing agent state %r for team %s: it resolves outside states/",
+                agent_id,
+                team_id,
+            )
+            return None
+        try:
+            with open(state_path) as f:
+                return AgentStateSnapshot.model_validate(yaml.safe_load(f))
+        except (yaml.YAMLError, ValueError) as exc:
+            # ValueError covers a non-UTF-8 file and Pydantic's ValidationError.
+            logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
+            return None
 
     def delete_team(self, team_id: uuid.UUID) -> None:
         """Delete all persisted data for a team.

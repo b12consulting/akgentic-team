@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the twelve :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the thirteen :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -425,6 +425,30 @@ class NagraEventStore:
                     "Skipping corrupted agent state %s for team %s: %s", row[0], team_id, exc
                 )
         return snapshots
+
+    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+        """Return one agent's snapshot by its ``(team_id, agent_id)`` key, or ``None``.
+
+        A row that does not validate is logged at ``WARNING`` naming the agent and
+        the team, and reads as ``None``, as on the YAML and Mongo backends.
+        """
+        # PostgreSQL ``text`` cannot hold a NUL, so no row can match, and psycopg
+        # refuses to bind one (``DataError``) — a query string must not become a 500.
+        if "\x00" in agent_id:
+            return None
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute(
+                "SELECT data FROM agent_state_entries WHERE team_id = %s AND agent_id = %s",
+                (str(team_id), agent_id),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            return AgentStateSnapshot.model_validate(decode_jsonb_column(row[0]))
+        except (ValueError, TypeError) as exc:
+            logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
+            return None
 
     # --- agent cards (agent_card_entries) ----------------------------------
 
