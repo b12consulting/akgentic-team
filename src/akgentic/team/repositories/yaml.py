@@ -45,7 +45,6 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._agent_ids import is_canonical_agent_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -579,8 +578,6 @@ class YamlEventStore:
         """
         states_dir = self._team_dir(snapshot.team_id) / "states"
         states_dir.mkdir(parents=True, exist_ok=True)
-        # Same path ``load_agent_state`` builds, deliberately unchecked: this id
-        # comes from the actor system, not from a request.
         state_path = states_dir / f"{snapshot.agent_id}.yaml"
         self._atomic_write(state_path, snapshot.model_dump())
         logger.debug(
@@ -616,24 +613,22 @@ class YamlEventStore:
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
 
-    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
         """Load one agent state snapshot from ``states/{agent_id}.yaml``.
 
-        Reads that one file; never globs ``states/``. The id is untrusted, so it is
-        checked by :func:`is_canonical_agent_uuid` before any path is built: a
-        canonical UUID holds no separator, dot or NUL, so the path stays inside
-        this team's ``states/``.
+        Reads that one file; never globs ``states/``. ``agent_id`` is a UUID, so
+        the file name it forms cannot leave this team's ``states/``.
 
         Args:
             team_id: Unique identifier of the team.
-            agent_id: The agent's id, as ``save_agent_state`` keyed it.
+            agent_id: The agent's UUID; the file stem is ``str(agent_id)``.
 
         Returns:
-            The snapshot, or ``None`` if the id is not a canonical UUID, the file
-            is absent, or it does not load (logged at WARNING).
+            The snapshot, or ``None`` if the file is absent or does not load
+            (logged at WARNING).
         """
-        if not is_canonical_agent_uuid(agent_id):
-            return None
         state_path = self._team_dir(team_id) / "states" / f"{agent_id}.yaml"
         try:
             with open(state_path) as f:

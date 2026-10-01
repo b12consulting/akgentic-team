@@ -23,7 +23,6 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._agent_ids import is_canonical_agent_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -229,14 +228,11 @@ class InMemoryEventStore:
             if snapshot_team_id == team_id
         ]
 
-    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
-        """Load one agent's snapshot by its key, detached exactly as ``load_agent_states``.
-
-        A non-canonical UUID id is a miss, as on every real backend.
-        """
-        if not is_canonical_agent_uuid(agent_id):
-            return None
-        snapshot = self.agent_states.get((team_id, agent_id))
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
+        """Load one agent's snapshot by its key, detached exactly as ``load_agent_states``."""
+        snapshot = self.agent_states.get((team_id, str(agent_id)))
         if snapshot is None:
             return None
         return snapshot.model_copy(update={"state": snapshot.state.serializable_copy()})

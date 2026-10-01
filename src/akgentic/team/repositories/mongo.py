@@ -45,7 +45,6 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._agent_ids import is_canonical_agent_uuid
 
 if TYPE_CHECKING:
     import pymongo.collection
@@ -546,23 +545,22 @@ class MongoEventStore:
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
 
-    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
         """Load one agent state snapshot with a ``find_one`` on ``team_id`` + ``agent_id``.
 
-        Served by the unique ``(team_id, agent_id)`` index. An id that is not a
-        canonical UUID is a miss without a query.
+        Served by the unique ``(team_id, agent_id)`` index.
 
         Args:
             team_id: Unique identifier of the team.
-            agent_id: The agent's id, as ``save_agent_state`` keyed it.
+            agent_id: The agent's UUID; matched as ``str(agent_id)``.
 
         Returns:
-            The snapshot, or ``None`` if the id is not a canonical UUID, if
-            absent, or if it does not validate (logged at WARNING).
+            The snapshot, or ``None`` if absent or if it does not validate
+            (logged at WARNING).
         """
-        if not is_canonical_agent_uuid(agent_id):
-            return None
-        doc = self._agent_states.find_one({"team_id": str(team_id), "agent_id": agent_id})
+        doc = self._agent_states.find_one({"team_id": str(team_id), "agent_id": str(agent_id)})
         if doc is None:
             return None
         doc.pop("_id", None)

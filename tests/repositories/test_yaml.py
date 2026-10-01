@@ -1344,80 +1344,32 @@ class TestTheWriterRefusesWhatTheReaderWouldRefuse:
         assert any("Skipping corrupted event" in r.getMessage() for r in caplog.records)
 
 
-_NON_UUID_IDS = [
-    pytest.param("../x", id="dotdot-relative"),
-    pytest.param("a/b", id="slash"),
-    pytest.param("a\\b", id="backslash"),
-    pytest.param(".", id="dot"),
-    pytest.param("..", id="dotdot"),
-    pytest.param("", id="empty"),
-    pytest.param("x\x00y", id="nul"),
-    pytest.param("/etc/hosts", id="absolute"),
-    pytest.param("@Manager", id="display-name"),
-]
-
-
-class TestYamlLoadAgentStateStaysInsideStates:
-    """``load_agent_state`` turns an untrusted id into a path; the UUID check is pinned here.
-
-    The contract suite proves a non-UUID id is a miss on every backend. These
-    specs prove HOW on YAML: the check stops the read before any file is opened.
-    """
-
-    @pytest.mark.parametrize("agent_id", _NON_UUID_IDS)
-    def test_a_non_uuid_id_never_opens_a_file(
-        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch, agent_id: str
-    ) -> None:
-        """A non-canonical id is ``None`` without an ``open``."""
-        team_id = uuid.uuid4()
-        yaml_store.save_agent_state(
-            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
-        )
-
-        def _no_open(*args: object, **kwargs: object) -> None:
-            pytest.fail(f"open called for rejected id {agent_id!r}: {args!r}")
-
-        monkeypatch.setattr(yaml_repository, "open", _no_open, raising=False)
-
-        assert yaml_store.load_agent_state(team_id, agent_id) is None
-
-    def test_dotdot_cannot_reach_a_snapshot_in_the_team_directory(
-        self, yaml_store: YamlEventStore, tmp_path: Path
-    ) -> None:
-        """A valid snapshot planted one level above ``states/`` is not reachable as ``../x``."""
-        team_id = uuid.uuid4()
-        yaml_store.save_agent_state(
-            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
-        )
-        planted = make_agent_state_snapshot(team_id=team_id, agent_id="x")
-        with open(tmp_path / str(team_id) / "x.yaml", "w") as handle:
-            yaml.safe_dump(planted.model_dump(), handle)
-
-        assert yaml_store.load_agent_state(team_id, "../x") is None
+class TestYamlLoadAgentState:
+    """YAML-only paths of ``load_agent_state``: a missing or unopenable file is never a raise."""
 
     def test_an_absent_states_directory_is_a_miss(self, yaml_store: YamlEventStore) -> None:
         """A team with no ``states/`` at all reads as ``None``, not an exception."""
         team_id = uuid.uuid4()
         yaml_store.save_team(make_process(team_id=team_id))
 
-        assert yaml_store.load_agent_state(team_id, str(uuid.uuid4())) is None
+        assert yaml_store.load_agent_state(team_id, uuid.uuid4()) is None
 
     def test_a_states_directory_without_that_file_is_a_miss(
         self, yaml_store: YamlEventStore
     ) -> None:
-        """``states/`` exists but holds no file for the id: ``None``."""
+        """``states/`` exists but holds no file for the id, e.g. removed by a concurrent delete."""
         team_id = uuid.uuid4()
         yaml_store.save_agent_state(
             make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
         )
 
-        assert yaml_store.load_agent_state(team_id, str(uuid.uuid4())) is None
+        assert yaml_store.load_agent_state(team_id, uuid.uuid4()) is None
 
     def test_an_unreadable_entry_is_none_with_a_warning(
         self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A directory named like a snapshot cannot be opened: ``None`` and a WARNING."""
-        team_id, agent_id = uuid.uuid4(), str(uuid.uuid4())
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
         yaml_store.save_agent_state(
             make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
         )
@@ -1426,5 +1378,5 @@ class TestYamlLoadAgentStateStaysInsideStates:
         with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
             assert yaml_store.load_agent_state(team_id, agent_id) is None
 
-        assert agent_id in caplog.text
+        assert str(agent_id) in caplog.text
         assert str(team_id) in caplog.text

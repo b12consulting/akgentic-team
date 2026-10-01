@@ -263,7 +263,9 @@ class EventStore(Protocol):
         """
         ...
 
-    def load_agent_state(self, team_id: uuid.UUID, agent_id: str) -> AgentStateSnapshot | None:
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
         """Load one agent's state snapshot through a point read on ``(team_id, agent_id)``.
 
         Returns ``None`` when the team holds no snapshot for that agent. It never
@@ -272,12 +274,11 @@ class EventStore(Protocol):
         and the team and returns ``None`` — never raises — as ``load_agent_states``
         skips it.
 
-        ``agent_id`` must be a canonical UUID string, exactly as ``str(uuid)``
-        writes it; anything else, including braced, upper-case or hyphen-free
-        forms, is a miss and returns ``None`` before any I/O. It may arrive from an
-        HTTP query string. Legacy snapshots keyed by display name (``@Manager``)
-        are reachable only through ``load_agent_states``, and self-heal to a
-        UUID key on the agent's next state change.
+        ``agent_id`` is the agent's UUID; backends key the lookup on
+        ``str(agent_id)``, the form ``save_agent_state`` stores. Legacy snapshots
+        keyed by display name (``@Manager``) have no UUID that maps to them: they
+        are reachable only through ``load_agent_states``, and self-heal to a UUID
+        key on the agent's next state change.
         """
         ...
 

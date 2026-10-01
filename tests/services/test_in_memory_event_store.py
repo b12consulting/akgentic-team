@@ -303,51 +303,42 @@ class TestInMemoryEventStoreLoadAgentState:
 
     def test_a_hit_returns_the_saved_snapshot(self) -> None:
         store = InMemoryEventStore()
-        team_id, agent_id = uuid.uuid4(), str(uuid.uuid4())
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
         store.save_agent_state(
             make_agent_state_snapshot(
-                team_id=team_id, agent_id=agent_id, state=SampleAgentState(task_count=3)
+                team_id=team_id, agent_id=str(agent_id), state=SampleAgentState(task_count=3)
             )
         )
 
         loaded = store.load_agent_state(team_id, agent_id)
 
         assert loaded is not None
-        assert (loaded.team_id, loaded.agent_id) == (team_id, agent_id)
+        assert (loaded.team_id, loaded.agent_id) == (team_id, str(agent_id))
         assert isinstance(loaded.state, SampleAgentState)
         assert loaded.state.task_count == 3
 
     def test_a_miss_returns_none(self) -> None:
         store = InMemoryEventStore()
-        team_id, known = uuid.uuid4(), str(uuid.uuid4())
-        store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id=known))
+        team_id, known = uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id=str(known)))
 
-        assert store.load_agent_state(team_id, str(uuid.uuid4())) is None
+        assert store.load_agent_state(team_id, uuid.uuid4()) is None
         assert store.load_agent_state(uuid.uuid4(), known) is None
-
-    def test_a_name_keyed_snapshot_is_a_miss(self) -> None:
-        """Only a canonical UUID reads; a legacy name-keyed snapshot is still listed."""
-        store = InMemoryEventStore()
-        team_id = uuid.uuid4()
-        store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="@Manager"))
-
-        assert store.load_agent_state(team_id, "@Manager") is None
-        assert [s.agent_id for s in store.load_agent_states(team_id)] == ["@Manager"]
 
     def test_another_teams_snapshot_is_never_returned(self) -> None:
         store = InMemoryEventStore()
-        team_a, team_b, shared = uuid.uuid4(), uuid.uuid4(), str(uuid.uuid4())
-        store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id=shared))
+        team_a, team_b, shared = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id=str(shared)))
 
         assert store.load_agent_state(team_a, shared) is None
 
     def test_mutating_the_returned_state_does_not_change_a_second_read(self) -> None:
         """Detached, as the real backends are: they rebuild the state on every load."""
         store = InMemoryEventStore()
-        team_id, agent_id = uuid.uuid4(), str(uuid.uuid4())
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
         store.save_agent_state(
             make_agent_state_snapshot(
-                team_id=team_id, agent_id=agent_id, state=SampleAgentState(task_count=1)
+                team_id=team_id, agent_id=str(agent_id), state=SampleAgentState(task_count=1)
             )
         )
 
