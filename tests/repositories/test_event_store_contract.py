@@ -1020,6 +1020,7 @@ class TestEventStoreContract:
             pytest.param("", id="empty"),
             pytest.param("x\x00y", id="nul"),
             pytest.param("/etc/hosts", id="absolute"),
+            pytest.param("a" * 300, id="longer-than-a-filename"),
         ],
     )
     def test_load_agent_state_hostile_id_is_a_miss(

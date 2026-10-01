@@ -654,10 +654,16 @@ class YamlEventStore:
             return None
         states_dir = self._team_dir(team_id) / "states"
         state_path = states_dir / f"{agent_id}.yaml"
-        if not state_path.exists():
+        try:
+            if not state_path.exists():
+                return None
+            # Resolve BOTH sides: ``data_dir`` itself may sit under a symlink.
+            inside_states = state_path.resolve().parent == states_dir.resolve()
+        except OSError:
+            # Python 3.12's ``exists`` raises ENAMETOOLONG for an over-long id; a
+            # name the filesystem refuses cannot hold a snapshot, so it is a miss.
             return None
-        # Resolve BOTH sides: ``data_dir`` itself may sit under a symlink.
-        if state_path.resolve().parent != states_dir.resolve():
+        if not inside_states:
             logger.warning(
                 "Refusing agent state %r for team %s: it resolves outside states/",
                 agent_id,
@@ -667,7 +673,9 @@ class YamlEventStore:
         try:
             with open(state_path) as f:
                 return AgentStateSnapshot.model_validate(yaml.safe_load(f))
-        except (yaml.YAMLError, ValueError) as exc:
+        except FileNotFoundError:
+            return None  # removed since ``exists``, e.g. by a concurrent ``delete_team``
+        except (OSError, yaml.YAMLError, ValueError) as exc:
             # ValueError covers a non-UTF-8 file and Pydantic's ValidationError.
             logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
             return None

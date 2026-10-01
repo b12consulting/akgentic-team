@@ -1445,3 +1445,31 @@ class TestYamlLoadAgentStateStaysInsideStates:
         yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
 
         assert yaml_store.load_agent_state(team_id, "anyone") is None
+
+    def test_a_file_removed_after_the_existence_check_is_a_miss(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A concurrent ``delete_team`` between ``exists`` and ``open`` is ``None``, not a raise."""
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="gone"))
+
+        def _removed(path: Path, *args: object, **kwargs: object) -> None:
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+
+        monkeypatch.setattr(yaml_repository, "open", _removed, raising=False)
+
+        assert yaml_store.load_agent_state(team_id, "gone") is None
+
+    def test_an_unreadable_entry_is_none_with_a_warning(
+        self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A directory named like a snapshot cannot be opened: ``None`` and a WARNING."""
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id="real"))
+        (tmp_path / str(team_id) / "states" / "odd.yaml").mkdir()
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            assert yaml_store.load_agent_state(team_id, "odd") is None
+
+        assert "odd" in caplog.text
+        assert str(team_id) in caplog.text
