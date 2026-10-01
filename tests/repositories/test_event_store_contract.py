@@ -884,6 +884,142 @@ class TestEventStoreContract:
         """Protocol contract: no agent states for a team yields ``[]``."""
         assert event_store.load_agent_states(uuid.uuid4()) == []
 
+    # --- load_agent_state (one agent) -------------------------------------
+
+    def test_load_agent_state_returns_the_saved_snapshot(self, event_store: EventStore) -> None:
+        """A hit by the agent's UUID returns the snapshot saved, its state rebuilt as the class."""
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        event_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
+        event_store.save_agent_state(
+            make_agent_state_snapshot(
+                team_id=team_id,
+                agent_id=str(agent_id),
+                name="@Manager",
+                state=SampleAgentState(task_count=11),
+            )
+        )
+
+        loaded = event_store.load_agent_state(team_id, agent_id)
+
+        assert loaded is not None
+        assert (loaded.team_id, loaded.agent_id, loaded.name) == (
+            team_id,
+            str(agent_id),
+            "@Manager",
+        )
+        assert isinstance(loaded.state, SampleAgentState)
+        assert loaded.state.task_count == 11
+
+    def test_load_agent_state_returns_the_latest_save(self, event_store: EventStore) -> None:
+        """Two saves for one ``(team_id, agent_id)``: the read returns the second."""
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        for task_count in (1, 2):
+            event_store.save_agent_state(
+                make_agent_state_snapshot(
+                    team_id=team_id,
+                    agent_id=str(agent_id),
+                    state=SampleAgentState(task_count=task_count),
+                )
+            )
+
+        loaded = event_store.load_agent_state(team_id, agent_id)
+
+        assert loaded is not None
+        assert isinstance(loaded.state, SampleAgentState)
+        assert loaded.state.task_count == 2
+
+    def test_load_agent_state_misses_return_none(self, event_store: EventStore) -> None:
+        """An agent the team has no snapshot for, and an unknown team, are both ``None``."""
+        team_id, known = uuid.uuid4(), uuid.uuid4()
+        event_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(known))
+        )
+
+        assert event_store.load_agent_state(team_id, uuid.uuid4()) is None
+        assert event_store.load_agent_state(uuid.uuid4(), known) is None
+
+    def test_load_agent_state_never_crosses_teams(self, event_store: EventStore) -> None:
+        """Only team B holds ``shared``: team A's read is ``None``, team B's is B's."""
+        team_a, team_b, shared = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        event_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_a, agent_id=str(uuid.uuid4()))
+        )
+        event_store.save_agent_state(
+            make_agent_state_snapshot(
+                team_id=team_b, agent_id=str(shared), state=SampleAgentState(task_count=2)
+            )
+        )
+
+        assert event_store.load_agent_state(team_a, shared) is None
+        loaded_b = event_store.load_agent_state(team_b, shared)
+        assert loaded_b is not None
+        assert loaded_b.team_id == team_b
+
+    def test_load_agent_state_returns_each_teams_own_value(self, event_store: EventStore) -> None:
+        """Both teams hold ``shared`` with different values: each read gets its own."""
+        team_a, team_b, shared = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        for team_id, task_count in ((team_a, 1), (team_b, 2)):
+            event_store.save_agent_state(
+                make_agent_state_snapshot(
+                    team_id=team_id,
+                    agent_id=str(shared),
+                    state=SampleAgentState(task_count=task_count),
+                )
+            )
+
+        for team_id, task_count in ((team_a, 1), (team_b, 2)):
+            loaded = event_store.load_agent_state(team_id, shared)
+            assert loaded is not None
+            assert loaded.team_id == team_id
+            assert isinstance(loaded.state, SampleAgentState)
+            assert loaded.state.task_count == task_count
+
+    def test_load_agent_state_does_not_reach_a_name_keyed_snapshot(
+        self, event_store: EventStore
+    ) -> None:
+        """A legacy snapshot keyed by display name has no UUID that maps to it.
+
+        It stays listed by ``load_agent_states`` and self-heals to a UUID key on
+        the agent's next state change.
+        """
+        team_id = uuid.uuid4()
+        event_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id="@Manager")
+        )
+
+        assert event_store.load_agent_state(team_id, uuid.uuid4()) is None
+        assert [s.agent_id for s in event_store.load_agent_states(team_id)] == ["@Manager"]
+
+    @pytest.mark.parametrize(
+        "stale_path",
+        [
+            pytest.param("akgentic.core.agent_state.DeletedAgentState", id="missing-class"),
+            pytest.param("akgentic.core.no_such_module.DeletedAgentState", id="missing-module"),
+        ],
+    )
+    def test_load_agent_state_returns_none_for_a_stale_snapshot(
+        self,
+        event_store: EventStore,
+        seed_raw_agent_state: RawAgentStateSeeder,
+        caplog: pytest.LogCaptureFixture,
+        stale_path: str,
+    ) -> None:
+        """A snapshot naming a deleted state class reads as ``None``, logged once — no raise."""
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        seed_raw_agent_state(
+            team_id, str(agent_id), stale_agent_state_document(team_id, str(agent_id), stale_path)
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert event_store.load_agent_state(team_id, agent_id) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(agent_id) in warnings[0].getMessage()
+        assert str(team_id) in warnings[0].getMessage()
+
     # --- delete_team ------------------------------------------------------
 
     def test_delete_team_cascades_across_three_kinds(self, event_store: EventStore) -> None:

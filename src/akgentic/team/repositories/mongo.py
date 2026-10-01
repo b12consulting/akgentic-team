@@ -545,6 +545,31 @@ class MongoEventStore:
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
 
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
+        """Load one agent state snapshot with a ``find_one`` on ``team_id`` + ``agent_id``.
+
+        Served by the unique ``(team_id, agent_id)`` index.
+
+        Args:
+            team_id: Unique identifier of the team.
+            agent_id: The agent's UUID; matched as ``str(agent_id)``.
+
+        Returns:
+            The snapshot, or ``None`` if absent or if it does not validate
+            (logged at WARNING).
+        """
+        doc = self._agent_states.find_one({"team_id": str(team_id), "agent_id": str(agent_id)})
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        try:
+            return AgentStateSnapshot.model_validate(doc)
+        except (ValueError, TypeError) as exc:
+            logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
+            return None
+
     def delete_team(self, team_id: uuid.UUID) -> None:
         """Delete all persisted data for a team from all three collections.
 

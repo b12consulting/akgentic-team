@@ -11,12 +11,19 @@ drift fails a test instead of going unnoticed.
 from __future__ import annotations
 
 import time
+import uuid
 
 import pytest
 
 from akgentic.team.models import TeamStatus
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from tests.models.conftest import AcmeTeamMetadata, make_indexed_process, make_process
+from tests.models.conftest import (
+    AcmeTeamMetadata,
+    SampleAgentState,
+    make_agent_state_snapshot,
+    make_indexed_process,
+    make_process,
+)
 from tests.repositories.test_event_store_contract import (
     METADATA_FILTER_IDS,
     METADATA_FILTER_MATRIX,
@@ -289,3 +296,58 @@ class TestInMemoryEventStoreCardEnumeration:
 
         (entry,) = store.list_agent_card_entries()
         assert entry.first_seen_at is None
+
+
+class TestInMemoryEventStoreLoadAgentState:
+    """The fake's one-agent read must answer what the real backends answer."""
+
+    def test_a_hit_returns_the_saved_snapshot(self) -> None:
+        store = InMemoryEventStore()
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(
+            make_agent_state_snapshot(
+                team_id=team_id, agent_id=str(agent_id), state=SampleAgentState(task_count=3)
+            )
+        )
+
+        loaded = store.load_agent_state(team_id, agent_id)
+
+        assert loaded is not None
+        assert (loaded.team_id, loaded.agent_id) == (team_id, str(agent_id))
+        assert isinstance(loaded.state, SampleAgentState)
+        assert loaded.state.task_count == 3
+
+    def test_a_miss_returns_none(self) -> None:
+        store = InMemoryEventStore()
+        team_id, known = uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id=str(known)))
+
+        assert store.load_agent_state(team_id, uuid.uuid4()) is None
+        assert store.load_agent_state(uuid.uuid4(), known) is None
+
+    def test_another_teams_snapshot_is_never_returned(self) -> None:
+        store = InMemoryEventStore()
+        team_a, team_b, shared = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(make_agent_state_snapshot(team_id=team_b, agent_id=str(shared)))
+
+        assert store.load_agent_state(team_a, shared) is None
+
+    def test_mutating_the_returned_state_does_not_change_a_second_read(self) -> None:
+        """Detached, as the real backends are: they rebuild the state on every load."""
+        store = InMemoryEventStore()
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        store.save_agent_state(
+            make_agent_state_snapshot(
+                team_id=team_id, agent_id=str(agent_id), state=SampleAgentState(task_count=1)
+            )
+        )
+
+        first = store.load_agent_state(team_id, agent_id)
+        assert first is not None
+        assert isinstance(first.state, SampleAgentState)
+        first.state.task_count = 99
+
+        second = store.load_agent_state(team_id, agent_id)
+        assert second is not None
+        assert isinstance(second.state, SampleAgentState)
+        assert second.state.task_count == 1

@@ -578,6 +578,8 @@ class YamlEventStore:
         """
         states_dir = self._team_dir(snapshot.team_id) / "states"
         states_dir.mkdir(parents=True, exist_ok=True)
+        # Same path ``load_agent_state`` builds, from a free ``str`` id: it comes from
+        # the actor system, not a request. The read is closed by its ``uuid.UUID`` type.
         state_path = states_dir / f"{snapshot.agent_id}.yaml"
         self._atomic_write(state_path, snapshot.model_dump())
         logger.debug(
@@ -612,6 +614,33 @@ class YamlEventStore:
                 )
         logger.debug("Loaded %d agent states for team %s", len(snapshots), team_id)
         return snapshots
+
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
+        """Load one agent state snapshot from ``states/{agent_id}.yaml``.
+
+        Reads that one file; never globs ``states/``. ``agent_id`` is a UUID, so
+        the file name it forms cannot leave this team's ``states/``.
+
+        Args:
+            team_id: Unique identifier of the team.
+            agent_id: The agent's UUID; the file stem is ``str(agent_id)``.
+
+        Returns:
+            The snapshot, or ``None`` if the file is absent or does not load
+            (logged at WARNING).
+        """
+        state_path = self._team_dir(team_id) / "states" / f"{agent_id}.yaml"
+        try:
+            with open(state_path) as f:
+                return AgentStateSnapshot.model_validate(yaml.safe_load(f))
+        except FileNotFoundError:
+            return None
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            # ValueError covers a non-UTF-8 file and Pydantic's ValidationError.
+            logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
+            return None
 
     def delete_team(self, team_id: uuid.UUID) -> None:
         """Delete all persisted data for a team.

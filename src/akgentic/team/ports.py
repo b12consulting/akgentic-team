@@ -263,6 +263,25 @@ class EventStore(Protocol):
         """
         ...
 
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
+        """Load one agent's state snapshot through a point read on ``(team_id, agent_id)``.
+
+        Returns ``None`` when the team holds no snapshot for that agent. It never
+        returns another team's snapshot, whatever ``agent_id`` holds. A stored
+        snapshot that does not validate is logged at ``WARNING`` naming the agent
+        and the team and returns ``None`` — never raises — as ``load_agent_states``
+        skips it.
+
+        ``agent_id`` is the agent's UUID; backends key the lookup on
+        ``str(agent_id)``, the form ``save_agent_state`` stores. Legacy snapshots
+        keyed by display name (``@Manager``) have no UUID that maps to them: they
+        are reachable only through ``load_agent_states``, and self-heal to a UUID
+        key on the agent's next state change.
+        """
+        ...
+
     def save_agent_cards(self, cards: list[AgentCard]) -> None:
         """Persist agent cards into the content-addressed card store.
 

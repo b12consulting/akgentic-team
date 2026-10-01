@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the twelve :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the thirteen :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -425,6 +425,28 @@ class NagraEventStore:
                     "Skipping corrupted agent state %s for team %s: %s", row[0], team_id, exc
                 )
         return snapshots
+
+    def load_agent_state(
+        self, team_id: uuid.UUID, agent_id: uuid.UUID
+    ) -> AgentStateSnapshot | None:
+        """Return one agent's snapshot by its ``(team_id, str(agent_id))`` key, or ``None``.
+
+        A row that does not validate is logged at ``WARNING`` naming the agent and
+        the team, and reads as ``None``, as on the YAML and Mongo backends.
+        """
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute(
+                "SELECT data FROM agent_state_entries WHERE team_id = %s AND agent_id = %s",
+                (str(team_id), str(agent_id)),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            return AgentStateSnapshot.model_validate(decode_jsonb_column(row[0]))
+        except (ValueError, TypeError) as exc:
+            logger.warning("Corrupted agent state %s for team %s: %s", agent_id, team_id, exc)
+            return None
 
     # --- agent cards (agent_card_entries) ----------------------------------
 

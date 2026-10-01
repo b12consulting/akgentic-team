@@ -1342,3 +1342,41 @@ class TestTheWriterRefusesWhatTheReaderWouldRefuse:
 
         assert [e.sequence for e in loaded] == [1, 2]
         assert any("Skipping corrupted event" in r.getMessage() for r in caplog.records)
+
+
+class TestYamlLoadAgentState:
+    """YAML-only paths of ``load_agent_state``: a missing or unopenable file is never a raise."""
+
+    def test_an_absent_states_directory_is_a_miss(self, yaml_store: YamlEventStore) -> None:
+        """A team with no ``states/`` at all reads as ``None``, not an exception."""
+        team_id = uuid.uuid4()
+        yaml_store.save_team(make_process(team_id=team_id))
+
+        assert yaml_store.load_agent_state(team_id, uuid.uuid4()) is None
+
+    def test_a_states_directory_without_that_file_is_a_miss(
+        self, yaml_store: YamlEventStore
+    ) -> None:
+        """``states/`` exists but holds no file for the id, e.g. removed by a concurrent delete."""
+        team_id = uuid.uuid4()
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
+
+        assert yaml_store.load_agent_state(team_id, uuid.uuid4()) is None
+
+    def test_an_unreadable_entry_is_none_with_a_warning(
+        self, yaml_store: YamlEventStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A directory named like a snapshot cannot be opened: ``None`` and a WARNING."""
+        team_id, agent_id = uuid.uuid4(), uuid.uuid4()
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=team_id, agent_id=str(uuid.uuid4()))
+        )
+        (tmp_path / str(team_id) / "states" / f"{agent_id}.yaml").mkdir()
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.team.repositories.yaml"):
+            assert yaml_store.load_agent_state(team_id, agent_id) is None
+
+        assert str(agent_id) in caplog.text
+        assert str(team_id) in caplog.text
