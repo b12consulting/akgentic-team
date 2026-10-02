@@ -1674,22 +1674,22 @@ def _same_stamp(left: datetime, right: datetime) -> bool:
     return abs(_as_utc(left) - _as_utc(right)) <= _MILLISECOND
 
 
+_DESCRIPTION_KEYS = frozenset({"team_description", "description_origin", "updated_at"})
+
+
+def _everything_but_the_description(process: Process) -> dict[str, object]:
+    """The dump with the three keys the write owns removed."""
+    return {k: v for k, v in process.model_dump().items() if k not in _DESCRIPTION_KEYS}
+
+
 def _assert_only_the_description_changed(after: Process, before: Process) -> None:
-    """Every field but the three the write owns equals the saved one."""
-    assert after.team_id == before.team_id
-    assert after.status == before.status
-    assert after.user_id == before.user_id
-    assert after.user_email == before.user_email
-    assert after.team_name == before.team_name
-    assert after.catalog_namespace == before.catalog_namespace
-    assert after.metadata == before.metadata
-    assert after.metadata_indexes == before.metadata_indexes
-    assert _same_stamp(after.created_at, before.created_at)
-    assert after.entry_point == before.entry_point
-    assert after.supervisors == before.supervisors
-    assert after.agent_cards == before.agent_cards
-    assert after.message_types == before.message_types
-    assert after.metadata_type == before.metadata_type
+    """Every field but the three the write owns equals the saved one.
+
+    Compared through the dumps rather than field by field: an enumerated
+    comparison is complete on the day it is written and silently stops covering
+    the field added next, which is the one this spec most needs to see.
+    """
+    assert _everything_but_the_description(after) == _everything_but_the_description(before)
 
 
 class TestUpdateTeamDescriptionContract:

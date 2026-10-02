@@ -126,8 +126,11 @@ class EventStore(Protocol):
     ) -> Process | None:
         """Write ``team_description`` and its owner in ONE conditional, field-level write.
 
-        The **only** writer of ``Process.description_origin`` anywhere in this
-        package. Two processes write the description — a server endpoint on
+        The **only** method in this package that *sets* ``description_origin``
+        (``save_team`` re-persists whatever value a loaded ``Process`` already
+        carries, which is why its whole-document replace remains a narrow
+        hazard and must never be used to change these fields). Two processes
+        write the description — a server endpoint on
         behalf of a user (``USER``) and a worker-side generator (``AUTO``) — and
         ``save_team`` cannot arbitrate between them: it is a whole-document
         replace after a read on every backend, so the later writer wins whatever

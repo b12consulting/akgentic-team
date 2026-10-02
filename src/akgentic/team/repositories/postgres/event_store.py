@@ -178,8 +178,12 @@ class NagraEventStore:
         memory and a concurrent writer's change survives. The column is declared
         ``json`` (Nagra's ``json`` type), which has no ``||`` of its own, hence
         the cast in and back out: ``(data::jsonb || %s::jsonb)::json``. The
-        promoted ``metadata_indexes`` column is not touched — nothing on this
-        path changes it.
+        round trip through ``jsonb`` re-serialises the stored text — key order
+        and whitespace are normalised, a duplicate key collapses to its last
+        value — but every key and value the row held is still there, which is
+        what the raw-document spec in the contract suite pins. The promoted
+        ``metadata_indexes`` column is not touched — nothing on this path
+        changes it.
 
         The ``AUTO`` guard is a ``WHERE`` term in the same statement —
         ``data->>'description_origin' IS DISTINCT FROM 'user'`` — so condition
