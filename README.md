@@ -1069,6 +1069,44 @@ This package only ships the backend implementation, the `[postgres]`
 extra, the deployment hook, and the documentation. The enterprise
 deployment project owns the application-level switch.
 
+### The team description has an owner and one conditional writer
+
+`Process.team_description` is `None` at creation and is never seeded from the
+card. Two writers may fill it later — a user editing it, and a generator that
+summarises the team's first message — and `Process.description_origin` records
+which of them owns the current value:
+
+| `description_origin` | Meaning |
+|---|---|
+| `DescriptionOrigin.AUTO` (default) | the generator may write — whether or not it has written yet |
+| `DescriptionOrigin.USER` | a user wrote it; the generator never writes again, not even after the user clears it to `None` |
+
+Both go through one store method, `EventStore.update_team_description`, reachable
+from the manager as a plain pass-through:
+
+```python
+from akgentic.team import DescriptionOrigin
+
+# A user's edit always lands and latches the owner to USER.
+process = manager.update_description(runtime.id, "Quarterly review", DescriptionOrigin.USER)
+
+# A generated line lands only while the owner is still AUTO; against a
+# USER-owned record it writes nothing and returns the stored Process unchanged.
+process = manager.update_description(runtime.id, "Generated", DescriptionOrigin.AUTO)
+
+manager.update_description(runtime.id, None, DescriptionOrigin.USER)  # clears, and stays cleared
+```
+
+The write is **field-level and conditional inside the store**: exactly
+`team_description`, `description_origin` and `updated_at` are written, and the
+ownership check is the write's own filter (`$ne` on Mongo, `IS DISTINCT FROM` on
+Postgres, a raw-document check before the atomic rewrite on YAML). Two processes
+writing the same team never overwrite each other's other fields, and a user edit
+that lands while a generator is running wins. The method returns `None` for an
+unknown team, writes to a `DELETED` team (lifecycle answers belong to the
+caller), and neither trims nor caps the string — callers own the 500-character
+limit. Never set these two fields through `save_team`.
+
 ### Crash Recovery
 
 `TeamRestorer` executes a 3-phase protocol:

@@ -11,7 +11,13 @@ from akgentic.core.orchestrator import STOP_TIMEOUT, EventSubscriber, Orchestrat
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.team.factory import TeamFactory
 from akgentic.team.metadata import derive_metadata_indexes
-from akgentic.team.models import Process, TeamCard, TeamRuntime, TeamStatus
+from akgentic.team.models import (
+    DescriptionOrigin,
+    Process,
+    TeamCard,
+    TeamRuntime,
+    TeamStatus,
+)
 from akgentic.team.ports import EventStore, NullServiceRegistry, ServiceRegistry
 from akgentic.team.projection import derive_team_projection
 from akgentic.team.restorer import TeamRestorer
@@ -586,3 +592,31 @@ class TeamManager:
 
         logger.info("Metadata updated for team %s", team_id)
         return updated_process
+
+    def update_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """Write a team's description through the store's conditional write.
+
+        A pass-through to :meth:`EventStore.update_team_description`, and
+        deliberately nothing more: no ``load_team`` first, no status check, no
+        orchestrator push, no runtime lookup. The ownership guard lives in the
+        store's own filter so two processes can write without racing; a
+        read-then-check here would reintroduce exactly the race the store method
+        exists to remove. Lifecycle decisions (404 on an unknown team, 409 on a
+        deleted one) belong to the caller, which resolves the ``Process`` first.
+
+        Args:
+            team_id: The team to write.
+            description: The new description, verbatim, or ``None`` to clear.
+            origin: Who is writing — ``USER`` latches, ``AUTO`` yields to a
+                ``USER``-owned description.
+
+        Returns:
+            Whatever the store answers: the stored ``Process`` after the call,
+            or ``None`` for an unknown team.
+        """
+        return self._event_store.update_team_description(team_id, description, origin)
