@@ -17,6 +17,7 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
@@ -138,6 +139,38 @@ class InMemoryEventStore:
         """Persist team process snapshot."""
         self.write_calls.append("save_team")
         self.teams[process.team_id] = process
+
+    def update_team_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """The conditional description write, with the SAME condition as the backends.
+
+        ``None`` for an unknown team; for ``AUTO`` against a stored ``USER``
+        origin the stored ``Process`` comes back untouched; otherwise the three
+        keys are written through ``model_copy`` and the result stored and
+        returned. The condition is the whole point of carrying this method: a
+        fake that always writes, or never writes, passes the conformance sweep's
+        shape check and could not fail a test the real backends fail.
+        ``test_in_memory_event_store.py`` pins both directions.
+        """
+        self.write_calls.append("update_team_description")
+        stored = self.teams.get(team_id)
+        if stored is None:
+            return None
+        if origin is DescriptionOrigin.AUTO and stored.description_origin is DescriptionOrigin.USER:
+            return stored
+        updated = stored.model_copy(
+            update={
+                "team_description": description,
+                "description_origin": origin,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.teams[team_id] = updated
+        return updated
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
         """Load a team process snapshot by ID."""

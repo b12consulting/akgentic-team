@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 RawTeamSeeder = Callable[[uuid.UUID, dict[str, Any]], None]
 """Writes one raw team document straight into the backend's storage."""
 
+RawTeamReader = Callable[[uuid.UUID], dict[str, Any] | None]
+"""Reads one raw team document straight out of the backend's storage.
+
+The counterpart of ``RawTeamSeeder``: the stored mapping as the backend holds
+it, with no ``Process.model_validate`` in between. A validated ``Process`` can
+only report fields the current model knows, so a key planted raw and dropped by
+a write path is invisible through ``load_team`` -- this is the only read that
+can see it. ``None`` when the backend holds no document for the id.
+"""
+
 RawAgentStateSeeder = Callable[[uuid.UUID, str, dict[str, Any]], None]
 """Writes one raw agent-state document straight into the backend's storage."""
 
@@ -156,6 +166,57 @@ def seed_raw_team(
             )
 
     return _seed
+
+
+@pytest.fixture
+def read_raw_team(
+    request: pytest.FixtureRequest,
+    event_store: EventStore,
+    tmp_path: Path,
+) -> RawTeamReader:
+    """Return a function that reads the raw stored document from the yielded backend.
+
+    Reads exactly where ``seed_raw_team`` writes and where the backend's own
+    ``load_team`` reads: the team's ``team.yaml``, the ``teams`` collection
+    (minus Mongo's ``_id``), the ``data`` column. Nothing is validated on the
+    way out, so an unknown top-level key is reported as stored.
+    """
+    del event_store  # requested so the backend's storage exists and is clean
+    backend: str = request.node.callspec.params["event_store"]
+
+    def _read(team_id: uuid.UUID) -> dict[str, Any] | None:
+        if backend == "yaml":
+            team_path = tmp_path / str(team_id) / "team.yaml"
+            if not team_path.exists():
+                return None
+            with open(team_path) as handle:
+                document: dict[str, Any] | None = yaml.safe_load(handle)
+            return document
+        if backend == "mongo":
+            mongo_db = request.getfixturevalue("mongo_db")
+            from akgentic.team.repositories.mongo import TEAMS_COLLECTION
+
+            found: dict[str, Any] | None = mongo_db[TEAMS_COLLECTION].find_one(
+                {"team_id": str(team_id)}
+            )
+            if found is not None:
+                found.pop("_id", None)
+            return found
+        conn = request.getfixturevalue("postgres_clean_tables")
+        from nagra import Transaction  # type: ignore[import-untyped]
+
+        from akgentic.team.repositories.postgres._queries import decode_jsonb_column
+
+        with Transaction(conn) as trn:
+            cursor = trn.execute(
+                "SELECT data FROM team_process_entries WHERE id = %s", (str(team_id),)
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(decode_jsonb_column(row[0]))
+
+    return _read
 
 
 @pytest.fixture

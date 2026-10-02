@@ -15,7 +15,7 @@ import uuid
 
 import pytest
 
-from akgentic.team.models import TeamStatus
+from akgentic.team.models import DescriptionOrigin, TeamStatus
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from tests.models.conftest import (
     AcmeTeamMetadata,
@@ -351,3 +351,78 @@ class TestInMemoryEventStoreLoadAgentState:
         assert second is not None
         assert isinstance(second.state, SampleAgentState)
         assert second.state.task_count == 1
+
+
+class TestInMemoryEventStoreUpdateTeamDescription:
+    """The fake's conditional write must answer what the real backends answer.
+
+    The conformance sweep proves the method EXISTS; only these specs prove it
+    carries the condition. A fake that always writes passes the shape check and
+    fails "AUTO loses to USER"; one that never writes passes the shape check
+    and fails "USER lands". Both directions are pinned so neither drift can
+    make the service suite green against a manager the backends would fail.
+    """
+
+    def test_a_user_write_lands_and_latches(self) -> None:
+        store = InMemoryEventStore()
+        saved = make_process()
+        store.save_team(saved)
+
+        result = store.update_team_description(saved.team_id, "Mine", DescriptionOrigin.USER)
+
+        assert result is not None
+        assert result.team_description == "Mine"
+        assert result.description_origin is DescriptionOrigin.USER
+        assert result.updated_at > saved.updated_at
+        stored = store.load_team(saved.team_id)
+        assert stored is not None
+        assert stored.team_description == "Mine"
+        assert stored.description_origin is DescriptionOrigin.USER
+
+    def test_an_auto_write_loses_to_a_user_owned_description(self) -> None:
+        store = InMemoryEventStore()
+        saved = make_process()
+        store.save_team(saved)
+        owned = store.update_team_description(saved.team_id, "Mine", DescriptionOrigin.USER)
+        assert owned is not None
+
+        result = store.update_team_description(saved.team_id, "Generated", DescriptionOrigin.AUTO)
+
+        assert result is not None
+        assert result.team_description == "Mine"
+        assert result.description_origin is DescriptionOrigin.USER
+        assert result.updated_at == owned.updated_at
+        stored = store.load_team(saved.team_id)
+        assert stored is not None
+        assert stored.team_description == "Mine"
+
+    def test_an_auto_write_lands_on_an_auto_team(self) -> None:
+        store = InMemoryEventStore()
+        saved = make_process()
+        store.save_team(saved)
+
+        result = store.update_team_description(saved.team_id, "Generated", DescriptionOrigin.AUTO)
+
+        assert result is not None
+        assert result.team_description == "Generated"
+        assert result.description_origin is DescriptionOrigin.AUTO
+        stored = store.load_team(saved.team_id)
+        assert stored is not None
+        assert stored.team_description == "Generated"
+
+    def test_an_unknown_team_returns_none_and_creates_nothing(self) -> None:
+        store = InMemoryEventStore()
+        ghost = uuid.uuid4()
+
+        assert store.update_team_description(ghost, "Anything", DescriptionOrigin.USER) is None
+        assert store.update_team_description(ghost, "Anything", DescriptionOrigin.AUTO) is None
+        assert store.load_team(ghost) is None
+
+    def test_the_write_is_recorded_in_write_calls(self) -> None:
+        store = InMemoryEventStore()
+        saved = make_process()
+        store.save_team(saved)
+
+        store.update_team_description(saved.team_id, "Mine", DescriptionOrigin.USER)
+
+        assert store.write_calls == ["save_team", "update_team_description"]

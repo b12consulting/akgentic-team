@@ -1,7 +1,7 @@
 """Domain models for team lifecycle management.
 
-TeamCard, TeamCardMember, TeamRuntime, TeamStatus, AgentRef, AgentCardRef,
-AgentCardEntry, Process, PersistedEvent, AgentStateSnapshot.
+TeamCard, TeamCardMember, TeamRuntime, TeamStatus, DescriptionOrigin, AgentRef,
+AgentCardRef, AgentCardEntry, Process, PersistedEvent, AgentStateSnapshot.
 """
 
 from __future__ import annotations
@@ -520,6 +520,19 @@ class TeamStatus(StrEnum):
     DELETED = "deleted"
 
 
+class DescriptionOrigin(StrEnum):
+    """Who owns ``Process.team_description``.
+
+    ``AUTO`` means *the generator may write* — whether or not it has written
+    yet, which is why it is the default and why a document written before the
+    field existed reads as it. ``USER`` is a one-way latch set only by a user's
+    write; nothing in this package clears it, not even a write of ``None``.
+    """
+
+    AUTO = "auto"
+    USER = "user"
+
+
 class AgentRef(SerializableBaseModel):
     """One spawned agent identity, and the role it was spawned from.
 
@@ -623,6 +636,12 @@ class Process(SerializableBaseModel):
             the card's description: the card describes a blueprint, this
             describes one running team, and conflating the two makes a
             user-edited description snap back to the blueprint's text.
+        description_origin: Who owns ``team_description``. ``AUTO`` (the
+            default, and what a document without the key reads as) lets the
+            generator write; ``USER`` is set by a user's write and never
+            cleared here. Written only by
+            :meth:`akgentic.team.ports.EventStore.update_team_description`,
+            always together with the description it describes.
         entry_point: Ref to the agent that receives external messages.
         supervisors: Refs to the first-layer members, in declaration order,
             already expanded for ``headcount`` — two instances of one role are
@@ -672,6 +691,14 @@ class Process(SerializableBaseModel):
         description=(
             "Mutable description of this team instance. None at creation and "
             "never seeded from the card's description."
+        ),
+    )
+    description_origin: DescriptionOrigin = Field(
+        default=DescriptionOrigin.AUTO,
+        description=(
+            "Who owns team_description: 'auto' lets the generator write, 'user' "
+            "is a one-way latch set by a user's write. Defaults so a document "
+            "written before the field existed needs no migration."
         ),
     )
     entry_point: AgentRef = Field(

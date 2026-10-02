@@ -27,7 +27,13 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import UserMessage
 
-from akgentic.team.models import AgentCardEntry, AgentCardRef, Process, TeamStatus
+from akgentic.team.models import (
+    AgentCardEntry,
+    AgentCardRef,
+    DescriptionOrigin,
+    Process,
+    TeamStatus,
+)
 from akgentic.team.ports import AgentCardNotFoundError, EventNotFoundError, EventStore
 from akgentic.team.projection import (
     hash_agent_card,
@@ -49,6 +55,7 @@ from tests.repositories.conftest import (
     DamagedAgentCardSeeder,
     RawAgentCardSeeder,
     RawAgentStateSeeder,
+    RawTeamReader,
     RawTeamSeeder,
     stale_agent_state_document,
 )
@@ -1651,3 +1658,327 @@ class TestAgentCardStoreContract:
         assert entry.card_hash == expected
         assert hash_agent_card(event_store.load_agent_cards([expected])[expected]) == expected
 
+
+# ---------------------------------------------------------------------------
+# update_team_description — the conditional, field-level description write
+# ---------------------------------------------------------------------------
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalise a stamp for comparison: a naive value read back is UTC by construction."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _same_stamp(left: datetime, right: datetime) -> bool:
+    """Equal to within storage resolution — BSON keeps milliseconds."""
+    return abs(_as_utc(left) - _as_utc(right)) <= _MILLISECOND
+
+
+def _assert_only_the_description_changed(after: Process, before: Process) -> None:
+    """Every field but the three the write owns equals the saved one."""
+    assert after.team_id == before.team_id
+    assert after.status == before.status
+    assert after.user_id == before.user_id
+    assert after.user_email == before.user_email
+    assert after.team_name == before.team_name
+    assert after.catalog_namespace == before.catalog_namespace
+    assert after.metadata == before.metadata
+    assert after.metadata_indexes == before.metadata_indexes
+    assert _same_stamp(after.created_at, before.created_at)
+    assert after.entry_point == before.entry_point
+    assert after.supervisors == before.supervisors
+    assert after.agent_cards == before.agent_cards
+    assert after.message_types == before.message_types
+    assert after.metadata_type == before.metadata_type
+
+
+class TestUpdateTeamDescriptionContract:
+    """The Contract table, one spec per row, on every backend.
+
+    The guard is the write's OWN filter — Mongo ``$ne``, Postgres
+    ``IS DISTINCT FROM``, YAML's raw-dict check before its atomic rewrite — and
+    the write touches three keys and nothing else. Both halves are pinned here
+    because neither is visible through ``save_team`` / ``load_team`` alone.
+    """
+
+    # --- row 1: USER lands ----------------------------------------------------
+
+    def test_a_user_write_lands_on_an_existing_team(self, event_store: EventStore) -> None:
+        """Row 1: the three keys are written, ``updated_at`` moves, nothing else does."""
+        saved = make_indexed_process(AcmeTeamMetadata(tenant="acme"), user_id="u-1")
+        assert saved.team_description is None
+        event_store.save_team(saved)
+        time.sleep(0.01)
+
+        result = event_store.update_team_description(
+            saved.team_id, "Quarterly review", DescriptionOrigin.USER
+        )
+
+        assert result is not None
+        assert result.team_description == "Quarterly review"
+        assert result.description_origin is DescriptionOrigin.USER
+        assert _as_utc(result.updated_at) > _as_utc(saved.updated_at)
+        _assert_only_the_description_changed(result, saved)
+
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description == "Quarterly review"
+        assert loaded.description_origin is DescriptionOrigin.USER
+        assert _same_stamp(loaded.updated_at, result.updated_at)
+        _assert_only_the_description_changed(loaded, saved)
+
+    # --- row 2: AUTO lands while the origin is auto ---------------------------
+
+    def test_an_auto_write_lands_when_the_stored_origin_is_auto(
+        self, event_store: EventStore
+    ) -> None:
+        """Row 2a: ``AUTO`` is not a latch — a second ``AUTO`` write replaces the first."""
+        saved = make_process()
+        event_store.save_team(saved)
+
+        first = event_store.update_team_description(
+            saved.team_id, "Generated once", DescriptionOrigin.AUTO
+        )
+        assert first is not None
+        assert first.team_description == "Generated once"
+        assert first.description_origin is DescriptionOrigin.AUTO
+        _assert_only_the_description_changed(first, saved)
+
+        second = event_store.update_team_description(
+            saved.team_id, "Generated again", DescriptionOrigin.AUTO
+        )
+        assert second is not None
+        assert second.team_description == "Generated again"
+        assert second.description_origin is DescriptionOrigin.AUTO
+
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description == "Generated again"
+        assert loaded.description_origin is DescriptionOrigin.AUTO
+
+    def test_an_auto_write_lands_when_the_key_is_absent(
+        self, event_store: EventStore, seed_raw_team: RawTeamSeeder
+    ) -> None:
+        """Row 2b: a document written before the field counts as "generator may write".
+
+        Mongo ``$ne`` matches a missing key and Postgres ``IS DISTINCT FROM``
+        treats ``NULL`` as distinct from ``'user'``; YAML reads the raw dict.
+        """
+        team_id = uuid.uuid4()
+        document = make_process(team_id=team_id).model_dump()
+        del document["description_origin"]
+        seed_raw_team(team_id, document)
+
+        result = event_store.update_team_description(team_id, "Generated", DescriptionOrigin.AUTO)
+
+        assert result is not None
+        assert result.team_description == "Generated"
+        assert result.description_origin is DescriptionOrigin.AUTO
+        loaded = event_store.load_team(team_id)
+        assert loaded is not None
+        assert loaded.team_description == "Generated"
+        assert loaded.description_origin is DescriptionOrigin.AUTO
+
+    # --- row 3: AUTO loses to USER --------------------------------------------
+
+    def test_an_auto_write_against_a_user_owned_record_writes_nothing(
+        self, event_store: EventStore
+    ) -> None:
+        """Row 3: THE spec. Not the description, not the origin, not ``updated_at``.
+
+        The sleep is load-bearing: a backend that wrote anyway and then
+        re-read would land inside one millisecond tick and hide under the
+        stamp tolerance, exactly as in the card store's re-save spec.
+        """
+        saved = make_process()
+        event_store.save_team(saved)
+        owned = event_store.update_team_description(saved.team_id, "Mine", DescriptionOrigin.USER)
+        assert owned is not None
+        time.sleep(0.01)
+
+        result = event_store.update_team_description(
+            saved.team_id, "Generated", DescriptionOrigin.AUTO
+        )
+
+        assert result is not None
+        assert result.team_description == "Mine"
+        assert result.description_origin is DescriptionOrigin.USER
+        assert _same_stamp(result.updated_at, owned.updated_at)
+
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description == "Mine"
+        assert loaded.description_origin is DescriptionOrigin.USER
+        assert _same_stamp(loaded.updated_at, owned.updated_at)
+
+    # --- row 4: None clears ---------------------------------------------------
+
+    def test_a_user_clear_is_durable_and_does_not_reset_the_latch(
+        self, event_store: EventStore
+    ) -> None:
+        """Row 4: ``None`` from a user is a choice; the generator may not fill it back in."""
+        saved = make_process()
+        event_store.save_team(saved)
+        owned = event_store.update_team_description(saved.team_id, "Mine", DescriptionOrigin.USER)
+        assert owned is not None
+        time.sleep(0.01)
+
+        cleared = event_store.update_team_description(saved.team_id, None, DescriptionOrigin.USER)
+
+        assert cleared is not None
+        assert cleared.team_description is None
+        assert cleared.description_origin is DescriptionOrigin.USER
+        assert _as_utc(cleared.updated_at) > _as_utc(owned.updated_at)
+        time.sleep(0.01)
+
+        refilled = event_store.update_team_description(
+            saved.team_id, "Generated", DescriptionOrigin.AUTO
+        )
+
+        assert refilled is not None
+        assert refilled.team_description is None
+        assert refilled.description_origin is DescriptionOrigin.USER
+        assert _same_stamp(refilled.updated_at, cleared.updated_at)
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description is None
+        assert loaded.description_origin is DescriptionOrigin.USER
+
+    def test_an_auto_clear_on_an_auto_team_clears(self, event_store: EventStore) -> None:
+        """Row 4, the other half: the generator may clear what it wrote."""
+        saved = make_process()
+        event_store.save_team(saved)
+        event_store.update_team_description(saved.team_id, "Generated", DescriptionOrigin.AUTO)
+
+        cleared = event_store.update_team_description(saved.team_id, None, DescriptionOrigin.AUTO)
+
+        assert cleared is not None
+        assert cleared.team_description is None
+        assert cleared.description_origin is DescriptionOrigin.AUTO
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description is None
+        assert loaded.description_origin is DescriptionOrigin.AUTO
+
+    # --- row 5: unknown team --------------------------------------------------
+
+    @pytest.mark.parametrize("origin", list(DescriptionOrigin), ids=lambda o: o.value)
+    def test_an_unknown_team_returns_none_and_creates_nothing(
+        self, event_store: EventStore, origin: DescriptionOrigin
+    ) -> None:
+        """Row 5: an update, never an upsert."""
+        ghost = uuid.uuid4()
+
+        assert event_store.update_team_description(ghost, "Anything", origin) is None
+        assert event_store.load_team(ghost) is None
+        assert event_store.list_teams() == []
+
+    # --- row 6: DELETED team --------------------------------------------------
+
+    def test_a_deleted_team_is_written_and_keeps_its_status(self, event_store: EventStore) -> None:
+        """Row 6: the store does not check status; 404 / 409 belong to the caller."""
+        saved = make_process(status=TeamStatus.DELETED)
+        event_store.save_team(saved)
+
+        result = event_store.update_team_description(
+            saved.team_id, "Written anyway", DescriptionOrigin.USER
+        )
+
+        assert result is not None
+        assert result.team_description == "Written anyway"
+        assert result.status is TeamStatus.DELETED
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description == "Written anyway"
+        assert loaded.status is TeamStatus.DELETED
+
+    # --- row 7: field-level, the raw-document guard ---------------------------
+
+    def test_an_unknown_key_survives_the_write(
+        self,
+        event_store: EventStore,
+        seed_raw_team: RawTeamSeeder,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """Row 7: three keys are written and the document is otherwise untouched.
+
+        A key the current model has never heard of stands in for the field a
+        newer version — or a concurrent writer — put there. It is planted raw
+        and read back raw, because ``Process.model_validate`` drops it on sight
+        (Pydantic's default ``extra="ignore"``) and a validated ``Process`` can
+        therefore never show it missing. Mutation-verified on YAML: a read →
+        ``model_validate`` → ``model_copy`` → ``model_dump`` write turns this
+        red there and nothing else.
+        """
+        team_id = uuid.uuid4()
+        seeded = make_process(team_id=team_id).model_dump()
+        seeded["extra_field"] = "sentinel"
+        seed_raw_team(team_id, dict(seeded))
+        time.sleep(0.01)
+
+        result = event_store.update_team_description(team_id, "Field-level", DescriptionOrigin.USER)
+
+        assert result is not None
+        raw = read_raw_team(team_id)
+        assert raw is not None
+        assert raw["extra_field"] == "sentinel"
+        assert raw["team_description"] == "Field-level"
+        assert raw["description_origin"] == "user"
+        assert raw["updated_at"] != seeded["updated_at"]
+        # And every other key is byte-identical to what was seeded.
+        untouched = {
+            k: v
+            for k, v in seeded.items()
+            if k not in ("team_description", "description_origin", "updated_at")
+        }
+        assert {k: raw[k] for k in untouched} == untouched
+
+    # --- no trimming, no cap --------------------------------------------------
+
+    def test_a_long_padded_description_is_stored_byte_for_byte(
+        self, event_store: EventStore
+    ) -> None:
+        """Callers own the 500-character cap and any trimming; the store writes what it gets."""
+        padded = "  " + "x" * 600 + "  "
+        saved = make_process()
+        event_store.save_team(saved)
+
+        result = event_store.update_team_description(saved.team_id, padded, DescriptionOrigin.USER)
+
+        assert result is not None
+        assert result.team_description == padded
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.team_description == padded
+
+    # --- round-trip integrity -------------------------------------------------
+
+    def test_every_write_leaves_a_document_load_team_validates(
+        self, event_store: EventStore
+    ) -> None:
+        """The three values are serialised as ``save_team`` serialises them.
+
+        A hand-formatted ``updated_at`` — the enum member or a raw ``datetime``
+        handed straight to the backend — would read back as a document
+        ``load_team`` refuses, which this sequence of writes turns into ``None``.
+        """
+        saved = make_process()
+        event_store.save_team(saved)
+
+        for description, origin in (
+            ("Generated", DescriptionOrigin.AUTO),
+            (None, DescriptionOrigin.AUTO),
+            ("Mine", DescriptionOrigin.USER),
+            (None, DescriptionOrigin.USER),
+            ("Generated again", DescriptionOrigin.AUTO),
+        ):
+            written = event_store.update_team_description(saved.team_id, description, origin)
+            assert written is not None
+            loaded = event_store.load_team(saved.team_id)
+            assert loaded is not None
+            assert loaded.team_description == written.team_description
+            assert loaded.description_origin is written.description_origin
+            assert _same_stamp(loaded.updated_at, written.updated_at)
+            assert loaded.updated_at.tzinfo is not None
+            # The reader accepts its own dump, which is the whole round trip.
+            assert Process.model_validate(loaded.model_dump()) == loaded

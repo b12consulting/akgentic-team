@@ -1,6 +1,6 @@
 """Nagra-backed ``EventStore`` implementation.
 
-Implements the thirteen :class:`~akgentic.team.ports.EventStore` Protocol methods
+Implements the fourteen :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
 :meth:`NagraEventStore.delete_team` is the one exception that spans a single
@@ -28,12 +28,14 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories._description import description_update_fields
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,61 @@ class NagraEventStore:
                 "metadata_indexes = EXCLUDED.metadata_indexes",
                 (str(process.team_id), data, list(process.metadata_indexes)),
             )
+
+    def update_team_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """Write the three description keys with ONE conditional ``UPDATE ... RETURNING``.
+
+        The three keys are merged into the stored document with the ``jsonb``
+        concatenation operator, so no other key of ``data`` is serialised from
+        memory and a concurrent writer's change survives. The column is declared
+        ``json`` (Nagra's ``json`` type), which has no ``||`` of its own, hence
+        the cast in and back out: ``(data::jsonb || %s::jsonb)::json``. The
+        promoted ``metadata_indexes`` column is not touched — nothing on this
+        path changes it.
+
+        The ``AUTO`` guard is a ``WHERE`` term in the same statement —
+        ``data->>'description_origin' IS DISTINCT FROM 'user'`` — so condition
+        and write are one operation. ``IS DISTINCT FROM`` treats an absent key
+        (``NULL``) as distinct from ``'user'``, which is what makes a row
+        written before the field count as writable. The statement is assembled
+        from fixed fragments only; every caller value rides a bound ``%s``.
+
+        No row back is ambiguous — no such team, or the filter rejected a
+        ``USER``-owned record — so it is followed by ``load_team``, whose answer
+        is right in both cases. A returned row is hydrated through
+        ``_hydrate_team`` at ERROR, as ``load_team`` does.
+
+        Args:
+            team_id: The team to write.
+            description: The new description, verbatim, or ``None`` to clear.
+            origin: Who is writing.
+
+        Returns:
+            The stored ``Process`` after the call, or ``None`` when the team
+            does not exist or its document will not validate.
+        """
+        sql = (
+            "UPDATE team_process_entries SET data = (data::jsonb || %s::jsonb)::json WHERE id = %s"
+        )
+        params: list[object] = [
+            json.dumps(description_update_fields(description, origin)),
+            str(team_id),
+        ]
+        if origin is DescriptionOrigin.AUTO:
+            sql += " AND data->>'description_origin' IS DISTINCT FROM %s"
+            params.append(DescriptionOrigin.USER.value)
+        sql += " RETURNING data"
+        with Transaction(self._conn_string) as trn:
+            cursor = trn.execute(sql, tuple(params))
+            row = cursor.fetchone()
+        if row is None:
+            return self.load_team(team_id)
+        return self._hydrate_team(str(team_id), row[0], logging.ERROR)
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
         """Load a team process snapshot by id; return ``None`` if absent.

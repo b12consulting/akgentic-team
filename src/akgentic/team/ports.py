@@ -10,6 +10,7 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
@@ -114,6 +115,84 @@ class EventStore(Protocol):
         """Persist the current team process snapshot.
 
         Called by PersistenceSubscriber to checkpoint team state.
+        """
+        ...
+
+    def update_team_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """Write ``team_description`` and its owner in ONE conditional, field-level write.
+
+        The **only** writer of ``Process.description_origin`` anywhere in this
+        package. Two processes write the description — a server endpoint on
+        behalf of a user (``USER``) and a worker-side generator (``AUTO``) — and
+        ``save_team`` cannot arbitrate between them: it is a whole-document
+        replace after a read on every backend, so the later writer wins whatever
+        it read. The ownership guard is therefore the write's **own filter**,
+        evaluated by the backend inside the write (Mongo ``$ne``, Postgres
+        ``IS DISTINCT FROM``, YAML raw-dict check immediately before its atomic
+        rewrite), never a check in the caller and never a read-then-replace.
+
+        **Three keys only.** Exactly ``team_description``, ``description_origin``
+        and ``updated_at`` are written, always together, so ``description_origin``
+        can never describe a value it did not accompany. No backend serialises
+        the whole ``Process`` from memory on this path, so a concurrent change to
+        any other field — a ``status`` flip by another process, a key this
+        version of the model has never heard of — is never overwritten. That is
+        what ``save_team`` cannot promise and why this method exists.
+
+        **No trim, no cap, no validation of the string.** The store writes what
+        it is handed, byte for byte, whitespace included. The 500-character cap
+        and any trimming belong to the caller (the endpoint rejects, the
+        generator truncates).
+
+        **No status check.** A ``DELETED`` team is written like any other; 404 /
+        409 belong to the caller, which resolves the ``Process`` first. A status
+        check here "for safety" would make the server-side write race the
+        worker again.
+
+        Contract — every row holds on every backend:
+
+        1. ``origin=USER`` on an existing team: the three keys are written,
+           ``description_origin`` becomes ``USER``, ``updated_at`` moves, every
+           other field is untouched. Returns the stored ``Process``.
+        2. ``origin=AUTO`` when the stored origin is ``auto`` **or the key is
+           absent** (a document written before the field): written exactly as
+           row 1 with ``description_origin == AUTO``. ``AUTO`` is not a latch —
+           a second ``AUTO`` write replaces the first.
+        3. ``origin=AUTO`` against a ``USER``-owned record: **nothing is
+           written**, not even ``updated_at``. Returns the stored ``Process``
+           unchanged.
+        4. ``description=None`` clears the description under the rules above.
+           A ``USER`` clear is a durable choice: the latch does **not** reset on
+           ``None``, so a later ``AUTO`` write is still a no-op.
+        5. Unknown ``team_id``: returns ``None``. The write is an update, never
+           an upsert — no document is created.
+        6. ``DELETED`` team: written as any other, ``status`` untouched.
+        7. Field-level: a top-level key the current model does not know
+           survives the write on every backend.
+
+        A no-match on a conditional backend is ambiguous — absent team, or
+        filter rejected it — so an implementation MUST follow a no-match with
+        :meth:`load_team` and return its answer (``None`` or the stored
+        ``Process``), never ``None`` alone. A stored document that does not
+        validate after the write follows the :meth:`load_team` convention:
+        logged at ERROR naming the ``team_id``, ``None`` returned.
+
+        Args:
+            team_id: The team to write.
+            description: The new description, or ``None`` to clear it. Stored
+                verbatim.
+            origin: Who is writing. ``USER`` always lands and latches;
+                ``AUTO`` lands only while the stored origin is not ``user``.
+
+        Returns:
+            The stored ``Process`` after the call — updated, or unchanged when
+            the ``AUTO`` guard rejected the write — or ``None`` when no team
+            with that id exists or its document will not validate.
         """
         ...
 
