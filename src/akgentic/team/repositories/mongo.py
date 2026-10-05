@@ -32,6 +32,7 @@ except ImportError as exc:
         "Install with: pip install akgentic-team[mongo]"
     ) from exc
 
+from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
 from akgentic.core.agent_card import AgentCard
@@ -39,12 +40,14 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories._description import description_update_fields
 
 if TYPE_CHECKING:
     import pymongo.collection
@@ -277,6 +280,55 @@ class MongoEventStore:
             upsert=True,
         )
         logger.debug("Saved team %s", process.team_id)
+
+    def update_team_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """Write the three description keys with ONE conditional ``find_one_and_update``.
+
+        ``$set`` of exactly the three keys, so no other field of the document is
+        serialised from memory and a concurrent writer's change survives. The
+        ``AUTO`` guard is in the FILTER — ``description_origin: {"$ne": "user"}``
+        — so the condition and the write are one operation on the server;
+        ``$ne`` matches a missing key, which is what makes a document written
+        before the field count as writable. No ``upsert``: an unknown team is
+        an update that matched nothing, never a new document.
+
+        A ``None`` from the driver is ambiguous — no such team, or the filter
+        rejected a ``USER``-owned record — so it is followed by ``load_team``,
+        whose answer is the right one in both cases. The returned document
+        follows ``load_team``'s corrupted-document convention.
+
+        Args:
+            team_id: The team to write.
+            description: The new description, verbatim, or ``None`` to clear.
+            origin: Who is writing.
+
+        Returns:
+            The stored ``Process`` after the call, or ``None`` when the team
+            does not exist or its document will not validate.
+        """
+        query: dict[str, object] = {"team_id": str(team_id)}
+        if origin is DescriptionOrigin.AUTO:
+            query["description_origin"] = {"$ne": DescriptionOrigin.USER.value}
+        doc = self._teams.find_one_and_update(
+            query,
+            {"$set": description_update_fields(description, origin)},
+            return_document=ReturnDocument.AFTER,
+        )
+        if doc is None:
+            return self.load_team(team_id)
+        doc.pop("_id", None)
+        try:
+            process = Process.model_validate(doc)
+        except (ValueError, TypeError) as exc:
+            logger.error("Corrupted team document for team %s: %s", team_id, exc)
+            return None
+        logger.debug("Updated description of team %s (origin=%s)", team_id, origin.value)
+        return process
 
     def load_team(self, team_id: uuid.UUID) -> Process | None:
         """Load a team process snapshot by ID.

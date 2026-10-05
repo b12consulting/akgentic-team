@@ -39,12 +39,14 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
 )
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
+from akgentic.team.repositories._description import description_update_fields
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +213,57 @@ class YamlEventStore:
         team_path = team_dir / "team.yaml"
         self._atomic_write(team_path, process.model_dump())
         logger.debug("Saved team %s to %s", process.team_id, team_path)
+
+    def update_team_description(
+        self,
+        team_id: uuid.UUID,
+        description: str | None,
+        origin: DescriptionOrigin,
+    ) -> Process | None:
+        """Write the three description keys into the RAW ``team.yaml`` document.
+
+        The document is read with ``_load_team_data`` and rewritten with the
+        three keys replaced in the loaded mapping itself — never
+        ``Process.model_validate``d first. Validating would drop every key the
+        current model does not know (Pydantic's default ``extra="ignore"``),
+        so a read → validate → ``model_copy`` → ``model_dump`` write destroys a
+        field a newer version or a concurrent writer put there, silently and
+        with every field-level assertion still green. Mutating the raw dict is
+        this backend's field-level write; the contract suite plants an unknown
+        key and reads it back raw to hold it to that.
+
+        The ``AUTO`` guard reads ``description_origin`` off the raw dict, right
+        before the atomic rewrite. An absent key is writable — a document
+        written before the field existed is one the generator may describe.
+        The check-then-write is acceptable here and nowhere else: this store is
+        single-process by construction, while Mongo and Postgres put the guard
+        in the statement.
+
+        Args:
+            team_id: The team to write.
+            description: The new description, verbatim, or ``None`` to clear.
+            origin: Who is writing.
+
+        Returns:
+            The stored ``Process`` after the call — the document just written,
+            or the untouched one when the ``AUTO`` guard rejected the write —
+            or ``None`` when no ``team.yaml`` exists or the document will not
+            load (logged, as ``load_team`` does).
+        """
+        data = self._load_team_data(team_id)
+        if not isinstance(data, dict):
+            # Absent → None. A parsed document that is not a mapping is as
+            # unloadable as one that will not parse: let load_team log it.
+            return self.load_team(team_id)
+        if (
+            origin is DescriptionOrigin.AUTO
+            and data.get("description_origin") == DescriptionOrigin.USER.value
+        ):
+            return self._validate_team_data(team_id, data)
+        data.update(description_update_fields(description, origin))
+        self._atomic_write(self._team_dir(team_id) / "team.yaml", data)
+        logger.debug("Updated description of team %s (origin=%s)", team_id, origin.value)
+        return self._validate_team_data(team_id, data)
 
     def _load_team_data(self, team_id: uuid.UUID) -> Any:
         """Read and parse team.yaml WITHOUT validating it.

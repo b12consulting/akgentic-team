@@ -10,6 +10,7 @@ from akgentic.core.messages.message import Message, UserMessage
 
 from akgentic.team.models import (
     AgentStateSnapshot,
+    DescriptionOrigin,
     PersistedEvent,
     Process,
     TeamStatus,
@@ -129,6 +130,63 @@ class TestProcess:
         data.pop("catalog_namespace", None)
         restored = Process.model_validate(data)
         assert restored.catalog_namespace is None
+
+
+class TestDescriptionOrigin:
+    """``DescriptionOrigin`` names who owns ``Process.team_description``."""
+
+    def test_has_exactly_two_members(self) -> None:
+        assert set(DescriptionOrigin) == {DescriptionOrigin.AUTO, DescriptionOrigin.USER}
+
+    def test_values_are_auto_and_user(self) -> None:
+        assert DescriptionOrigin.AUTO.value == "auto"
+        assert DescriptionOrigin.USER.value == "user"
+
+    def test_each_member_is_str(self) -> None:
+        for origin in DescriptionOrigin:
+            assert isinstance(origin, str)
+
+    def test_is_exported_from_the_package(self) -> None:
+        import akgentic.team
+
+        assert "DescriptionOrigin" in akgentic.team.__all__
+        assert akgentic.team.DescriptionOrigin is DescriptionOrigin
+
+
+class TestProcessDescriptionOrigin:
+    """``Process.description_origin`` defaults so a pre-field document needs no migration."""
+
+    def test_defaults_to_auto_with_no_description(self) -> None:
+        process = make_process()
+        assert process.team_description is None
+        assert process.description_origin is DescriptionOrigin.AUTO
+
+    def test_a_document_without_the_key_validates_to_auto(self) -> None:
+        """A stored document written before the field existed loads unchanged."""
+        data = make_process().model_dump()
+        data.pop("description_origin")
+        data.pop("team_description")
+        restored = Process.model_validate(data)
+        assert restored.description_origin is DescriptionOrigin.AUTO
+        assert restored.team_description is None
+
+    def test_a_user_origin_round_trips(self) -> None:
+        process = make_process().model_copy(
+            update={
+                "team_description": "Quarterly review",
+                "description_origin": DescriptionOrigin.USER,
+            }
+        )
+        data = process.model_dump()
+        assert data["description_origin"] == "user"
+        restored = Process.model_validate(data)
+        assert restored.description_origin is DescriptionOrigin.USER
+        assert restored.team_description == "Quarterly review"
+
+    def test_the_field_sits_directly_after_team_description(self) -> None:
+        """The dump order is the document order every backend writes."""
+        keys = list(Process.model_fields)
+        assert keys[keys.index("team_description") + 1] == "description_origin"
 
 
 class TestProcessMetadata:
