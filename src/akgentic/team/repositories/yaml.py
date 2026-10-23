@@ -150,7 +150,8 @@ class YamlEventStore:
 
     def __init__(self, data_dir: Path, *, delete_mode: DeleteMode = DeleteMode.HARD) -> None:
         self._data_dir = data_dir
-        self._delete_mode = delete_mode
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
 
     @staticmethod
     def _atomic_write(path: Path, data: dict[str, object]) -> None:

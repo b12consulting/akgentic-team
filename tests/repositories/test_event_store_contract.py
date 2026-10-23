@@ -18,6 +18,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -2029,6 +2030,20 @@ def _ids(processes: list[Process]) -> set[uuid.UUID]:
     return {p.team_id for p in processes}
 
 
+def _storage_of(request: pytest.FixtureRequest, tmp_path: Path) -> object:
+    """The storage argument the yielded ``event_store`` was built over.
+
+    The same directory, database or connection string ``soft_event_store``
+    reuses, so a store built from it here shares the yielded store's data.
+    """
+    backend: str = request.node.callspec.params["event_store"]
+    if backend == "yaml":
+        return tmp_path
+    if backend == "mongo":
+        return request.getfixturevalue("mongo_db")
+    return request.getfixturevalue("postgres_clean_tables")
+
+
 class TestSoftDeleteContract:
     """``SOFT`` retires: ``status`` and ``updated_at`` move, nothing else does.
 
@@ -2048,6 +2063,45 @@ class TestSoftDeleteContract:
         """
         with pytest.raises(TypeError, match="positional argument"):
             type(event_store)("unused", DeleteMode.SOFT)  # type: ignore[call-arg]
+
+    def test_a_store_built_with_the_wire_string_soft_retires(
+        self,
+        request: pytest.FixtureRequest,
+        tmp_path: Path,
+        event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """An untyped caller's ``"soft"`` retires; it never takes the purge branch.
+
+        ``delete_team`` dispatches by identity, so an uncoerced string would
+        fall through to the purge and the record would be gone.
+        """
+        storage = _storage_of(request, tmp_path)
+        # Ill-typed on purpose: the value an untyped config or env var hands in.
+        store = type(event_store)(storage, delete_mode="soft")  # type: ignore[arg-type]
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+
+        store.delete_team(saved.team_id)
+
+        after = read_raw_team(saved.team_id)
+        assert after is not None
+        assert after["status"] == "deleted"
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.status is TeamStatus.DELETED
+
+    def test_an_unknown_delete_mode_is_refused_at_construction(
+        self,
+        request: pytest.FixtureRequest,
+        tmp_path: Path,
+        event_store: EventStore,
+    ) -> None:
+        """A typo raises when the store is built, not as a silent purge later."""
+        storage = _storage_of(request, tmp_path)
+        with pytest.raises(ValueError, match="sfot"):
+            # Ill-typed on purpose: a misspelt mode from an untyped caller.
+            type(event_store)(storage, delete_mode="sfot")  # type: ignore[arg-type]
 
     def test_a_soft_delete_marks_the_team_deleted_and_moves_updated_at(
         self,

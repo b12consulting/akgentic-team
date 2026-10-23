@@ -207,7 +207,8 @@ class MongoEventStore:
         delete_mode: DeleteMode = DeleteMode.HARD,
     ) -> None:
         self._db = db
-        self._delete_mode = delete_mode
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
         self._teams: pymongo.collection.Collection = db[TEAMS_COLLECTION]  # type: ignore[type-arg]
         self._events: pymongo.collection.Collection = db["events"]  # type: ignore[type-arg]
         self._agent_states: pymongo.collection.Collection = db["agent_states"]  # type: ignore[type-arg]

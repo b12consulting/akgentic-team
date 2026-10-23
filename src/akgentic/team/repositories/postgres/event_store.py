@@ -144,7 +144,8 @@ class NagraEventStore:
 
         _ensure_schema_loaded()
         self._conn_string = conn_string
-        self._delete_mode = delete_mode
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
 
     # --- team process (team_process_entries) -------------------------------
 

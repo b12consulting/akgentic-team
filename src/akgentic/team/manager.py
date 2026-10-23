@@ -294,9 +294,11 @@ class TeamManager:
         return self._event_store.load_team(team_id)
 
     def delete_team(self, team_id: uuid.UUID) -> None:
-        """Delete a stopped team, purging all persisted data.
+        """Delete a stopped team, as the injected store's delete mode dictates.
 
-        Enforces the state machine: only STOPPED teams can be deleted.
+        Enforces the state machine: only STOPPED teams can be deleted. Under
+        ``DeleteMode.HARD`` the team's persisted data is purged; under
+        ``DeleteMode.SOFT`` the team is retired (status ``DELETED``, record kept).
 
         Args:
             team_id: The team identifier to delete.
@@ -319,7 +321,8 @@ class TeamManager:
             msg = f"Team {team_id} is already deleted"
             raise ValueError(msg)
 
-        # STOPPED — purge all data and deregister from service discovery
+        # STOPPED — purge (hard) or retire (soft) per the store's delete mode,
+        # then deregister from service discovery
         logger.info("Deleting team %s", team_id)
         self._event_store.delete_team(team_id)
         self._service_registry.deregister_team(self._instance_id, team_id)

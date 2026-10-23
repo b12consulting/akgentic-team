@@ -534,12 +534,15 @@ class DescriptionOrigin(StrEnum):
 
 
 class DeleteMode(StrEnum):
-    """What ``EventStore.delete_team`` does, fixed when the store is built.
+    """Whether deleting something purges it (``HARD``) or retires it (``SOFT``).
 
-    ``HARD`` (the default) purges the team's ``Process``, events and agent
-    states. ``SOFT`` retires the team instead: it sets ``status`` to
-    ``DELETED`` and moves ``updated_at``, and keeps everything else. No mode
-    deletes agent cards.
+    The event store uses it for a team's record, fixed when the store is built;
+    akgentic-infra reuses it for workspace trees.
+
+    For ``EventStore.delete_team``, ``HARD`` (the default) purges the team's
+    ``Process``, events and agent states. ``SOFT`` retires the team instead: it
+    sets ``status`` to ``DELETED`` and moves ``updated_at``, and keeps
+    everything else. No mode deletes agent cards.
     """
 
     HARD = "hard"
