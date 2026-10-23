@@ -121,3 +121,14 @@ def test_the_event_log_error_is_exported() -> None:
     assert not issubclass(
         akgentic.team.EventLogUnreadableError, akgentic.team.EventNotFoundError
     )
+
+
+def test_the_delete_mode_is_exported_with_exactly_two_values() -> None:
+    """``DeleteMode`` is how a deployment builds its store, so it must be nameable.
+
+    Exactly ``HARD`` and ``SOFT``: a third member would be a mode no backend
+    implements, and its string values are what a settings file carries.
+    """
+    assert "DeleteMode" in akgentic.team.__all__
+    exported = akgentic.team.DeleteMode
+    assert {m.name: m.value for m in exported} == {"HARD": "hard", "SOFT": "soft"}

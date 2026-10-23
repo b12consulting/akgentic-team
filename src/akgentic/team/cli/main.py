@@ -192,11 +192,7 @@ def list_teams_cmd(
         help="Filter by team status: running, stopped, or deleted.",
     ),
 ) -> None:
-    """List all team instances."""
-    state = _get_state(ctx)
-    event_store = _build_event_store(state)
-    teams = event_store.list_teams()
-
+    """List team instances. Deleted teams are shown only with --status deleted."""
     if status is not None:
         valid_statuses = ("running", "stopped", "deleted")
         if status not in valid_statuses:
@@ -205,7 +201,12 @@ def list_teams_cmd(
                 f"Must be one of: {', '.join(valid_statuses)}"
             )
             raise typer.Exit(code=1)
-        teams = [t for t in teams if t.status.value == status]
+
+    state = _get_state(ctx)
+    event_store = _build_event_store(state)
+    # Pushed down, not filtered here: the store's default hides DELETED teams,
+    # so an in-memory filter over list_teams() could never show them.
+    teams = event_store.list_teams(status=TeamStatus(status) if status is not None else None)
 
     render(teams, state.format)
 
@@ -391,7 +392,7 @@ def delete_cmd(
     ctx: typer.Context,
     team_id: str = typer.Argument(help="Team UUID to delete."),
 ) -> None:
-    """Delete a stopped team and purge all its data."""
+    """Delete a stopped or retired team and purge all its data."""
     try:
         parsed_id = uuid.UUID(team_id)
     except ValueError:
@@ -419,12 +420,8 @@ def delete_cmd(
         )
         raise typer.Exit(code=1)
 
-    if process.status == TeamStatus.DELETED:
-        err_console.print(
-            "[red]Error:[/red] Team already deleted."
-        )
-        raise typer.Exit(code=1)
-
+    # A DELETED team falls through: the store is built HARD, so this purges a
+    # retired record along with its events and agent states.
     event_store.delete_team(parsed_id)
     logger.info("Team deleted: %s", team_id)
     Console().print(f"Team '{team_id}' deleted.")

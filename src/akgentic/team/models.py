@@ -1,7 +1,7 @@
 """Domain models for team lifecycle management.
 
-TeamCard, TeamCardMember, TeamRuntime, TeamStatus, DescriptionOrigin, AgentRef,
-AgentCardRef, AgentCardEntry, Process, PersistedEvent, AgentStateSnapshot.
+TeamCard, TeamCardMember, TeamRuntime, TeamStatus, DescriptionOrigin, DeleteMode,
+AgentRef, AgentCardRef, AgentCardEntry, Process, PersistedEvent, AgentStateSnapshot.
 """
 
 from __future__ import annotations
@@ -531,6 +531,19 @@ class DescriptionOrigin(StrEnum):
 
     AUTO = "auto"
     USER = "user"
+
+
+class DeleteMode(StrEnum):
+    """What ``EventStore.delete_team`` does, fixed when the store is built.
+
+    ``HARD`` (the default) purges the team's ``Process``, events and agent
+    states. ``SOFT`` retires the team instead: it sets ``status`` to
+    ``DELETED`` and moves ``updated_at``, and keeps everything else. No mode
+    deletes agent cards.
+    """
+
+    HARD = "hard"
+    SOFT = "soft"
 
 
 class AgentRef(SerializableBaseModel):

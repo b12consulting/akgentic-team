@@ -1,7 +1,9 @@
-"""The shared three-key builder behind every backend's ``update_team_description``.
+"""The shared builders behind every backend's field-level team writes.
 
-Backend behaviour lives in ``test_event_store_contract.py``. What is pinned
-here is the one property the contract suite cannot see directly: the values
+``description_update_fields`` serves ``update_team_description`` and
+``soft_delete_fields`` serves a soft ``delete_team``. Backend behaviour lives in
+``test_event_store_contract.py``. What is pinned here is the one property the
+contract suite cannot see directly: the values
 every backend writes are the values ``save_team`` would have written for the
 same ``Process``, byte for byte, so no backend can hand-format a stamp its own
 ``load_team`` then refuses.
@@ -13,10 +15,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from akgentic.team.models import DescriptionOrigin, Process
+from akgentic.team.models import DescriptionOrigin, Process, TeamStatus
 from akgentic.team.repositories._description import (
     DESCRIPTION_UPDATE_KEYS,
+    SOFT_DELETE_KEYS,
     description_update_fields,
+    soft_delete_fields,
 )
 from tests.models.conftest import make_process
 
@@ -80,3 +84,32 @@ class TestDescriptionUpdateFields:
         assert description_update_fields(padded, DescriptionOrigin.AUTO)["team_description"] == (
             padded
         )
+
+
+class TestSoftDeleteFields:
+    def test_the_keys_are_exactly_the_two(self) -> None:
+        fields = soft_delete_fields()
+
+        assert tuple(fields) == SOFT_DELETE_KEYS
+        assert set(fields) == {"status", "updated_at"}
+
+    def test_the_status_is_the_plain_stored_string_not_the_enum_member(self) -> None:
+        """What reaches YAML / BSON / JSON is what ``save_team`` writes: the value."""
+        fields = soft_delete_fields()
+
+        assert fields["status"] == "deleted"
+        assert type(fields["status"]) is str
+
+    def test_the_values_match_a_save_team_style_dump_of_the_same_process(self) -> None:
+        """The stamp is in the form the reader validates, and it is "now"."""
+        before = datetime.now(UTC)
+        fields = soft_delete_fields()
+        after = datetime.now(UTC)
+
+        full = make_process().model_dump()
+        assert type(fields["updated_at"]) is type(full["updated_at"])
+
+        restored = Process.model_validate({**full, **fields})
+        assert restored.status is TeamStatus.DELETED
+        assert restored.updated_at.tzinfo is not None
+        assert before - _MILLISECOND <= restored.updated_at <= after + _MILLISECOND

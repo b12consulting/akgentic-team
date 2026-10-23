@@ -37,7 +37,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from pydantic import BaseModel, Field
 
-from akgentic.team.models import PersistedEvent, Process, TeamStatus
+from akgentic.team.models import DeleteMode, PersistedEvent, Process, TeamStatus
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories import yaml as yaml_repository
@@ -394,6 +394,48 @@ class TestYamlEventStoreYamlSpecific:
         with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
             assert [p.team_id for p in yaml_store.list_teams()] == [good.team_id]
         assert any("Corrupted team.yaml" in record.message for record in caplog.records)
+
+    def test_the_default_listing_drops_a_deleted_team_before_validating_it(
+        self, yaml_store: YamlEventStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``DELETED`` exclusion runs on the raw mapping, so it costs no hydration."""
+        live = make_process(status=TeamStatus.RUNNING)
+        yaml_store.save_team(live)
+        yaml_store.save_team(make_process(status=TeamStatus.DELETED))
+        calls: list[object] = []
+        original = Process.model_validate
+
+        def counting(data: object, *args: object, **kwargs: object) -> Process:
+            calls.append(data)
+            return original(data, *args, **kwargs)
+
+        monkeypatch.setattr(Process, "model_validate", counting)
+
+        assert [p.team_id for p in yaml_store.list_teams()] == [live.team_id]
+        assert len(calls) == 1
+
+    def test_a_soft_delete_leaves_a_non_mapping_document_alone_and_logs_it(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A document the two keys cannot be written into is logged, never rewritten.
+
+        It is already skipped by ``list_teams`` and reads as ``None`` from
+        ``load_team``, so leaving it is the same outcome a retire would have had.
+        """
+        store = YamlEventStore(tmp_path, delete_mode=DeleteMode.SOFT)
+        team_id = uuid.uuid4()
+        team_dir = tmp_path / str(team_id)
+        team_dir.mkdir()
+        team_path = team_dir / "team.yaml"
+        team_path.write_text("- just\n- a\n- list\n")
+
+        with caplog.at_level(logging.ERROR, logger="akgentic.team.repositories.yaml"):
+            store.delete_team(team_id)
+
+        assert team_path.read_text() == "- just\n- a\n- list\n"
+        assert any(
+            r.levelno == logging.ERROR and str(team_id) in r.getMessage() for r in caplog.records
+        )
 
     # --- Corrupted-file resilience ------------------------------------------
 

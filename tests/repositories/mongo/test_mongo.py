@@ -29,6 +29,7 @@ from pymongo.errors import OperationFailure
 from akgentic.team.projection import hash_agent_card
 from akgentic.team.repositories.mongo import (
     AGENT_CARDS_COLLECTION,
+    TEAMS_COLLECTION,
     MongoEventStore,
     ensure_indexes,
 )
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
     from akgentic.team.models import Process
     from akgentic.team.ports import EventStore
 
-from akgentic.team.models import TeamStatus
+from akgentic.team.models import DeleteMode, TeamStatus
 from tests.models.conftest import (
     AcmeTeamMetadata,
     make_agent_card,
@@ -219,16 +220,17 @@ class TestMongoEventStoreMongoSpecific:
         assert spy_find.call_args.args[0] == {"user_id": "u1", "status": "running"}
         assert [p.team_id for p in result] == [mine_running.team_id]
 
-    def test_list_teams_without_filters_issues_an_empty_find_filter(
+    def test_list_teams_without_filters_issues_only_the_not_deleted_find_filter(
         self, mongo_store: MongoEventStore
     ) -> None:
-        """A ``None`` parameter contributes no key — the filter stays ``{}``.
+        """A ``None`` status contributes ``{"$ne": "deleted"}`` and nothing else.
 
         Both the no-argument call and the explicit ``user_id=None,
-        status=None`` call must reach MongoDB unfiltered and return every
-        lifecycle state, ``DELETED`` included.
+        status=None`` call reach MongoDB with that one term, and hide the
+        ``DELETED`` team in the server rather than in Python.
         """
-        mongo_store.save_team(make_process(status=TeamStatus.RUNNING))
+        running = make_process(status=TeamStatus.RUNNING)
+        mongo_store.save_team(running)
         mongo_store.save_team(make_process(status=TeamStatus.DELETED))
 
         with patch.object(
@@ -237,7 +239,7 @@ class TestMongoEventStoreMongoSpecific:
             no_argument = mongo_store.list_teams()
 
         spy_find.assert_called_once()
-        assert spy_find.call_args.args[0] == {}
+        assert spy_find.call_args.args[0] == {"status": {"$ne": "deleted"}}
 
         with patch.object(
             mongo_store._teams, "find", wraps=mongo_store._teams.find
@@ -245,9 +247,63 @@ class TestMongoEventStoreMongoSpecific:
             explicit_none = mongo_store.list_teams(user_id=None, status=None)
 
         spy_find.assert_called_once()
-        assert spy_find.call_args.args[0] == {}
-        assert len(no_argument) == 2
+        assert spy_find.call_args.args[0] == {"status": {"$ne": "deleted"}}
+        assert [p.team_id for p in no_argument] == [running.team_id]
         assert {p.team_id for p in explicit_none} == {p.team_id for p in no_argument}
+
+    def test_a_soft_delete_is_one_guarded_update_of_two_keys(self, mongo_db: Any) -> None:
+        """``SOFT`` issues ONE ``update_one``: the ``$ne`` guard, two keys, no upsert.
+
+        A ``load_team`` → ``save_team`` round trip would show up here as a
+        ``replace_one`` and no ``update_one`` — the lost-write race this shape
+        exists to avoid — and an upsert would create a document for an unknown
+        team.
+        """
+        store = MongoEventStore(mongo_db, delete_mode=DeleteMode.SOFT)
+        process = make_process(status=TeamStatus.STOPPED)
+        store.save_team(process)
+
+        teams = store._teams
+        with (
+            patch.object(teams, "update_one", wraps=teams.update_one) as spy_update,
+            patch.object(teams, "replace_one", wraps=teams.replace_one) as spy_replace,
+            patch.object(teams, "delete_many", wraps=teams.delete_many) as spy_delete,
+        ):
+            store.delete_team(process.team_id)
+
+        spy_update.assert_called_once()
+        spy_replace.assert_not_called()
+        spy_delete.assert_not_called()
+        query, update = spy_update.call_args.args
+        assert query == {"team_id": str(process.team_id), "status": {"$ne": "deleted"}}
+        assert set(update) == {"$set"}
+        assert set(update["$set"]) == {"status", "updated_at"}
+        assert update["$set"]["status"] == "deleted"
+        assert not spy_update.call_args.kwargs.get("upsert", False)
+
+    def test_the_not_deleted_filter_creates_no_index(self, mongo_db: Any) -> None:
+        """The ``$ne`` default needs no index of its own, at boot or at query time.
+
+        The set of teams-collection indexes is exactly what ``ensure_indexes``
+        has always provisioned, before and after a listing and a soft delete.
+        A status-index build at boot is what a large production collection
+        cannot absorb, so nothing here may add one.
+        """
+        store = MongoEventStore(mongo_db, delete_mode=DeleteMode.SOFT)
+        before = set(mongo_db[TEAMS_COLLECTION].index_information())
+        process = make_process(status=TeamStatus.STOPPED)
+        store.save_team(process)
+
+        store.delete_team(process.team_id)
+        store.list_teams()
+
+        assert set(mongo_db[TEAMS_COLLECTION].index_information()) == before
+        assert before == {
+            "_id_",
+            "teams_user_id_idx",
+            "teams_status_idx",
+            "teams_metadata_indexes_idx",
+        }
 
     def test_list_teams_positional_user_id_still_reaches_the_find_filter(
         self, mongo_store: MongoEventStore
@@ -268,7 +324,7 @@ class TestMongoEventStoreMongoSpecific:
             result = mongo_store.list_teams("u1")
 
         spy_find.assert_called_once()
-        assert spy_find.call_args.args[0] == {"user_id": "u1"}
+        assert spy_find.call_args.args[0] == {"user_id": "u1", "status": {"$ne": "deleted"}}
         assert [p.team_id for p in result] == [mine.team_id]
 
     def test_list_teams_does_not_filter_status_in_python(
@@ -740,7 +796,8 @@ class TestMongoEventStoreMongoSpecific:
 
         spy_find.assert_called_once()
         assert spy_find.call_args.args[0] == {
-            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}]
+            "status": {"$ne": "deleted"},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}],
         }
         assert [p.team_id for p in result] == [acme.team_id]
 
@@ -786,7 +843,8 @@ class TestMongoEventStoreMongoSpecific:
             result = mongo_store.list_teams(metadata={"tenant": ["AzE"]})
 
         assert spy_find.call_args.args[0] == {
-            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|aze"}}]}]
+            "status": {"$ne": "deleted"},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|aze"}}]}],
         }
         assert [p.team_id for p in result] == [aze.team_id]
 
@@ -806,6 +864,7 @@ class TestMongoEventStoreMongoSpecific:
             mongo_store.list_teams(metadata={"tenant": ["ac", "acm"], "case_ref": ["C-"]})
 
         assert spy_find.call_args.args[0] == {
+            "status": {"$ne": "deleted"},
             "$and": [
                 {
                     "$or": [
@@ -836,7 +895,8 @@ class TestMongoEventStoreMongoSpecific:
             mongo_store.list_teams(metadata={"tenant": [], "case_ref": ["C-1"], "other": [""]})
 
         assert spy_find.call_args.args[0] == {
-            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^case_ref\\|c\\-1"}}]}]
+            "status": {"$ne": "deleted"},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^case_ref\\|c\\-1"}}]}],
         }
 
     def test_list_teams_pushes_user_id_and_metadata_into_one_find_filter(
@@ -865,6 +925,7 @@ class TestMongoEventStoreMongoSpecific:
         spy_find.assert_called_once()
         assert spy_find.call_args.args[0] == {
             "user_id": "u1",
+            "status": {"$ne": "deleted"},
             "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}],
         }
         assert [p.team_id for p in result] == [mine.team_id]
@@ -1005,7 +1066,8 @@ class TestMongoEventStoreMongoSpecific:
         # `tenant|acme\|corp`; `re.escape` turns each `|` into `\|` and the
         # separator escaping's own `\` into `\\`, giving `\\\|` in the middle.
         assert spy_find.call_args.args[0] == {
-            "$and": [{"$or": [{"metadata_indexes": {"$regex": r"^tenant\|acme\\\|corp"}}]}]
+            "status": {"$ne": "deleted"},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": r"^tenant\|acme\\\|corp"}}]}],
         }
         assert [p.team_id for p in result] == [piped.team_id]
 
@@ -1064,7 +1126,8 @@ class TestMongoEventStoreMongoSpecific:
         indexed_find.assert_called_once()
         assert bare_find.call_args.args[0] == indexed_find.call_args.args[0]
         assert bare_find.call_args.args[0] == {
-            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}]
+            "status": {"$ne": "deleted"},
+            "$and": [{"$or": [{"metadata_indexes": {"$regex": "^tenant\\|acme"}}]}],
         }
         assert from_bare == from_indexed
         # Pinned absolutely too, so two equally broken stores cannot pass by

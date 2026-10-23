@@ -1,14 +1,15 @@
-"""The three values ``update_team_description`` writes, built in ONE place.
+"""The values the two field-level team writes store, built in ONE place.
 
 Every backend's ``update_team_description`` writes exactly ``team_description``,
-``description_origin`` and ``updated_at``, and every backend's ``load_team``
-validates what ``save_team`` wrote through ``Process.model_dump()``. The values
-are therefore picked out of a ``model_dump()`` of a ``Process`` carrying them —
-never the enum member or a raw ``datetime`` handed straight to ``yaml.safe_dump``,
-BSON or ``json.dumps``, and never a hand-formatted ``updated_at``. A backend
-that formatted the stamp itself would write a document its own ``load_team``
-could refuse, and three backends formatting it separately would drift apart.
-One helper, three callers, one definition.
+``description_origin`` and ``updated_at``, and every backend's soft
+``delete_team`` writes exactly ``status`` and ``updated_at``. Every backend's
+``load_team`` validates what ``save_team`` wrote through ``Process.model_dump()``.
+The values are therefore picked out of a ``model_dump()`` of a ``Process``
+carrying them — never the enum member or a raw ``datetime`` handed straight to
+``yaml.safe_dump``, BSON or ``json.dumps``, and never a hand-formatted
+``updated_at``. A backend that formatted the stamp itself would write a document
+its own ``load_team`` could refuse, and three backends formatting it separately
+would drift apart. One helper per write, three callers each, one definition.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ DESCRIPTION_UPDATE_KEYS: tuple[str, str, str] = (
     "updated_at",
 )
 """The keys ``update_team_description`` writes, and the only keys it writes."""
+
+SOFT_DELETE_KEYS: tuple[str, str] = ("status", "updated_at")
+"""The keys a soft ``delete_team`` writes, and the only keys it writes."""
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _TEMPLATE_ROLE = "description-update-template"
@@ -82,3 +86,22 @@ def description_update_fields(
         .model_dump()
     )
     return {key: dump[key] for key in DESCRIPTION_UPDATE_KEYS}
+
+
+def soft_delete_fields() -> dict[str, object]:
+    """Return the two stored values that retire a team, serialised.
+
+    ``status`` is ``DELETED`` and ``updated_at`` is ``datetime.now(UTC)`` at the
+    call, each in the form ``Process.model_dump()`` emits, so the document any
+    backend writes them into reads back through ``load_team`` unchanged.
+
+    Returns:
+        Exactly :data:`SOFT_DELETE_KEYS`, ready for ``$set``, ``||`` or a
+        raw-dict update.
+    """
+    dump = (
+        _template_process()
+        .model_copy(update={"status": TeamStatus.DELETED, "updated_at": datetime.now(UTC)})
+        .model_dump()
+    )
+    return {key: dump[key] for key in SOFT_DELETE_KEYS}
