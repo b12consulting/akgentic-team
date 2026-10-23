@@ -659,11 +659,12 @@ class MongoEventStore:
         retire a no-op that leaves ``updated_at`` alone. No ``upsert``: an
         unknown team matches nothing and creates nothing.
         """
-        self._teams.update_one(
+        result = self._teams.update_one(
             {"team_id": str(team_id), "status": {"$ne": TeamStatus.DELETED.value}},
             {"$set": soft_delete_fields()},
         )
-        logger.debug("Retired team %s", team_id)
+        if result.matched_count:
+            logger.debug("Retired team %s", team_id)
 
     def _purge(self, team_id: uuid.UUID) -> None:
         """Delete all persisted data for a team from all three collections.

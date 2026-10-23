@@ -1998,9 +1998,10 @@ class TestUpdateTeamDescriptionContract:
 class _ProcessWithExtraField(Process):
     """A ``Process`` carrying a field no write path has ever heard of.
 
-    Module-level so the ``__model__`` tag ``save_team`` writes resolves on the
-    way back out. An enumerated ``Process(...)`` rebuild returns a plain
-    ``Process`` and drops ``extra_field``, however complete it is today.
+    Module-level so the ``__model__`` tag ``save_team`` writes names an
+    importable class. ``load_team`` still reads such a document as ``None`` on
+    every backend (see the subclass spec below), so the guard is carried by the
+    raw document, not by a re-load.
     """
 
     extra_field: str = "sentinel"
@@ -2040,9 +2041,12 @@ class TestSoftDeleteContract:
         """Positional construction is unchanged: the mode can only be named.
 
         The argument count is checked before the constructor body runs, so the
-        storage argument here is never used.
+        storage argument here is never used. The ``match`` is load-bearing: with
+        the ``*`` dropped, Mongo would bind the mode positionally and then raise
+        a DIFFERENT ``TypeError`` from indexing the string — a bare
+        ``pytest.raises(TypeError)`` passed that way.
         """
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="positional argument"):
             type(event_store)("unused", DeleteMode.SOFT)  # type: ignore[call-arg]
 
     def test_a_soft_delete_marks_the_team_deleted_and_moves_updated_at(
@@ -2148,9 +2152,11 @@ class TestSoftDeleteContract:
         """Golden Rule #12: a field the write path has never heard of survives.
 
         Saved through ``save_team`` as a real subclass, so the stored document
-        carries ``extra_field`` and the subclass's ``__model__`` tag. An
-        enumerated ``Process(...)`` rebuild — even one naming every field that
-        exists today — loses both, and the raw comparison sees it.
+        carries ``extra_field`` and the subclass's ``__model__`` tag, and the
+        raw document must keep both. A ``load_team`` → enumerated ``Process(...)``
+        → ``save_team`` retire fails HERE on ``status`` rather than on the lost
+        key — ``load_team`` returns ``None``, so that retire writes nothing. The
+        spec that fails on ``extra_field`` itself is the raw-planted twin below.
 
         The re-load half pins what every backend does today, observed rather
         than assumed: ``load_team`` does NOT round-trip a subclass. The
