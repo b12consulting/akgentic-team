@@ -219,9 +219,23 @@ class EventStore(Protocol):
         ...
 
     def delete_team(self, team_id: uuid.UUID) -> None:
-        """Delete all persisted data for a team.
+        """Purge or retire a team, as fixed by the store's ``DeleteMode``.
 
-        Called by TeamManager during team deletion to purge stored state.
+        The mode is chosen when the store is built and never per call.
+
+        * ``DeleteMode.HARD`` (the default) purges the team's ``Process``, every
+          event and every agent state. It purges a team whose stored status is
+          already ``DELETED`` too: that is how a retired record is removed.
+        * ``DeleteMode.SOFT`` retires the team: it sets ``status`` to
+          ``DELETED`` and ``updated_at`` to now, in one field-level write, and
+          leaves every other stored key, every event and every agent state as
+          they were. On an unknown team it is a no-op that creates nothing; on
+          a team already ``DELETED`` it is a no-op that leaves the stored
+          document, ``updated_at`` included, untouched.
+
+        No mode ever deletes agent cards: they are shared across teams (FR13).
+        An unknown team is a no-op under either mode. Called by TeamManager, by
+        the server and by ``ak-team delete``.
         """
         ...
 
@@ -244,8 +258,12 @@ class EventStore(Protocol):
             user_id: If provided, return only snapshots whose ``Process.user_id``
                 matches. If ``None`` (default), do not filter on the owner.
             status: If provided, return only snapshots whose ``Process.status``
-                matches. If ``None`` (default), do not filter on the lifecycle
-                state — every status is returned, including ``DELETED``.
+                matches; ``status=DELETED`` is how retired teams are reached.
+                If ``None`` (default), every status **except** ``DELETED`` is
+                returned, under either ``DeleteMode``: a deployment switched
+                from ``SOFT`` back to ``HARD`` must not resurface the teams it
+                retired. A ``DELETED`` record written by ``save_team`` is hidden
+                the same way.
             metadata: Mapping of indexed field name to a list of **prefix
                 terms**. Each term is rendered to a flattened ``"key|value"``
                 form via :func:`akgentic.team.metadata.make_index_entry` — the
@@ -289,8 +307,9 @@ class EventStore(Protocol):
                 on one term per character.
 
         Every filter is an independent term and they combine as a conjunction:
-        a filter left at ``None`` constrains nothing, and adding one can only
-        narrow the result set, never widen it. In particular ``user_id`` scoping
+        ``user_id`` or ``metadata`` left at ``None`` constrains nothing, the
+        ``status`` default excludes only ``DELETED``, and adding a filter can
+        only narrow the result set, never widen it. In particular ``user_id`` scoping
         is applied server-side and is NEVER weakened by ``metadata`` — metadata
         is caller-supplied and non-secret, so it must not become a way to reach
         another owner's teams.

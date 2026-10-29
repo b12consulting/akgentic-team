@@ -67,6 +67,25 @@ class TestListCommand:
         assert str(running[0].team_id)[:8] in result.output
         assert str(stopped[0].team_id)[:8] not in result.output
 
+    def test_list_hides_a_retired_team_and_status_deleted_shows_it(
+        self, cli_runner: CliRunner, data_dir: object, yaml_store: YamlEventStore
+    ) -> None:
+        """Without ``--status`` a ``DELETED`` team is omitted; ``--status deleted`` lists it."""
+        live = populate_teams(yaml_store, count=1, status=TeamStatus.STOPPED)
+        retired = populate_teams(yaml_store, count=1, status=TeamStatus.DELETED)
+
+        default = cli_runner.invoke(app, ["--data-dir", str(data_dir), "list"])
+        assert default.exit_code == 0
+        assert str(live[0].team_id)[:8] in default.output
+        assert str(retired[0].team_id)[:8] not in default.output
+
+        deleted = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "list", "--status", "deleted"]
+        )
+        assert deleted.exit_code == 0
+        assert str(retired[0].team_id)[:8] in deleted.output
+        assert str(live[0].team_id)[:8] not in deleted.output
+
     def test_list_format_json(
         self, cli_runner: CliRunner, data_dir: object, yaml_store: YamlEventStore
     ) -> None:
@@ -384,6 +403,27 @@ class TestDeleteCommand:
         )
         assert result.exit_code == 1
         assert "Invalid UUID" in result.output
+
+    def test_delete_of_a_retired_team_purges_it(
+        self, cli_runner: CliRunner, data_dir: Path, yaml_store: YamlEventStore
+    ) -> None:
+        """A ``DELETED`` team is purged, events and agent states included, exit code 0."""
+        process = make_process(status=TeamStatus.DELETED)
+        yaml_store.save_team(process)
+        yaml_store.save_event(make_persisted_event(team_id=process.team_id, sequence=1))
+        yaml_store.save_agent_state(
+            make_agent_state_snapshot(team_id=process.team_id, agent_id="a1")
+        )
+
+        result = cli_runner.invoke(
+            app, ["--data-dir", str(data_dir), "delete", str(process.team_id)]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "deleted" in result.output
+        assert yaml_store.load_team(process.team_id) is None
+        assert yaml_store.load_events(process.team_id) == []
+        assert yaml_store.load_agent_states(process.team_id) == []
 
 
 class TestResumeCommand:

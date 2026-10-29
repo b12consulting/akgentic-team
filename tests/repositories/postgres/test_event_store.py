@@ -31,7 +31,7 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from nagra import Transaction  # type: ignore[import-untyped]
 
-from akgentic.team.models import Process, TeamStatus
+from akgentic.team.models import DeleteMode, Process, TeamStatus
 from akgentic.team.projection import hash_agent_card
 from akgentic.team.repositories.postgres import NagraEventStore, init_db
 
@@ -936,6 +936,39 @@ class TestAgentCardStatementShape:
         assert "data" not in sql, f"the enumeration pulls card payloads: {sql}"
         assert "*" not in sql, sql
         assert params == ()
+
+
+class TestSoftDeleteStatementShape:
+    """The ONE statement a ``SOFT`` ``delete_team`` builds.
+
+    The contract suite proves an unknown key survives, which a raw-preserving
+    ``SELECT`` then whole-``data`` ``UPDATE`` would also pass — while losing a
+    concurrent writer's change between the two. Only the statement shows that
+    the retire is a single guarded merge.
+    """
+
+    def test_a_soft_delete_is_one_guarded_merge_of_two_keys_with_every_value_bound(
+        self, recorded_sql: list[tuple[str, tuple[object, ...]]]
+    ) -> None:
+        team_id = uuid.uuid4()
+
+        NagraEventStore("postgresql://recorded/soft", delete_mode=DeleteMode.SOFT).delete_team(
+            team_id
+        )
+
+        assert len(recorded_sql) == 1, f"a soft delete is one statement: {recorded_sql}"
+        sql, params = recorded_sql[0]
+        assert sql == (
+            "UPDATE team_process_entries SET data = (data::jsonb || %s::jsonb)::json "
+            "WHERE id = %s AND (data ->> 'status') IS DISTINCT FROM %s"
+        )
+        payload, bound_id, guard = params
+        assert isinstance(payload, str)
+        merged = json.loads(payload)
+        assert set(merged) == {"status", "updated_at"}
+        assert merged["status"] == "deleted"
+        assert bound_id == str(team_id)
+        assert guard == "deleted"
 
 
 class TestAgentCardColumnProvisioning:

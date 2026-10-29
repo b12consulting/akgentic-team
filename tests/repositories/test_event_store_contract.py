@@ -18,6 +18,7 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -30,6 +31,7 @@ from akgentic.core.messages.message import UserMessage
 from akgentic.team.models import (
     AgentCardEntry,
     AgentCardRef,
+    DeleteMode,
     DescriptionOrigin,
     Process,
     TeamStatus,
@@ -313,15 +315,15 @@ class TestEventStoreContract:
         assert {p.team_id for p in result} == {p_empty.team_id}
         assert len(result) == 1
 
-    def test_list_teams_status_none_equals_no_arg_and_includes_deleted(
+    def test_list_teams_status_none_equals_no_arg_and_excludes_deleted(
         self, event_store: EventStore
     ) -> None:
-        """``status=None`` means *no status filter*, not "not deleted".
+        """``status=None`` means "every status but ``DELETED``", same as no argument.
 
-        A backend that quietly excluded ``DELETED`` from the unfiltered
-        result would move the default result set — the one thing the
-        additive parameter must never do. A caller that wants only live
-        teams asks for them explicitly.
+        A retired team must not reappear in the default listing, whichever mode
+        the store was built in: a deployment switched from soft back to hard
+        delete would otherwise resurface every team it ever retired. A caller
+        that wants retired teams asks for them with ``status=DELETED``.
         """
         running = make_process(status=TeamStatus.RUNNING)
         stopped = make_process(status=TeamStatus.STOPPED)
@@ -333,8 +335,10 @@ class TestEventStoreContract:
         with_none_ids = {p.team_id for p in event_store.list_teams(status=None)}
 
         assert with_none_ids == no_arg_ids
-        assert deleted.team_id in with_none_ids
-        assert with_none_ids == {running.team_id, stopped.team_id, deleted.team_id}
+        assert with_none_ids == {running.team_id, stopped.team_id}
+        assert {p.team_id for p in event_store.list_teams(status=TeamStatus.DELETED)} == {
+            deleted.team_id
+        }
 
     def test_list_teams_filters_by_status(self, event_store: EventStore) -> None:
         """``list_teams(status=...)`` returns exactly the snapshots in that state."""
@@ -446,7 +450,7 @@ class TestEventStoreContract:
     def test_list_teams_metadata_and_combines_with_status(
         self, event_store: EventStore
     ) -> None:
-        """``metadata`` and ``status`` intersect, and ``DELETED`` is reachable."""
+        """``metadata`` and ``status`` intersect; ``DELETED`` is reachable only by asking."""
         running = make_indexed_process(
             AcmeTeamMetadata(tenant="acme"), status=TeamStatus.RUNNING
         )
@@ -462,9 +466,12 @@ class TestEventStoreContract:
         result = event_store.list_teams(status=TeamStatus.RUNNING, metadata={"tenant": ["acme"]})
         assert {p.team_id for p in result} == {running.team_id}
 
-        # metadata alone does not implicitly constrain status.
+        # metadata alone leaves the status default in force: DELETED is hidden...
         unconstrained = event_store.list_teams(metadata={"tenant": ["acme"]})
-        assert {p.team_id for p in unconstrained} == {running.team_id, deleted.team_id}
+        assert {p.team_id for p in unconstrained} == {running.team_id}
+        # ...and status=DELETED reaches it through the same metadata term.
+        retired = event_store.list_teams(status=TeamStatus.DELETED, metadata={"tenant": ["acme"]})
+        assert {p.team_id for p in retired} == {deleted.team_id}
 
     def test_list_teams_all_three_filters_combine_with_and(
         self, event_store: EventStore
@@ -1982,3 +1989,407 @@ class TestUpdateTeamDescriptionContract:
             assert loaded.updated_at.tzinfo is not None
             # The reader accepts its own dump, which is the whole round trip.
             assert Process.model_validate(loaded.model_dump()) == loaded
+
+
+# ---------------------------------------------------------------------------
+# delete_team under DeleteMode.SOFT — retiring a team, and the default listing
+# ---------------------------------------------------------------------------
+
+
+class _ProcessWithExtraField(Process):
+    """A ``Process`` carrying a field no write path has ever heard of.
+
+    Module-level so the ``__model__`` tag ``save_team`` writes names an
+    importable class. ``load_team`` still reads such a document as ``None`` on
+    every backend (see the subclass spec below), so the guard is carried by the
+    raw document, not by a re-load.
+    """
+
+    extra_field: str = "sentinel"
+
+
+def _stamp(raw: dict[str, Any]) -> datetime:
+    """The raw stored ``updated_at`` as a comparable UTC datetime.
+
+    Every backend stores the ISO string ``model_dump()`` emits, so two raw
+    reads compare without any storage-resolution tolerance.
+    """
+    value = raw["updated_at"]
+    return _as_utc(value if isinstance(value, datetime) else datetime.fromisoformat(value))
+
+
+def _seed_events_and_states(event_store: EventStore, team_id: uuid.UUID) -> None:
+    """Three events and two agent states, so "they survive" has something to lose."""
+    for seq in range(1, 4):
+        event_store.save_event(make_persisted_event(team_id=team_id, sequence=seq))
+    for agent_id in ("a1", "a2"):
+        event_store.save_agent_state(make_agent_state_snapshot(team_id=team_id, agent_id=agent_id))
+
+
+def _ids(processes: list[Process]) -> set[uuid.UUID]:
+    return {p.team_id for p in processes}
+
+
+def _storage_of(request: pytest.FixtureRequest, tmp_path: Path) -> object:
+    """The storage argument the yielded ``event_store`` was built over.
+
+    The same directory, database or connection string ``soft_event_store``
+    reuses, so a store built from it here shares the yielded store's data.
+    """
+    backend: str = request.node.callspec.params["event_store"]
+    if backend == "yaml":
+        return tmp_path
+    if backend == "mongo":
+        return request.getfixturevalue("mongo_db")
+    return request.getfixturevalue("postgres_clean_tables")
+
+
+class TestSoftDeleteContract:
+    """``SOFT`` retires: ``status`` and ``updated_at`` move, nothing else does.
+
+    ``event_store`` is the default ``HARD`` store and ``soft_event_store`` a
+    ``SOFT`` sibling over the same storage, so every spec can seed through one,
+    retire through the other and read back raw.
+    """
+
+    def test_the_delete_mode_is_keyword_only(self, event_store: EventStore) -> None:
+        """Positional construction is unchanged: the mode can only be named.
+
+        The argument count is checked before the constructor body runs, so the
+        storage argument here is never used. The ``match`` is load-bearing: with
+        the ``*`` dropped, Mongo would bind the mode positionally and then raise
+        a DIFFERENT ``TypeError`` from indexing the string — a bare
+        ``pytest.raises(TypeError)`` passed that way.
+        """
+        with pytest.raises(TypeError, match="positional argument"):
+            type(event_store)("unused", DeleteMode.SOFT)  # type: ignore[call-arg]
+
+    def test_a_store_built_with_the_wire_string_soft_retires(
+        self,
+        request: pytest.FixtureRequest,
+        tmp_path: Path,
+        event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """An untyped caller's ``"soft"`` retires; it never takes the purge branch.
+
+        ``delete_team`` dispatches by identity, so an uncoerced string would
+        fall through to the purge and the record would be gone.
+        """
+        storage = _storage_of(request, tmp_path)
+        # Ill-typed on purpose: the value an untyped config or env var hands in.
+        store = type(event_store)(storage, delete_mode="soft")  # type: ignore[arg-type]
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+
+        store.delete_team(saved.team_id)
+
+        after = read_raw_team(saved.team_id)
+        assert after is not None
+        assert after["status"] == "deleted"
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.status is TeamStatus.DELETED
+
+    def test_an_unknown_delete_mode_is_refused_at_construction(
+        self,
+        request: pytest.FixtureRequest,
+        tmp_path: Path,
+        event_store: EventStore,
+    ) -> None:
+        """A typo raises when the store is built, not as a silent purge later."""
+        storage = _storage_of(request, tmp_path)
+        with pytest.raises(ValueError, match="sfot"):
+            # Ill-typed on purpose: a misspelt mode from an untyped caller.
+            type(event_store)(storage, delete_mode="sfot")  # type: ignore[arg-type]
+
+    def test_a_soft_delete_marks_the_team_deleted_and_moves_updated_at(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """The status is ``DELETED``, ``updated_at`` is later, and ``load_team`` still reads it."""
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+        before = read_raw_team(saved.team_id)
+        assert before is not None
+        time.sleep(0.01)
+
+        soft_event_store.delete_team(saved.team_id)
+
+        after = read_raw_team(saved.team_id)
+        assert after is not None
+        assert after["status"] == "deleted"
+        assert _stamp(after) > _stamp(before)
+        loaded = event_store.load_team(saved.team_id)
+        assert loaded is not None
+        assert loaded.status is TeamStatus.DELETED
+        assert _as_utc(loaded.updated_at) > _as_utc(saved.updated_at)
+
+    def test_events_sequence_and_agent_states_survive_a_soft_delete(
+        self, event_store: EventStore, soft_event_store: EventStore
+    ) -> None:
+        """What the three reads returned before the retire, they return after it."""
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+        _seed_events_and_states(event_store, saved.team_id)
+        events = [e.model_dump() for e in event_store.load_events(saved.team_id)]
+        max_sequence = event_store.get_max_sequence(saved.team_id)
+        states = sorted(
+            (s.model_dump() for s in event_store.load_agent_states(saved.team_id)),
+            key=lambda s: str(s["agent_id"]),
+        )
+        assert len(events) == 3
+        assert len(states) == 2
+
+        soft_event_store.delete_team(saved.team_id)
+
+        assert [e.model_dump() for e in event_store.load_events(saved.team_id)] == events
+        assert event_store.get_max_sequence(saved.team_id) == max_sequence == 3
+        assert (
+            sorted(
+                (s.model_dump() for s in event_store.load_agent_states(saved.team_id)),
+                key=lambda s: str(s["agent_id"]),
+            )
+            == states
+        )
+
+    def test_a_soft_delete_of_an_unknown_team_is_a_no_op_and_creates_nothing(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """An update, never an upsert: no raise, no document, nothing listed."""
+        ghost = uuid.uuid4()
+
+        soft_event_store.delete_team(ghost)
+        soft_event_store.delete_team(ghost)
+
+        assert event_store.load_team(ghost) is None
+        assert read_raw_team(ghost) is None
+        assert event_store.list_teams(status=TeamStatus.DELETED) == []
+
+    def test_a_soft_delete_of_a_deleted_team_leaves_the_document_identical(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """Already ``DELETED`` — saved so, or retired once — means not written at all.
+
+        The sleep is load-bearing: a backend that rewrote ``updated_at`` anyway
+        would land a different stamp, and the raw comparison sees it exactly.
+        """
+        saved_deleted = make_process(status=TeamStatus.DELETED)
+        retired_once = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved_deleted)
+        event_store.save_team(retired_once)
+        soft_event_store.delete_team(retired_once.team_id)
+        before = {p.team_id: read_raw_team(p.team_id) for p in (saved_deleted, retired_once)}
+        time.sleep(0.01)
+
+        soft_event_store.delete_team(saved_deleted.team_id)
+        soft_event_store.delete_team(retired_once.team_id)
+
+        for team_id, raw in before.items():
+            assert raw is not None
+            assert read_raw_team(team_id) == raw
+
+    def test_a_soft_delete_writes_two_keys_and_keeps_a_subclass_field(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """Golden Rule #12: a field the write path has never heard of survives.
+
+        Saved through ``save_team`` as a real subclass, so the stored document
+        carries ``extra_field`` and the subclass's ``__model__`` tag, and the
+        raw document must keep both. A ``load_team`` → enumerated ``Process(...)``
+        → ``save_team`` retire fails HERE on ``status`` rather than on the lost
+        key — ``load_team`` returns ``None``, so that retire writes nothing. The
+        spec that fails on ``extra_field`` itself is the raw-planted twin below.
+
+        The re-load half pins what every backend does today, observed rather
+        than assumed: ``load_team`` does NOT round-trip a subclass. The
+        ``__model__`` tag deserialises to a ``_ProcessWithExtraField`` instance,
+        ``Process.model_validate`` refuses it (``model_type``), and the document
+        reads as ``None`` — before the retire and after it alike. That is
+        ``save_team`` / ``load_team`` behaviour the retire does not change, which
+        is exactly why the raw document carries the guard.
+        """
+        saved = _ProcessWithExtraField(**dict(make_process(status=TeamStatus.STOPPED)))
+        event_store.save_team(saved)
+        before = read_raw_team(saved.team_id)
+        assert before is not None
+        assert before.get("extra_field") == "sentinel"
+        assert event_store.load_team(saved.team_id) is None
+        time.sleep(0.01)
+
+        soft_event_store.delete_team(saved.team_id)
+
+        after = read_raw_team(saved.team_id)
+        assert after is not None
+        assert after.get("extra_field") == "sentinel"
+        assert after["status"] == "deleted"
+        assert _stamp(after) > _stamp(before)
+        untouched = {k: v for k, v in before.items() if k not in ("status", "updated_at")}
+        assert {k: after.get(k) for k in untouched} == untouched
+        assert set(after) == set(before)
+        assert event_store.load_team(saved.team_id) is None
+
+    def test_an_unknown_key_planted_raw_survives_a_soft_delete(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        seed_raw_team: RawTeamSeeder,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """The subclass guard's twin, on a document ``load_team`` DOES read.
+
+        Tagged as a plain ``Process``, so a ``load_team`` → enumerated
+        ``Process(...)`` → ``save_team`` retire would succeed here — and drop
+        ``extra_field``, which ``Process.model_validate`` never sees. This is the
+        spec on which such a rewrite fails on the lost key itself.
+        """
+        team_id = uuid.uuid4()
+        seeded = make_process(team_id=team_id, status=TeamStatus.STOPPED).model_dump()
+        seeded["extra_field"] = "sentinel"
+        seed_raw_team(team_id, dict(seeded))
+        before = read_raw_team(team_id)
+        assert before is not None
+        time.sleep(0.01)
+
+        soft_event_store.delete_team(team_id)
+
+        after = read_raw_team(team_id)
+        assert after is not None
+        assert after.get("extra_field") == "sentinel"
+        assert after["status"] == "deleted"
+        assert _stamp(after) > _stamp(before)
+        untouched = {k: v for k, v in before.items() if k not in ("status", "updated_at")}
+        assert {k: after.get(k) for k in untouched} == untouched
+        loaded = event_store.load_team(team_id)
+        assert loaded is not None
+        assert loaded.status is TeamStatus.DELETED
+
+    def test_a_hard_store_purges_a_team_a_soft_store_retired(
+        self,
+        event_store: EventStore,
+        soft_event_store: EventStore,
+        read_raw_team: RawTeamReader,
+    ) -> None:
+        """``HARD`` is the purge path for a retired record, events and states included."""
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+        _seed_events_and_states(event_store, saved.team_id)
+        soft_event_store.delete_team(saved.team_id)
+        assert read_raw_team(saved.team_id) is not None
+
+        event_store.delete_team(saved.team_id)
+
+        assert read_raw_team(saved.team_id) is None
+        assert event_store.load_team(saved.team_id) is None
+        assert event_store.load_events(saved.team_id) == []
+        assert event_store.get_max_sequence(saved.team_id) == 0
+        assert event_store.load_agent_states(saved.team_id) == []
+        assert event_store.list_teams(status=TeamStatus.DELETED) == []
+
+    def test_a_hard_store_purges_a_team_saved_as_deleted(self, event_store: EventStore) -> None:
+        """The default mode purges a ``DELETED`` record exactly like any other."""
+        saved = make_process(status=TeamStatus.DELETED)
+        event_store.save_team(saved)
+        _seed_events_and_states(event_store, saved.team_id)
+
+        event_store.delete_team(saved.team_id)
+
+        assert event_store.load_team(saved.team_id) is None
+        assert event_store.load_events(saved.team_id) == []
+        assert event_store.load_agent_states(saved.team_id) == []
+
+    def test_a_soft_delete_leaves_the_card_store_untouched(
+        self, event_store: EventStore, soft_event_store: EventStore
+    ) -> None:
+        """No mode deletes agent cards: they are shared across teams."""
+        card = _make_card("lead", "Lead")
+        event_store.save_agent_cards([card])
+        card_hash = hash_agent_card(storable_agent_card(card))
+        saved = make_process(status=TeamStatus.STOPPED)
+        event_store.save_team(saved)
+
+        soft_event_store.delete_team(saved.team_id)
+
+        assert set(event_store.load_agent_cards([card_hash])) == {card_hash}
+
+
+class TestDefaultListingHidesRetiredTeams:
+    """``list_teams()`` hides ``DELETED`` under either mode; ``status=DELETED`` reaches it."""
+
+    def test_a_retired_team_is_hidden_by_both_stores_and_reached_by_status_deleted(
+        self, event_store: EventStore, soft_event_store: EventStore
+    ) -> None:
+        """Soft-retired and ``save_team``-written ``DELETED`` records behave alike.
+
+        Asked of both stores over the same storage: the exclusion is not a
+        property of the mode, or switching a deployment back to ``HARD`` would
+        resurface every team it had retired.
+        """
+        running = make_process(status=TeamStatus.RUNNING)
+        stopped = make_process(status=TeamStatus.STOPPED)
+        to_retire = make_process(status=TeamStatus.STOPPED)
+        saved_deleted = make_process(status=TeamStatus.DELETED)
+        for process in (running, stopped, to_retire, saved_deleted):
+            event_store.save_team(process)
+        soft_event_store.delete_team(to_retire.team_id)
+
+        retired = {to_retire.team_id, saved_deleted.team_id}
+        for store in (event_store, soft_event_store):
+            assert _ids(store.list_teams()) == {running.team_id, stopped.team_id}
+            assert _ids(store.list_teams(status=None)) == {running.team_id, stopped.team_id}
+            assert _ids(store.list_teams(status=TeamStatus.DELETED)) == retired
+            assert _ids(store.list_teams(status=TeamStatus.RUNNING)) == {running.team_id}
+            assert _ids(store.list_teams(status=TeamStatus.STOPPED)) == {stopped.team_id}
+
+    def test_the_exclusion_combines_with_user_id_and_never_weakens_it(
+        self, event_store: EventStore, soft_event_store: EventStore
+    ) -> None:
+        """u1's retired team is hidden from u1's listing, and u2's never reaches u1."""
+        u1_live = make_process(user_id="u1", status=TeamStatus.STOPPED)
+        u1_retired = make_process(user_id="u1", status=TeamStatus.STOPPED)
+        u2_retired = make_process(user_id="u2", status=TeamStatus.STOPPED)
+        for process in (u1_live, u1_retired, u2_retired):
+            event_store.save_team(process)
+        soft_event_store.delete_team(u1_retired.team_id)
+        soft_event_store.delete_team(u2_retired.team_id)
+
+        assert _ids(event_store.list_teams(user_id="u1")) == {u1_live.team_id}
+        assert _ids(event_store.list_teams(user_id="u1", status=TeamStatus.DELETED)) == {
+            u1_retired.team_id
+        }
+        assert _ids(event_store.list_teams(user_id="u2")) == set()
+
+    def test_the_exclusion_combines_with_metadata(
+        self, event_store: EventStore, soft_event_store: EventStore
+    ) -> None:
+        """A retired team matching the metadata is hidden, and reached with ``DELETED``."""
+        acme_live = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.STOPPED
+        )
+        acme_retired = make_indexed_process(
+            AcmeTeamMetadata(tenant="acme"), status=TeamStatus.STOPPED
+        )
+        contoso_retired = make_indexed_process(
+            AcmeTeamMetadata(tenant="contoso"), status=TeamStatus.STOPPED
+        )
+        for process in (acme_live, acme_retired, contoso_retired):
+            event_store.save_team(process)
+        soft_event_store.delete_team(acme_retired.team_id)
+        soft_event_store.delete_team(contoso_retired.team_id)
+
+        acme = {"tenant": ["acme"]}
+        assert _ids(event_store.list_teams(metadata=acme)) == {acme_live.team_id}
+        assert _ids(event_store.list_teams(status=TeamStatus.DELETED, metadata=acme)) == {
+            acme_retired.team_id
+        }

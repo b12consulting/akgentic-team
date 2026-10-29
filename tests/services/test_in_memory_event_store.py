@@ -36,15 +36,23 @@ from tests.services.conftest import InMemoryEventStore
 class TestInMemoryEventStoreListTeams:
     """``list_teams`` on the fake must match the Protocol it stands in for."""
 
-    def test_no_argument_call_returns_every_team_including_deleted(self) -> None:
-        """No filter means no filter — ``DELETED`` is in the default result set."""
+    def test_no_argument_call_hides_deleted_and_status_deleted_returns_it(self) -> None:
+        """The default hides retired teams; ``status=DELETED`` is how they are reached."""
         store = InMemoryEventStore()
         running = make_process(status=TeamStatus.RUNNING)
+        stopped = make_process(status=TeamStatus.STOPPED)
         deleted = make_process(status=TeamStatus.DELETED)
-        store.save_team(running)
-        store.save_team(deleted)
+        for process in (running, stopped, deleted):
+            store.save_team(process)
 
-        assert {p.team_id for p in store.list_teams()} == {running.team_id, deleted.team_id}
+        assert {p.team_id for p in store.list_teams()} == {running.team_id, stopped.team_id}
+        assert {p.team_id for p in store.list_teams(status=None)} == {
+            running.team_id,
+            stopped.team_id,
+        }
+        assert {p.team_id for p in store.list_teams(status=TeamStatus.DELETED)} == {
+            deleted.team_id
+        }
 
     def test_filters_by_user_id(self) -> None:
         """``user_id`` selects only that owner's snapshots."""

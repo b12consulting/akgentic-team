@@ -40,6 +40,7 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DeleteMode,
     DescriptionOrigin,
     PersistedEvent,
     Process,
@@ -47,7 +48,10 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._description import description_update_fields
+from akgentic.team.repositories._description import (
+    description_update_fields,
+    soft_delete_fields,
+)
 
 if TYPE_CHECKING:
     import pymongo.collection
@@ -191,6 +195,8 @@ class MongoEventStore:
             Switch it off where the teams collection is too large to absorb a
             foreground build at boot, and run
             ``python -m akgentic.team.scripts.init_mongo`` out of band instead.
+        delete_mode: What :meth:`delete_team` does. ``HARD`` (the default)
+            purges the team; ``SOFT`` retires it. Fixed for the store's life.
     """
 
     def __init__(
@@ -198,8 +204,11 @@ class MongoEventStore:
         db: pymongo.database.Database,  # type: ignore[type-arg]
         *,
         auto_create_indexes: bool | None = None,
+        delete_mode: DeleteMode = DeleteMode.HARD,
     ) -> None:
         self._db = db
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
         self._teams: pymongo.collection.Collection = db[TEAMS_COLLECTION]  # type: ignore[type-arg]
         self._events: pymongo.collection.Collection = db["events"]  # type: ignore[type-arg]
         self._agent_states: pymongo.collection.Collection = db["agent_states"]  # type: ignore[type-arg]
@@ -365,11 +374,13 @@ class MongoEventStore:
         All three filters are pushed into the same Mongo ``find`` filter dict
         — ``{"user_id": ...}``, ``{"status": ...}`` and, per filtered metadata
         key, one ``$or`` of anchored ``{"metadata_indexes": {"$regex": "^..."}}``
-        arms, those ``$or`` groups collected under ``$and``. A parameter left at
-        ``None`` contributes no key, so ``list_teams()`` issues ``find({})`` and
-        returns every team. The selection happens in MongoDB, never in Python
-        after hydration, so a team that will not be returned is never
-        transferred or validated.
+        arms, those ``$or`` groups collected under ``$and``. ``user_id`` and
+        ``metadata`` left at ``None`` contribute no key. ``status`` always
+        contributes one: equality when given, else ``{"$ne": "deleted"}``, so
+        ``list_teams()`` issues ``find({"status": {"$ne": "deleted"}})`` and
+        returns every team that is not retired. The selection happens in
+        MongoDB, never in Python after hydration, so a team that will not be
+        returned is never transferred or validated.
 
         The ``$or``-inside-``$and`` nesting **is** the combination rule: terms
         for one key OR, distinct keys AND (ADR-28 §D7). The outer ``$and`` is
@@ -400,9 +411,10 @@ class MongoEventStore:
                 ``Process.user_id`` matches. If ``None`` (default), the
                 filter carries no ``user_id`` key. See ADR-16 §1.
             status: If provided, return only snapshots whose
-                ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. See
-                ADR-23 §1.
+                ``Process.status`` matches; ``DELETED`` reaches retired teams.
+                If ``None`` (default), every status except ``DELETED`` is
+                returned, whatever this store's ``delete_mode``. The ``$ne``
+                needs no index of its own. See ADR-23 §1 and ADR-30 §3.
             metadata: Mapping of indexed field name to a list of prefix terms.
                 Terms for one key OR-combine; distinct keys AND-combine. Empty
                 terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
@@ -420,6 +432,8 @@ class MongoEventStore:
             query["user_id"] = user_id
         if status is not None:
             query["status"] = status
+        else:
+            query["status"] = {"$ne": TeamStatus.DELETED.value}
         # Gate on the RENDERED groups, not on `metadata` truthiness: FR4 lets a
         # key carry an empty term list, so `{"tenant": []}` is truthy and still
         # has to add nothing. `$and: []` and `$or: []` are both OperationFailure
@@ -623,13 +637,42 @@ class MongoEventStore:
             return None
 
     def delete_team(self, team_id: uuid.UUID) -> None:
-        """Delete all persisted data for a team from all three collections.
+        """Purge or retire a team, as this store's ``delete_mode`` says.
 
-        Removes documents from ``teams``, ``events``, and ``agent_states``
-        matching the given ``team_id``. If no documents exist, this is a no-op.
+        ``HARD`` purges (see :meth:`_purge`); ``SOFT`` retires (see
+        :meth:`_retire`). Either way an unknown team is a no-op and the shared
+        ``agent_cards`` collection is untouched.
 
         Args:
             team_id: Unique identifier of the team to delete.
+        """
+        if self._delete_mode is DeleteMode.SOFT:
+            self._retire(team_id)
+        else:
+            self._purge(team_id)
+
+    def _retire(self, team_id: uuid.UUID) -> None:
+        """Set ``status`` and ``updated_at`` with ONE conditional ``update_one``.
+
+        ``$set`` of exactly the two keys, so no other field of the document is
+        serialised from memory and a concurrent writer's change survives. The
+        ``status: {"$ne": "deleted"}`` term in the FILTER is what makes a second
+        retire a no-op that leaves ``updated_at`` alone. No ``upsert``: an
+        unknown team matches nothing and creates nothing.
+        """
+        result = self._teams.update_one(
+            {"team_id": str(team_id), "status": {"$ne": TeamStatus.DELETED.value}},
+            {"$set": soft_delete_fields()},
+        )
+        if result.matched_count:
+            logger.debug("Retired team %s", team_id)
+
+    def _purge(self, team_id: uuid.UUID) -> None:
+        """Delete all persisted data for a team from all three collections.
+
+        Removes documents from ``teams``, ``events``, and ``agent_states``
+        matching the given ``team_id``, whatever the stored status — a retired
+        team is purged like any other. If no documents exist, this is a no-op.
         """
         team_id_str = str(team_id)
         self._teams.delete_many({"team_id": team_id_str})

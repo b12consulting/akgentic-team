@@ -3,8 +3,9 @@
 Implements the fourteen :class:`~akgentic.team.ports.EventStore` Protocol methods
 against PostgreSQL using Nagra's :class:`~nagra.Transaction` wrapper. Each
 public method opens its own transaction (per-method ownership);
-:meth:`NagraEventStore.delete_team` is the one exception that spans a single
-transaction across three ``DELETE`` statements for atomic cascade semantics.
+:meth:`NagraEventStore.delete_team` under ``DeleteMode.HARD`` is the one
+exception that spans a single transaction across three ``DELETE`` statements
+for atomic cascade semantics.
 
 The class satisfies the ``EventStore`` Protocol via structural subtyping — it
 does NOT inherit from the Protocol explicitly (mirrors ``YamlEventStore`` and
@@ -28,6 +29,7 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DeleteMode,
     DescriptionOrigin,
     PersistedEvent,
     Process,
@@ -35,7 +37,10 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._description import description_update_fields
+from akgentic.team.repositories._description import (
+    description_update_fields,
+    soft_delete_fields,
+)
 from akgentic.team.repositories.postgres._queries import decode_jsonb_column
 
 logger = logging.getLogger(__name__)
@@ -127,9 +132,11 @@ class NagraEventStore:
     Args:
         conn_string: Nagra-compatible Postgres connection string used to
             open per-method transactions.
+        delete_mode: What :meth:`delete_team` does. ``HARD`` (the default)
+            purges the team; ``SOFT`` retires it. Fixed for the store's life.
     """
 
-    def __init__(self, conn_string: str) -> None:
+    def __init__(self, conn_string: str, *, delete_mode: DeleteMode = DeleteMode.HARD) -> None:
         # Local import keeps the constructor cheap and avoids a circular
         # import on package initialisation (``__init__`` re-exports this
         # class after defining ``_ensure_schema_loaded``).
@@ -137,6 +144,8 @@ class NagraEventStore:
 
         _ensure_schema_loaded()
         self._conn_string = conn_string
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
 
     # --- team process (team_process_entries) -------------------------------
 
@@ -290,10 +299,11 @@ class NagraEventStore:
           and cannot serve a prefix on an element. ADR-28 §D6 records the
           remedy — a side table with a ``text_pattern_ops`` B-tree — as
           something to take when volume calls for it, not now.
-        * ``status`` → in memory, on the hydrated rows. Its push-down needs
-          a further expression index and is story 26.5, still DEFERRED, so
-          this is the shipped behaviour of this backend rather than a
-          placeholder. Both indexes above are created by :func:`init_db`.
+        * ``status`` → in memory, on the hydrated rows: equality when given,
+          else every status but ``DELETED``. Its push-down needs a further
+          expression index and is story 26.5, still DEFERRED, so this is the
+          shipped behaviour of this backend rather than a placeholder. Both
+          indexes above are created by :func:`init_db`.
 
         The pushed-down terms AND-combine in one statement, and ``user_id``
         is appended whenever it is given — never dropped, weakened, or made
@@ -317,9 +327,10 @@ class NagraEventStore:
                 ``Process.user_id`` matches. If ``None`` (default), return all
                 snapshots. See ADR-16 §1.
             status: If provided, return only snapshots whose
-                ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. See
-                ADR-23 §1.
+                ``Process.status`` matches; ``DELETED`` reaches retired teams.
+                If ``None`` (default), every status except ``DELETED`` is
+                returned, whatever this store's ``delete_mode``. See ADR-23 §1
+                and ADR-30 §3.
             metadata: Mapping of indexed field name to a list of prefix terms.
                 Terms for one key OR-combine; distinct keys AND-combine. Empty
                 terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
@@ -363,15 +374,46 @@ class NagraEventStore:
                 teams.append(process)
         # The one filter still evaluated in Python — see the docstring.
         if status is not None:
-            teams = [t for t in teams if t.status == status]
-        return teams
+            return [t for t in teams if t.status == status]
+        return [t for t in teams if t.status != TeamStatus.DELETED]
 
     def delete_team(self, team_id: uuid.UUID) -> None:
+        """Purge or retire a team, as this store's ``delete_mode`` says.
+
+        ``HARD`` purges (see :meth:`_purge`); ``SOFT`` retires (see
+        :meth:`_retire`). Either way an unknown team is a no-op and
+        ``agent_card_entries`` is untouched.
+        """
+        if self._delete_mode is DeleteMode.SOFT:
+            self._retire(team_id)
+        else:
+            self._purge(team_id)
+
+    def _retire(self, team_id: uuid.UUID) -> None:
+        """Set ``status`` and ``updated_at`` with ONE conditional ``UPDATE``.
+
+        The two keys are merged into the stored document with the ``jsonb``
+        concatenation operator, exactly as :meth:`update_team_description`
+        merges its three, so no other key of ``data`` is serialised from memory.
+        The ``IS DISTINCT FROM`` term makes a second retire a no-op that leaves
+        ``updated_at`` alone; an unknown id matches no row and creates none.
+        The promoted ``metadata_indexes`` column is not touched. Every value
+        rides a bound ``%s``.
+        """
+        with Transaction(self._conn_string) as trn:
+            trn.execute(
+                "UPDATE team_process_entries SET data = (data::jsonb || %s::jsonb)::json "
+                "WHERE id = %s AND (data ->> 'status') IS DISTINCT FROM %s",
+                (json.dumps(soft_delete_fields()), str(team_id), TeamStatus.DELETED.value),
+            )
+
+    def _purge(self, team_id: uuid.UUID) -> None:
         """Cascade-delete a team across all three tables in ONE transaction.
 
         Order (dependency-safe): ``agent_state_entries`` → ``event_entries``
         → ``team_process_entries``. Idempotent: calling twice for the same
         id is a no-op on the second call (matches YAML / Mongo semantics).
+        A retired team is purged like any other.
 
         ``agent_card_entries`` is deliberately NOT in the cascade: cards are
         content-addressed and shared, another team may reference the very rows

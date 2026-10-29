@@ -32,10 +32,11 @@ environment variables.
 
 ### `ak-team list`
 
-List all team instances.
+List team instances. Deleted (retired) teams are hidden unless you ask for
+them with `--status deleted`.
 
 ```bash
-# List all teams
+# List every team that is not deleted
 ak-team list
 
 # Filter by status
@@ -143,14 +144,16 @@ Like `create`, blocks until **Ctrl+C** for graceful shutdown.
 
 ### `ak-team delete`
 
-Permanently delete a stopped team and purge all persisted data.
+Permanently delete a stopped or retired team and purge all persisted data.
 
 ```bash
 ak-team delete 550e8400-e29b-41d4-a716-446655440000
 ```
 
 This removes all data: Process metadata, events, and agent state snapshots.
-The team must be in STOPPED state — running teams must be stopped first.
+Agent cards are shared across teams and are never deleted. The team must be
+STOPPED or DELETED — running teams must be stopped first. A DELETED team is
+one a soft-delete deployment retired; this command is how it is purged.
 
 **Arguments:**
 

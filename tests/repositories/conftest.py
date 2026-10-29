@@ -1,7 +1,8 @@
 """Fixtures for the parametrized ``EventStore`` contract suite.
 
 Hosts the ``event_store`` fixture the shared ``TestEventStoreContract`` runs
-against, and ``seed_raw_team`` / ``seed_raw_agent_state``, which write a
+against, its ``SOFT`` sibling ``soft_event_store`` over the same storage, and
+``seed_raw_team`` / ``seed_raw_agent_state``, which write a
 document into whichever backend that fixture yielded **without** going through
 ``save_team`` / ``save_agent_state``.
 
@@ -121,6 +122,39 @@ def event_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Even
 
     msg = f"Unknown event_store backend: {backend}"
     raise ValueError(msg)
+
+
+@pytest.fixture
+def soft_event_store(
+    request: pytest.FixtureRequest,
+    event_store: EventStore,
+    tmp_path: Path,
+) -> EventStore:
+    """Return a ``SOFT`` store over the SAME storage as the yielded ``event_store``.
+
+    ``event_store`` is built with the default ``HARD`` mode; this sibling shares
+    its directory, database or connection, so one test can seed through either,
+    retire through this one, purge through the other and read back raw — which
+    is how the cross-mode contract (a ``HARD`` store purges what a ``SOFT`` one
+    retired; neither lists it) is exercised at all.
+    """
+    del event_store  # requested so the backend's storage exists and is clean
+    from akgentic.team.models import DeleteMode
+
+    backend: str = request.node.callspec.params["event_store"]
+    if backend == "yaml":
+        from akgentic.team.repositories.yaml import YamlEventStore
+
+        return YamlEventStore(tmp_path, delete_mode=DeleteMode.SOFT)
+    if backend == "mongo":
+        from akgentic.team.repositories.mongo import MongoEventStore
+
+        return MongoEventStore(request.getfixturevalue("mongo_db"), delete_mode=DeleteMode.SOFT)
+    from akgentic.team.repositories.postgres import NagraEventStore
+
+    return NagraEventStore(
+        request.getfixturevalue("postgres_clean_tables"), delete_mode=DeleteMode.SOFT
+    )
 
 
 @pytest.fixture

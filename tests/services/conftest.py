@@ -203,9 +203,10 @@ class InMemoryEventStore:
 
         Kept at the full current Protocol shape so this fake cannot drift
         from the real backends it stands in for: ``user_id``, ``status`` and
-        ``metadata`` are independent and combine with AND, and ``None`` on
-        any of them means "do not filter on that dimension" — so the no-arg
-        call still returns every team, ``DELETED`` ones included.
+        ``metadata`` are independent and combine with AND. ``None`` on
+        ``user_id`` or ``metadata`` means "do not filter on that dimension",
+        while ``status=None`` means "every status but ``DELETED``" — so the
+        no-arg call hides retired teams and ``status=DELETED`` reaches them.
 
         The metadata term is an **anchored prefix** on the stored entry, in the
         direction *stored starts with term*. Terms for one key OR-combine and
@@ -222,6 +223,8 @@ class InMemoryEventStore:
             teams = [t for t in teams if t.user_id == user_id]
         if status is not None:
             teams = [t for t in teams if t.status == status]
+        else:
+            teams = [t for t in teams if t.status != TeamStatus.DELETED]
         prefix_groups = make_index_prefix_groups(metadata)
         if prefix_groups:
             teams = [

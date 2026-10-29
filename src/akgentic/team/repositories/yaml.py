@@ -39,6 +39,7 @@ from akgentic.team.metadata import make_index_prefix_groups
 from akgentic.team.models import (
     AgentCardEntry,
     AgentStateSnapshot,
+    DeleteMode,
     DescriptionOrigin,
     PersistedEvent,
     Process,
@@ -46,7 +47,10 @@ from akgentic.team.models import (
 )
 from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
 from akgentic.team.projection import hash_agent_card, storable_agent_card
-from akgentic.team.repositories._description import description_update_fields
+from akgentic.team.repositories._description import (
+    description_update_fields,
+    soft_delete_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +144,14 @@ class YamlEventStore:
 
     Args:
         data_dir: Root directory for all persisted team data.
+        delete_mode: What :meth:`delete_team` does. ``HARD`` (the default)
+            purges the team; ``SOFT`` retires it. Fixed for the store's life.
     """
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, *, delete_mode: DeleteMode = DeleteMode.HARD) -> None:
         self._data_dir = data_dir
+        # Coerced: delete_team dispatches by identity, so a wire string must not purge.
+        self._delete_mode = DeleteMode(delete_mode)
 
     @staticmethod
     def _atomic_write(path: Path, data: dict[str, object]) -> None:
@@ -326,11 +334,14 @@ class YamlEventStore:
         ``TeamStatus`` is a ``StrEnum`` and ``save_team`` persists
         ``model_dump()`` output, so the stored values are plain strings that
         already compare equal to the enum members — no round-trip needed.
-        A document that is not a mapping cannot match a filter, so it is
-        skipped one step ahead of the corrupted-document skip that catches
-        it today. With no filter at all it is passed through untouched, so
-        the unfiltered result set — corrupted-document log line included —
-        does not move (ADR-23 §3).
+
+        ``status=None`` is not "no filter": it drops a mapping whose stored
+        ``status`` is ``deleted``, whatever the store's ``delete_mode``
+        (ADR-30 §3). That test runs first, on mappings only. A document that
+        is not a mapping cannot match a filter, so it is skipped one step
+        ahead of the corrupted-document skip that catches it today. With no
+        filter at all it is passed through untouched, so the unfiltered result
+        set keeps its corrupted-document log line (ADR-23 §3).
 
         Each filter is an independent guard, so a further one is another two
         lines and never disturbs the ones already here.
@@ -338,7 +349,8 @@ class YamlEventStore:
         Args:
             data: Raw parsed document as returned by ``_load_team_data``.
             user_id: Owning-user filter, or None for no user filter.
-            status: Lifecycle-state filter, or None for no status filter.
+            status: Lifecycle-state filter, or None for every status but
+                ``DELETED``.
             prefix_groups: One group of rendered ``"key|value"`` prefixes per
                 filtered key; empty for no metadata filter. **Prefixes within a
                 group are a disjunction and the groups are a conjunction** —
@@ -353,6 +365,12 @@ class YamlEventStore:
         Returns:
             True if the document should be hydrated and returned.
         """
+        if (
+            status is None
+            and isinstance(data, dict)
+            and data.get("status") == TeamStatus.DELETED.value
+        ):
+            return False
         if user_id is None and status is None and not prefix_groups:
             return True
         if not isinstance(data, dict):
@@ -421,9 +439,10 @@ class YamlEventStore:
                 ``Process.user_id`` matches. If ``None`` (default), return all
                 snapshots. See ADR-16 §1.
             status: If provided, return only snapshots whose
-                ``Process.status`` matches. If ``None`` (default), every
-                lifecycle state is returned, including ``DELETED``. See
-                ADR-23 §1.
+                ``Process.status`` matches; ``DELETED`` reaches retired teams.
+                If ``None`` (default), every status except ``DELETED`` is
+                returned, whatever this store's ``delete_mode``. See ADR-23 §1
+                and ADR-30 §3.
             metadata: Mapping of indexed field name to a list of prefix terms.
                 Terms for one key OR-combine; distinct keys AND-combine. Empty
                 terms drop out, so ``{}``, ``{"tenant": []}``, ``{"tenant": [""]}``
@@ -431,7 +450,7 @@ class YamlEventStore:
                 predicate at all. See ADR-24 §D5 and ADR-28 §D3/§D7.
 
         The three filters are independent terms combining as a conjunction;
-        one left at ``None`` constrains nothing.
+        ``user_id`` or ``metadata`` left at ``None`` constrains nothing.
 
         Returns:
             List of all loadable Process snapshots matching every filter
@@ -696,13 +715,54 @@ class YamlEventStore:
             return None
 
     def delete_team(self, team_id: uuid.UUID) -> None:
-        """Delete all persisted data for a team.
+        """Purge or retire a team, as this store's ``delete_mode`` says.
 
-        Removes the entire team directory and all contents. If the directory
-        does not exist, this is a no-op (no error raised).
+        ``HARD`` purges (see :meth:`_purge`); ``SOFT`` retires (see
+        :meth:`_retire`). Either way an unknown team is a no-op and the shared
+        ``agent_cards/`` directory is untouched.
 
         Args:
             team_id: Unique identifier of the team to delete.
+        """
+        if self._delete_mode is DeleteMode.SOFT:
+            self._retire(team_id)
+        else:
+            self._purge(team_id)
+
+    def _retire(self, team_id: uuid.UUID) -> None:
+        """Write ``status`` and ``updated_at`` into the RAW ``team.yaml`` document.
+
+        The same field-level write as :meth:`update_team_description`: the
+        mapping is read with ``_load_team_data``, the two keys are replaced in
+        it, and it is rewritten with ``_atomic_write`` — never
+        ``Process.model_validate``d, which would drop every key the current
+        model does not know. The ``deleted`` check reads the raw dict, so a
+        second retire leaves the file, ``updated_at`` included, untouched. The
+        check-then-write is unlocked for the same reason as there: this store
+        is single-process by construction.
+
+        An absent file is a no-op. A document that is not a mapping cannot take
+        the two keys, so it is logged at ERROR and left as it is; it is already
+        skipped by ``list_teams`` and reads as ``None`` from ``load_team``.
+        """
+        data = self._load_team_data(team_id)
+        if data is None:
+            return
+        if not isinstance(data, dict):
+            logger.error("Cannot retire team %s: team.yaml is not a mapping", team_id)
+            return
+        if data.get("status") == TeamStatus.DELETED.value:
+            return
+        data.update(soft_delete_fields())
+        self._atomic_write(self._team_dir(team_id) / "team.yaml", data)
+        logger.debug("Retired team %s", team_id)
+
+    def _purge(self, team_id: uuid.UUID) -> None:
+        """Delete all persisted data for a team.
+
+        Removes the entire team directory and all contents, whatever the stored
+        status — a retired team is purged like any other. If the directory does
+        not exist, this is a no-op (no error raised).
         """
         team_dir = self._team_dir(team_id)
         if team_dir.exists():

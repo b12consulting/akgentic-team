@@ -770,8 +770,11 @@ teams = event_store.list_teams(
 ```
 
 Every key AND-combines with every other key, and the whole metadata filter
-AND-combines with `user_id` and `status`. A filter left at `None` constrains
-nothing; adding one can only narrow the result set, never widen it. An empty
+AND-combines with `user_id` and `status`. `user_id` or `metadata` left at `None`
+constrains nothing. `status` left at `None` returns every status **except**
+`DELETED`, whichever delete mode the store was built with; pass
+`status=TeamStatus.DELETED` to reach retired teams. Adding a filter can only
+narrow the result set, never widen it. An empty
 dict is an empty conjunction and behaves exactly like `None`. Values are matched
 against the *rendered* form of the stored field, so a typed field is filtered by
 passing its rendered string (`"true"` for a `bool`, the ISO form for a `date`).
@@ -944,7 +947,7 @@ Both names are part of the contract — an operator inspecting a database
 addresses them by name.
 
 Each public `NagraEventStore` method opens its own `Transaction`. The one
-exception is `delete_team`, which spans a single transaction across the
+exception is `delete_team` under `DeleteMode.HARD`, which spans a single transaction across the
 three per-team tables (ordered: `agent_state_entries` → `event_entries` →
 `team_process_entries`) so cascade deletion is atomic. **`delete_team` leaves
 the agent-card store untouched on every backend** — cards are content-addressed
@@ -1107,6 +1110,30 @@ unknown team, writes to a `DELETED` team (lifecycle answers belong to the
 caller), and neither trims nor caps the string — callers own the 500-character
 limit. Never set these two fields through `save_team`.
 
+### Deleting a team: purge or retire
+
+Every store takes a keyword-only `delete_mode`, fixed when it is built:
+
+```python
+from akgentic.team import DeleteMode, YamlEventStore
+
+store = YamlEventStore(data_dir, delete_mode=DeleteMode.SOFT)
+```
+
+- **`DeleteMode.HARD`** (the default) — `delete_team` purges the `Process`, every
+  event and every agent state. It purges a team already stored as `DELETED`
+  too, which is how a retired record is finally removed (`ak-team delete` does
+  exactly this).
+- **`DeleteMode.SOFT`** — `delete_team` retires the team: one field-level write
+  sets `status` to `DELETED` and moves `updated_at`, and everything else stays,
+  events and agent states included. An unknown team and an already-`DELETED` team
+  are both no-ops.
+
+No mode deletes agent cards. Under **either** mode, `list_teams()` hides
+`DELETED` teams and `list_teams(status=TeamStatus.DELETED)` returns them, so
+switching a deployment from soft back to hard never resurfaces what it retired.
+`load_team` still returns a `DELETED` process; its callers guard on status.
+
 ### Crash Recovery
 
 `TeamRestorer` executes a 3-phase protocol:
@@ -1209,7 +1236,7 @@ ak-team create team-card.yaml
 # Resume a stopped team
 ak-team resume <team-id>
 
-# Delete a stopped team
+# Delete a stopped or retired team (purges all its data)
 ak-team delete <team-id>
 
 # Use MongoDB backend
