@@ -73,6 +73,7 @@ class TestInitMongoScriptExitCodes:
         info = client["akgentic"]["teams"].index_information()
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_ensure_indexes_failure_returns_1(
         self, monkeypatch: pytest.MonkeyPatch
