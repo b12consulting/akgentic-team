@@ -140,16 +140,11 @@ def ensure_indexes(
     pass (ADR-24 §D5). The name and key spec are unchanged by the move from
     equality to prefix — deployment tooling probes for the literal name.
 
-    ``teams_team_id_idx`` backs every by-team lookup: ``load_team``'s
-    ``find_one``, ``save_team``'s upsert and the other writes that filter on
-    ``team_id``. ``_id`` is not the team id, so without it each of those is a
-    collection scan whose cost grows with the number of teams. On Azure Cosmos
-    DB for MongoDB (RU-based) a lookup against ~47,000 teams cost ~1,830 RU
-    unindexed and ~3 RU indexed; under load the scans exhaust the provisioned
-    throughput and reads queue on rate limiting until they time out. It is
+    ``teams_team_id_idx`` backs every by-team lookup (``load_team``,
+    ``save_team``'s upsert and the other writes filtering on ``team_id``,
+    which is not ``_id``); without it each is a collection scan. It is
     deliberately **not** unique: Cosmos DB builds a unique index only on an
-    empty collection, so a unique spec would be refused on every deployment
-    that already holds teams.
+    empty collection.
 
     Idempotent — ``create_index`` returns silently when an index of the same
     name and key spec already exists, so this is safe across redeploys and safe
