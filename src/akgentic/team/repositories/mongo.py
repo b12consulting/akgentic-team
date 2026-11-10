@@ -77,13 +77,14 @@ _AUTO_INDEX_ENV = "MONGO_TEAM_AUTO_INDEX"
 # unset or empty variable — leaves it on.
 _AUTO_INDEX_DISABLING_VALUES = frozenset({"0", "false", "no"})
 
-# (key, index name) for the teams-collection indexes backing list_teams.
-# Every name here is load-bearing, not cosmetic — see the docstring of
-# ensure_indexes.
+# (key, index name) for the teams-collection indexes backing list_teams and
+# the by-team_id lookups. Every name here is load-bearing, not cosmetic — see
+# the docstring of ensure_indexes.
 _TEAM_INDEX_SPECS: tuple[tuple[str, str], ...] = (
     ("user_id", "teams_user_id_idx"),
     ("status", "teams_status_idx"),
     ("metadata_indexes", "teams_metadata_indexes_idx"),
+    ("team_id", "teams_team_id_idx"),
 )
 
 
@@ -124,11 +125,12 @@ def _resolve_auto_index(explicit: bool | None) -> bool:
 def ensure_indexes(
     db: pymongo.database.Database,  # type: ignore[type-arg]
 ) -> None:
-    """Create the teams-collection indexes backing the list_teams push-downs.
+    """Create the teams-collection indexes backing team lookups and list_teams.
 
     Creates ``teams_user_id_idx`` (``{"user_id": 1}``), ``teams_status_idx``
-    (``{"status": 1}``) and ``teams_metadata_indexes_idx``
-    (``{"metadata_indexes": 1}``) on the ``teams`` collection. Every name is
+    (``{"status": 1}``), ``teams_metadata_indexes_idx``
+    (``{"metadata_indexes": 1}``) and ``teams_team_id_idx``
+    (``{"team_id": 1}``) on the ``teams`` collection. Every name is
     load-bearing: deployment tooling probes for literal index names — the
     enterprise orphan reconciler waits on ``teams_status_idx`` and stays
     fail-closed while it is absent — so a rename leaves those sweeps silently
@@ -141,6 +143,12 @@ def ensure_indexes(
     seek on. Hence a plain single-field ascending spec here and no option to
     pass (ADR-24 §D5). The name and key spec are unchanged by the move from
     equality to prefix — deployment tooling probes for the literal name.
+
+    ``teams_team_id_idx`` backs every by-team lookup (``load_team``,
+    ``save_team``'s upsert and the other writes filtering on ``team_id``,
+    which is not ``_id``); without it each is a collection scan. It is
+    deliberately **not** unique: Cosmos DB builds a unique index only on an
+    empty collection.
 
     Idempotent — ``create_index`` returns silently when an index of the same
     name and key spec already exists, so this is safe across redeploys and safe
@@ -164,8 +172,8 @@ def ensure_indexes(
             teams.create_index(key, name=name)
         except PyMongoError:
             logger.warning(
-                "Could not create index '%s' on '%s.%s'; list_teams filters fall back "
-                "to a collection scan and degrade on large team collections. "
+                "Could not create index '%s' on '%s.%s'; queries filtering on it fall "
+                "back to a collection scan and degrade on large team collections. "
                 "Results stay correct.",
                 name,
                 teams.name,
