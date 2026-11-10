@@ -345,6 +345,22 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert list(info.keys()).count("teams_user_id_idx") == 1
 
+    # --- team_id index presence ---------------------------------------------
+
+    def test_teams_team_id_index_created_on_init(
+        self, mongo_store: MongoEventStore, mongo_db: Any
+    ) -> None:
+        """``MongoEventStore.__init__`` creates ``teams_team_id_idx`` on ``teams``.
+
+        Backs the by-team lookups: ``load_team``'s ``find_one`` and
+        ``save_team``'s upsert both filter on ``team_id``, which is not
+        ``_id``, so without it each is a collection scan. Pinned non-unique:
+        Cosmos DB builds a unique index only on an empty collection.
+        """
+        info = mongo_db["teams"].index_information()
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
+        assert not info["teams_team_id_idx"].get("unique", False)
+
     # --- event.id index presence --------------------------------------------
 
     def test_events_event_id_index_created_on_init(
@@ -422,11 +438,11 @@ class TestMongoEventStoreMongoSpecific:
     # --- teams index provisioning -------------------------------------------
 
     def test_ensure_indexes_creates_every_teams_index(self, mongo_db: Any) -> None:
-        """``ensure_indexes`` provisions all three teams-collection indexes.
+        """``ensure_indexes`` provisions every teams-collection index.
 
         Each is single-field ascending — the specs backing ``list_teams``'
-        ``user_id``, ``status`` and ``metadata`` push-downs, and the exact
-        names deployment tooling probes for.
+        ``user_id``, ``status`` and ``metadata`` push-downs and the by-team
+        ``team_id`` lookups, and the exact names deployment tooling probes for.
 
         ``teams_metadata_indexes_idx`` is the multikey one. MongoDB derives
         multikey automatically from the array-valued ``metadata_indexes``
@@ -439,6 +455,7 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_ensure_indexes_is_idempotent(self, mongo_db: Any) -> None:
         """A second call does not raise; each index stays present exactly once.
@@ -456,21 +473,28 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
         assert list(info.keys()).count("teams_user_id_idx") == 1
         assert list(info.keys()).count("teams_status_idx") == 1
         assert list(info.keys()).count("teams_metadata_indexes_idx") == 1
+        assert list(info.keys()).count("teams_team_id_idx") == 1
 
     def test_ensure_indexes_guards_each_index_independently(
         self, mongo_db: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A rejected spec is logged at WARNING and skipped, never raised.
 
-        All three names must appear: one ``try`` wrapping the whole loop would
+        Every name must appear: one ``try`` wrapping the whole loop would
         abandon ``teams_status_idx`` — the index the reconciler waits on — the
         moment ``teams_user_id_idx`` was refused.
         """
         real_create_index = type(mongo_db["teams"]).create_index
-        rejected = {"teams_user_id_idx", "teams_status_idx", "teams_metadata_indexes_idx"}
+        rejected = {
+            "teams_user_id_idx",
+            "teams_status_idx",
+            "teams_metadata_indexes_idx",
+            "teams_team_id_idx",
+        }
 
         def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
             if kwargs.get("name") in rejected:
@@ -513,6 +537,7 @@ class TestMongoEventStoreMongoSpecific:
         assert "teams_user_id_idx" not in info
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_metadata_index_rejection_is_logged_and_construction_still_succeeds(
         self, mongo_db: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
@@ -560,7 +585,7 @@ class TestMongoEventStoreMongoSpecific:
     ) -> None:
         """A backend that rejects the teams specs must not stop the process.
 
-        The wrapper refuses only the three teams indexes and delegates every
+        The wrapper refuses only the teams indexes and delegates every
         other key: a patch that rejected everything would take construction
         down on the ungated ``(team_id, sequence)`` index and prove nothing
         about the teams guard. ``mongomock`` shares one ``Collection`` class
@@ -572,7 +597,12 @@ class TestMongoEventStoreMongoSpecific:
         """
         monkeypatch.delenv("MONGO_TEAM_AUTO_INDEX", raising=False)
         real_create_index = type(mongo_db["teams"]).create_index
-        rejected = {"teams_user_id_idx", "teams_status_idx", "teams_metadata_indexes_idx"}
+        rejected = {
+            "teams_user_id_idx",
+            "teams_status_idx",
+            "teams_metadata_indexes_idx",
+            "teams_team_id_idx",
+        }
 
         def _reject_teams(self: Any, keys: Any, **kwargs: Any) -> Any:
             if kwargs.get("name") in rejected:
@@ -605,6 +635,7 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_auto_create_indexes_false_creates_no_teams_index(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
@@ -612,7 +643,7 @@ class TestMongoEventStoreMongoSpecific:
         """``auto_create_indexes=False`` suppresses every teams index.
 
         Including ``teams_user_id_idx``, which was unconditional before the
-        opt-out existed: one provisioning path, three indexes — which is why
+        opt-out existed: one provisioning path, every teams index — which is why
         the opt-out is paired with
         ``python -m akgentic.team.scripts.init_mongo``. Absence is asserted by
         name, never as ``index_information() == {}``: mongomock adds an
@@ -626,6 +657,7 @@ class TestMongoEventStoreMongoSpecific:
         assert "teams_user_id_idx" not in info
         assert "teams_status_idx" not in info
         assert "teams_metadata_indexes_idx" not in info
+        assert "teams_team_id_idx" not in info
         _assert_ungated_indexes_present(mongo_db)
 
     @pytest.mark.parametrize("raw", ["0", "false", "no", "FALSE", "No"])
@@ -645,6 +677,7 @@ class TestMongoEventStoreMongoSpecific:
         assert "teams_user_id_idx" not in info
         assert "teams_status_idx" not in info
         assert "teams_metadata_indexes_idx" not in info
+        assert "teams_team_id_idx" not in info
         _assert_ungated_indexes_present(mongo_db)
 
     @pytest.mark.parametrize("raw", ["", "1", "true", "yes", "maybe"])
@@ -664,6 +697,7 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_explicit_argument_beats_the_disabling_environment(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
@@ -682,6 +716,7 @@ class TestMongoEventStoreMongoSpecific:
         assert info["teams_user_id_idx"]["key"] == [("user_id", 1)]
         assert info["teams_status_idx"]["key"] == [("status", 1)]
         assert info["teams_metadata_indexes_idx"]["key"] == [("metadata_indexes", 1)]
+        assert info["teams_team_id_idx"]["key"] == [("team_id", 1)]
 
     def test_auto_create_indexes_is_keyword_only(
         self, mongo_db: Any, monkeypatch: pytest.MonkeyPatch
