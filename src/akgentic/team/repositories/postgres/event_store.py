@@ -7,9 +7,9 @@ public method opens its own transaction (per-method ownership);
 exception that spans a single transaction across three ``DELETE`` statements
 for atomic cascade semantics.
 
-The class satisfies the ``EventStore`` Protocol via structural subtyping — it
-does NOT inherit from the Protocol explicitly (mirrors ``YamlEventStore`` and
-``MongoEventStore``).
+The class declares the ``EventStore`` Protocol as an explicit base, as
+``YamlEventStore`` and ``MongoEventStore`` do, so mypy checks every method
+against the contract at the class definition.
 
 Implements ADR-15 Nagra-based PostgreSQL EventStore §§2, 3, 4, 8, 9, 10.
 """
@@ -35,7 +35,7 @@ from akgentic.team.models import (
     Process,
     TeamStatus,
 )
-from akgentic.team.ports import EventNotFoundError
+from akgentic.team.ports import EventNotFoundError, EventStore
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories._description import (
     description_update_fields,
@@ -122,7 +122,7 @@ def _like_prefix_pattern(prefix: str) -> str:
     return escaped + "%"
 
 
-class NagraEventStore:
+class NagraEventStore(EventStore):
     """Nagra-backed ``EventStore`` implementation.
 
     Constructor calls :func:`_ensure_schema_loaded` so instances are always
@@ -451,26 +451,72 @@ class NagraEventStore:
             after_event_id: If provided, return only events after the matching
                 event — anchor excluded. If ``None`` (default), the full log.
 
+        Both the anchor resolve and the ``sequence > N`` range filter run in
+        Postgres (ADR-21 §5), in one transaction so the anchor and the range
+        read the same snapshot: the anchor through
+        ``event_entries_event_id_idx``, the range through the
+        ``(team_id, sequence)`` natural key. A client polling with a cursor
+        reads only the events it has not seen, never the whole log.
+
+        A row that does not validate is logged at ``WARNING``, naming its
+        ``sequence``, and skipped — one event lost rather than the log, as on
+        the YAML and Mongo backends. ``EventLogUnreadableError`` is not raised
+        here: it reports a log that cannot be read *as a whole* (a YAML file
+        that will not parse), and a table of independent rows has no such
+        state.
+
         Raises:
             EventNotFoundError: If ``after_event_id`` does not resolve to an
                 event of this team.
         """
         with Transaction(self._conn_string) as trn:
-            cursor = trn.execute(
-                "SELECT data FROM event_entries WHERE team_id = %s "
-                "ORDER BY sequence ASC",
-                (str(team_id),),
-            )
+            if after_event_id is None:
+                cursor = trn.execute(
+                    "SELECT sequence, data FROM event_entries WHERE team_id = %s "
+                    "ORDER BY sequence ASC",
+                    (str(team_id),),
+                )
+            else:
+                anchor = self._resolve_anchor_sequence(trn, team_id, after_event_id)
+                cursor = trn.execute(
+                    "SELECT sequence, data FROM event_entries "
+                    "WHERE team_id = %s AND sequence > %s ORDER BY sequence ASC",
+                    (str(team_id), anchor),
+                )
             rows = cursor.fetchall()
-        events = [PersistedEvent.model_validate(decode_jsonb_column(r[0])) for r in rows]
-        if after_event_id is None:
-            return events
-        # Interim in-memory slice; the range-query push-down lands in story 24-4.
-        # event.id is persisted as a string, so compare stringified ids.
-        for index, event in enumerate(events):
-            if str(event.event.id) == str(after_event_id):
-                return events[index + 1 :]
-        raise EventNotFoundError(f"Event {after_event_id} not found for team {team_id}")
+        events: list[PersistedEvent] = []
+        for sequence, data in rows:
+            try:
+                events.append(PersistedEvent.model_validate(decode_jsonb_column(data)))
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "Skipping corrupted event seq=%s for team %s: %s", sequence, team_id, exc
+                )
+        return events
+
+    @staticmethod
+    def _resolve_anchor_sequence(
+        trn: Transaction, team_id: uuid.UUID, after_event_id: uuid.UUID
+    ) -> int:
+        """Return the ``sequence`` of the cursor anchor, or raise if absent.
+
+        ``event.id`` is persisted as a string inside ``data``, so the lookup
+        compares ``data -> 'event' ->> 'id'`` with the stringified id. The
+        expression is spelled exactly as ``event_entries_event_id_idx``
+        declares it, so the planner can use that index.
+
+        Raises:
+            EventNotFoundError: If the anchor is not an event of this team.
+        """
+        row = trn.execute(
+            "SELECT sequence FROM event_entries "
+            "WHERE team_id = %s AND (data -> 'event' ->> 'id') = %s",
+            (str(team_id), str(after_event_id)),
+        ).fetchone()
+        if row is None:
+            raise EventNotFoundError(f"Event {after_event_id} not found for team {team_id}")
+        sequence: int = row[0]
+        return sequence
 
     def get_max_sequence(self, team_id: uuid.UUID) -> int:
         """Return the largest sequence for a team, or ``0`` if empty.

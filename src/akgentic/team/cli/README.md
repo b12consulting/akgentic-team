@@ -21,9 +21,10 @@ All commands accept these options:
 |---|---|---|
 | `--data-dir` | `./data/` | Root directory for team data files |
 | `--format` | `table` | Output format: `table`, `json`, or `yaml` |
-| `--backend` | `yaml` | Storage backend: `yaml` or `mongodb` |
+| `--backend` | `yaml` | Storage backend: `yaml`, `mongodb` or `postgres` |
 | `--mongo-uri` | — | MongoDB connection URI (required for `mongodb` backend) |
 | `--mongo-db` | — | MongoDB database name (required for `mongodb` backend) |
+| `--postgres-conn-string` | — | PostgreSQL DSN, `postgresql://…` (required for `postgres` backend; env `DB_CONN_STRING_PERSISTENCE`) |
 
 `--mongo-uri` and `--mongo-db` can also be set via `MONGO_URI` and `MONGO_DB`
 environment variables.
@@ -196,6 +197,26 @@ export MONGO_URI=mongodb://localhost:27017
 export MONGO_DB=akgentic
 ak-team --backend mongodb list
 ```
+
+### PostgreSQL
+
+Requires the `[postgres]` optional extra (`nagra`, `psycopg`), and the tables
+created by `python -m akgentic.team.scripts.init_db`:
+
+```bash
+ak-team --backend postgres \
+        --postgres-conn-string postgresql://akgentic:secret@localhost:5432/akgentic \
+        list
+```
+
+Or via the environment variable `init_db` and the migration scripts already read:
+
+```bash
+export DB_CONN_STRING_PERSISTENCE=postgresql://akgentic:secret@localhost:5432/akgentic
+ak-team --backend postgres list
+```
+
+Only the `postgresql://` scheme is accepted; the DSN is never echoed in an error.
 
 ## Examples
 

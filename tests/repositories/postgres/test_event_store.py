@@ -1048,3 +1048,99 @@ class TestAgentCardColumnProvisioning:
 
         assert entry.first_seen_at is not None
         assert entry.first_seen_at.tzinfo is not None
+
+
+class TestNagraEventReads:
+    """Postgres-only: how ``load_events`` reads, not just what it returns.
+
+    The shared contract pins the results (cursor exclusive, stale cursor
+    raises, order by sequence). These pin the two properties a result alone
+    cannot show: the cursor is filtered in SQL, and one bad row is skipped
+    rather than failing the read.
+    """
+
+    _LOGGER = "akgentic.team.repositories.postgres.event_store"
+
+    @staticmethod
+    def _insert_raw_event(conn_string: str, team_id: uuid.UUID, sequence: int) -> None:
+        with Transaction(conn_string) as trn:
+            trn.execute(
+                "INSERT INTO event_entries (team_id, sequence, data) VALUES (%s, %s, %s)",
+                (str(team_id), sequence, json.dumps({"not": "an event"})),
+            )
+
+    def test_a_corrupted_event_row_is_skipped_not_raised(
+        self, postgres_clean_tables: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One bad row costs that event, not the log — as on YAML and Mongo.
+
+        Before, a single row failing ``PersistedEvent.model_validate`` raised a
+        bare ``ValidationError`` out of the store, so the server could not
+        replay or serve any event of the team.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        team_id = uuid.uuid4()
+        store.save_event(make_persisted_event(team_id=team_id, sequence=1))
+        self._insert_raw_event(postgres_clean_tables, team_id, 2)
+        store.save_event(make_persisted_event(team_id=team_id, sequence=3))
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            events = store.load_events(team_id)
+
+        assert [e.sequence for e in events] == [1, 3]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("corrupted event seq=2" in m and str(team_id) in m for m in messages)
+
+    def test_cursor_read_never_touches_rows_at_or_before_the_anchor(
+        self, postgres_clean_tables: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ``sequence > N`` filter runs in Postgres.
+
+        A corrupted row sits before the anchor. An in-memory slice would load
+        and validate it — and log it — before slicing; a pushed-down range
+        never reads it, so nothing is logged.
+        """
+        store = NagraEventStore(postgres_clean_tables)
+        team_id = uuid.uuid4()
+        self._insert_raw_event(postgres_clean_tables, team_id, 1)
+        anchor = make_persisted_event(team_id=team_id, sequence=2)
+        store.save_event(anchor)
+        store.save_event(make_persisted_event(team_id=team_id, sequence=3))
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            events = store.load_events(team_id, after_event_id=anchor.event.id)
+
+        assert [e.sequence for e in events] == [3]
+        assert not [r for r in caplog.records if "corrupted event" in r.getMessage()]
+
+    def test_cursor_on_another_team_raises_event_not_found(
+        self, postgres_clean_tables: str
+    ) -> None:
+        """The anchor lookup is scoped to the team: another team's event id is stale."""
+        from akgentic.team.ports import EventNotFoundError
+
+        store = NagraEventStore(postgres_clean_tables)
+        team_a, team_b = uuid.uuid4(), uuid.uuid4()
+        foreign = make_persisted_event(team_id=team_a, sequence=1)
+        store.save_event(foreign)
+        store.save_event(make_persisted_event(team_id=team_b, sequence=1))
+
+        with pytest.raises(EventNotFoundError):
+            store.load_events(team_b, after_event_id=foreign.event.id)
+
+    def test_anchor_lookup_can_use_the_event_id_index(self, postgres_clean_tables: str) -> None:
+        """The query's expression matches the index's, so the planner can pick it.
+
+        Sequential scans are disabled for the session so the plan names the
+        index whenever it is usable; a spelling drift between the query and
+        ``init_db`` would leave a seq scan and fail here.
+        """
+        team_id = str(uuid.uuid4())
+        with Transaction(postgres_clean_tables) as trn:
+            trn.execute("SET LOCAL enable_seqscan = off")
+            plan = trn.execute(
+                "EXPLAIN SELECT sequence FROM event_entries "
+                "WHERE team_id = %s AND (data -> 'event' ->> 'id') = %s",
+                (team_id, str(uuid.uuid4())),
+            ).fetchall()
+        assert "event_entries_event_id_idx" in "\n".join(row[0] for row in plan)

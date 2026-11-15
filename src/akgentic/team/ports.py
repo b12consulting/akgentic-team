@@ -66,8 +66,10 @@ class EventStore(Protocol):
     """Typed persistence surface for team event sourcing.
 
     Implementations provide durable storage for events, team process state,
-    and agent state snapshots. Concrete implementations (e.g. YamlEventStore,
-    MongoEventStore) satisfy this protocol via structural subtyping.
+    and agent state snapshots. The concrete implementations (YamlEventStore,
+    MongoEventStore, NagraEventStore) declare it as an explicit base, so mypy
+    checks each method's signature at the class definition and a missing
+    member makes the class abstract instead of passing silently.
     """
 
     def save_event(self, event: PersistedEvent) -> None:
