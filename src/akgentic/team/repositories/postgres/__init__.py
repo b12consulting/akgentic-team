@@ -98,6 +98,15 @@ def init_db(conn_string: str) -> None:
             "CREATE INDEX IF NOT EXISTS team_process_metadata_indexes_idx "
             "ON team_process_entries USING GIN (metadata_indexes)"
         )
+        # Serves the cursor anchor of NagraEventStore.load_events — the one
+        # lookup by event id. The expression must match the query's spelling
+        # (data -> 'event' ->> 'id') or the planner ignores the index. A
+        # database provisioned earlier gains it on the next init_db; until
+        # then the anchor lookup is still correct, only unindexed.
+        trn.execute(
+            "CREATE INDEX IF NOT EXISTS event_entries_event_id_idx "
+            "ON event_entries (team_id, (data -> 'event' ->> 'id'))"
+        )
 
 
 # Import the event store last so it can rely on _ensure_schema_loaded above.

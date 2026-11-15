@@ -18,6 +18,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 from rich.console import Console
+from rich.markup import escape
 
 from akgentic.team.cli._output import OutputFormat, render
 from akgentic.team.models import TeamCard, TeamStatus
@@ -40,9 +41,10 @@ class GlobalState:
     Attributes:
         data_dir: Root directory for team data files.
         format: Output format for command results.
-        backend: Storage backend (yaml or mongodb).
+        backend: Storage backend (yaml, mongodb or postgres).
         mongo_uri: MongoDB connection URI.
         mongo_db: MongoDB database name.
+        postgres_conn_string: PostgreSQL DSN (``postgresql://…``).
     """
 
     data_dir: Path = field(default_factory=lambda: Path("./data/"))
@@ -50,6 +52,7 @@ class GlobalState:
     backend: str = "yaml"
     mongo_uri: str | None = None
     mongo_db: str | None = None
+    postgres_conn_string: str | None = field(default=None, repr=False)
 
 
 app = typer.Typer(name="ak-team", help="Manage team instances.")
@@ -71,7 +74,7 @@ def main(
     backend: str = typer.Option(
         "yaml",
         "--backend",
-        help="Storage backend: yaml or mongodb.",
+        help="Storage backend: yaml, mongodb or postgres.",
     ),
     mongo_uri: str | None = typer.Option(
         None,
@@ -85,9 +88,19 @@ def main(
         envvar="MONGO_DB",
         help="MongoDB database name (required when --backend=mongodb).",
     ),
+    postgres_conn_string: str | None = typer.Option(
+        None,
+        "--postgres-conn-string",
+        envvar="DB_CONN_STRING_PERSISTENCE",
+        show_envvar=True,
+        help=(
+            "PostgreSQL DSN, postgresql://user:password@host:port/db "
+            "(required when --backend=postgres)."
+        ),
+    ),
 ) -> None:
     """Akgentic team CLI -- manage team lifecycle instances."""
-    valid_backends = ("yaml", "mongodb")
+    valid_backends = ("yaml", "mongodb", "postgres")
     if backend not in valid_backends:
         err_console.print(
             f"[red]Error:[/red] Invalid backend '{backend}'. "
@@ -102,6 +115,12 @@ def main(
                 err_console.print(f"[red]Error:[/red] {err}")
             raise typer.Exit(code=1)
 
+    if backend == "postgres":
+        error = _validate_postgres_options(postgres_conn_string)
+        if error:
+            err_console.print(f"[red]Error:[/red] {error}")
+            raise typer.Exit(code=1)
+
     ctx.ensure_object(dict)
     ctx.obj = GlobalState(
         data_dir=data_dir,
@@ -109,6 +128,7 @@ def main(
         backend=backend,
         mongo_uri=mongo_uri,
         mongo_db=mongo_db,
+        postgres_conn_string=postgres_conn_string,
     )
 
 
@@ -137,6 +157,29 @@ def _validate_mongodb_options(
     return errors
 
 
+def _validate_postgres_options(conn_string: str | None) -> str | None:
+    """Validate the Postgres DSN and return an error message, or ``None``.
+
+    Only ``postgresql://`` is accepted: Nagra dispatches on that exact prefix
+    and its error for any other DSN, ``postgres://`` included, prints the DSN —
+    password and all. The message here names the scheme, never the value.
+
+    Args:
+        conn_string: The DSN, or None if neither the flag nor the env var is set.
+
+    Returns:
+        An error message, or None when the DSN is usable.
+    """
+    if not conn_string:
+        return (
+            "--postgres-conn-string (or DB_CONN_STRING_PERSISTENCE env var) "
+            "is required when --backend=postgres"
+        )
+    if not conn_string.startswith("postgresql://"):
+        return "--postgres-conn-string must start with 'postgresql://'"
+    return None
+
+
 def _build_event_store(state: GlobalState) -> EventStore:
     """Construct an EventStore from the global CLI state.
 
@@ -162,6 +205,24 @@ def _build_event_store(state: GlobalState) -> EventStore:
         from akgentic.team.repositories.mongo import MongoEventStore
 
         return MongoEventStore(db)
+
+    if state.backend == "postgres":
+        try:
+            from akgentic.team.repositories.postgres import NagraEventStore
+        except ImportError as exc:
+            # escape(): Rich would otherwise read [postgres] and [cli,postgres]
+            # as markup tags and drop them, printing an install command that
+            # installs nothing.
+            err_console.print(
+                "[red]Error:[/red] "
+                + escape(
+                    "The Postgres backend needs the [postgres] extra: "
+                    'pip install "akgentic-team[cli,postgres]"'
+                )
+            )
+            raise typer.Exit(code=1) from exc
+        assert state.postgres_conn_string is not None  # validated in main()
+        return NagraEventStore(state.postgres_conn_string)
 
     from akgentic.team.repositories.yaml import YamlEventStore
 

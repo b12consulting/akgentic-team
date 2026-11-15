@@ -1,8 +1,9 @@
 """YamlEventStore: file-based EventStore with per-team directory layout.
 
 Persists team data to YAML files in a per-team directory structure using
-PyYAML for serialization and pathlib for filesystem operations. Satisfies
-the EventStore protocol via structural subtyping (no explicit inheritance).
+PyYAML for serialization and pathlib for filesystem operations. Declares
+the EventStore protocol as an explicit base, so mypy checks every method
+against the contract at the class definition.
 
 File layout per team::
 
@@ -45,7 +46,7 @@ from akgentic.team.models import (
     Process,
     TeamStatus,
 )
-from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError
+from akgentic.team.ports import EventLogUnreadableError, EventNotFoundError, EventStore
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories._description import (
     description_update_fields,
@@ -135,12 +136,11 @@ def _is_card_hash(value: str) -> bool:
     return len(value) == _CARD_HASH_LENGTH and _HEX_DIGITS.issuperset(value)
 
 
-class YamlEventStore:
+class YamlEventStore(EventStore):
     """File-based EventStore using YAML serialization with per-team directories.
 
-    Satisfies the ``EventStore`` protocol via structural subtyping without
-    inheriting from it. All filesystem directories are created on demand
-    (not eagerly at instantiation time).
+    Declares the ``EventStore`` protocol as an explicit base. All filesystem
+    directories are created on demand (not eagerly at instantiation time).
 
     Args:
         data_dir: Root directory for all persisted team data.

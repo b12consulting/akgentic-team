@@ -138,6 +138,21 @@ class TestInitDbIntegration:
             rows = cursor.fetchall()
         assert len(rows) == 1
 
+    def test_init_db_creates_event_id_index(self, postgres_initialized: str) -> None:
+        """After ``init_db``, ``event_entries_event_id_idx`` exists in ``pg_indexes``.
+
+        Backs the cursor-anchor lookup of :meth:`NagraEventStore.load_events`
+        (``WHERE team_id = %s AND (data -> 'event' ->> 'id') = %s``).
+        """
+        from nagra import Transaction
+
+        with Transaction(postgres_initialized) as trn:
+            rows = trn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'event_entries_event_id_idx'"
+            ).fetchall()
+        assert len(rows) == 1
+        assert "team_id" in rows[0][0]
+
     def test_init_db_metadata_indexes_column_is_a_text_array(
         self, postgres_initialized: str
     ) -> None:
