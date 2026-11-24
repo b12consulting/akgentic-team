@@ -930,8 +930,9 @@ uv sync --extra postgres
 
 The PostgreSQL backend is built on [Nagra](https://pypi.org/project/nagra/)
 and stores team state across four tables with promoted query keys plus a
-`data JSONB` payload (the payload is authoritative — promoted columns are
-indexes, not the source of truth):
+`data JSON` payload (plain `JSON`, which is what Nagra's `json` column type
+creates; the payload is authoritative — promoted columns are indexes, not the
+source of truth):
 
 | Table | Natural key | Purpose |
 |---|---|---|
@@ -940,11 +941,20 @@ indexes, not the source of truth):
 | `agent_state_entries` | `(team_id, agent_id)` | Agent state snapshots |
 | `agent_card_entries` | `card_hash` | Content-addressed `AgentCard` blobs, shared across teams |
 
-`init_db` creates two indexes on `team_process_entries`: the functional
-expression index `team_process_user_id_idx` over `(data ->> 'user_id')`, and
-the GIN index `team_process_metadata_indexes_idx` over `metadata_indexes`.
-Both names are part of the contract — an operator inspecting a database
-addresses them by name.
+`init_db` creates three indexes: on `team_process_entries`, the functional
+expression index `team_process_user_id_idx` over `(data ->> 'user_id')` and
+the GIN index `team_process_metadata_indexes_idx` over `metadata_indexes`; on
+`event_entries`, `event_entries_event_id_idx` over
+`(team_id, (data -> 'event' ->> 'id'))`, which serves the cursor anchor of
+`load_events`. The names are part of the contract — an operator inspecting a
+database addresses them by name. A database provisioned before an index
+existed gains it on the next `init_db` run.
+
+`load_events(team_id, after_event_id=...)` runs in SQL end to end: the anchor
+is resolved to its `sequence` and only `sequence > N` is read, so a client
+polling with a cursor never loads the whole log. An event row that does not
+validate is logged at `WARNING` with its `sequence` and skipped — one event
+lost rather than the log — as on the YAML and MongoDB backends.
 
 Each public `NagraEventStore` method opens its own `Transaction`. The one
 exception is `delete_team` under `DeleteMode.HARD`, which spans a single transaction across the
@@ -971,10 +981,12 @@ so existing operator `.env` files work unchanged:
 
 `DB_CONN_STRING_PERSISTENCE` is **shared verbatim with `akgentic-catalog`** —
 both modules target the same database. Their tables are disjoint by design:
-the catalog owns `template_entries`, `tool_entries`, `agent_entries`, and
-`team_entries`; this package owns `team_process_entries` (renamed from
-`team_entries` to prevent collision), `event_entries`, and
-`agent_state_entries`. A single Postgres instance can serve both modules.
+the catalog owns `catalog_entries`; this package owns `team_process_entries`,
+`event_entries`, `agent_state_entries` and `agent_card_entries`. A single
+Postgres instance can serve both modules.
+
+Only the `postgresql://` scheme works. Nagra's `Transaction` rejects any other
+prefix, `postgres://` included, with an error that prints the whole DSN.
 
 `NagraEventStore.__init__` takes `conn_string` directly as a positional
 argument — env-var reading happens at the wiring layer (application
@@ -1217,6 +1229,38 @@ cause — the documents it did convert are skipped the second time.
 > store predates the content-addressed card table. The migration writes into
 > `agent_card_entries`, which `init_db` provisions.
 
+### Moving a YAML store to PostgreSQL
+
+`python -m akgentic.team.scripts.copy_yaml_to_postgres` copies every team —
+running, stopped and retired — with its events, agent states and the agent
+cards it references, from a YAML store into PostgreSQL. The YAML store is only
+read.
+
+```bash
+export DB_CONN_STRING_PERSISTENCE=postgresql://akgentic:secret@localhost:5432/akgentic
+# 1. stop the server; 2. bring the YAML store to the current shape
+python -m akgentic.team.scripts.migrate_yaml --data-dir data/event_store
+# 3. create the tables
+python -m akgentic.team.scripts.init_db
+# 4. see what would be copied, then copy
+python -m akgentic.team.scripts.copy_yaml_to_postgres --data-dir data/event_store --dry-run
+python -m akgentic.team.scripts.copy_yaml_to_postgres --data-dir data/event_store
+```
+
+Per team it writes the cards first (and checks they resolve on the target), then
+the events above the target's current maximum `sequence`, then the agent states,
+and the team record last — so an interrupted run never leaves a team listed
+without its data, and re-running finishes the job without duplicating anything.
+A team that fails (a missing card, an `events.yaml` that will not parse) is
+logged with its `team_id` and skipped; the others are still copied. Exit codes
+follow the migration scripts: `0` all copied, `1` at least one team failed or
+the backend is unavailable, `2` configuration missing or invalid (no DSN, a
+non-`postgresql://` DSN, `--data-dir` not a directory).
+
+The copy itself is `akgentic.team.store_copy.copy_store(source, target)`. It
+uses only the `EventStore` protocol, so it also moves a store between any two
+backends from Python.
+
 ## CLI
 
 The `ak-team` command is available when the `[cli]` extra is installed.
@@ -1241,6 +1285,10 @@ ak-team delete <team-id>
 
 # Use MongoDB backend
 ak-team --backend mongodb --mongo-uri mongodb://localhost:27017 --mongo-db akgentic list
+
+# Use PostgreSQL backend (needs the [postgres] extra; the DSN may also come from
+# DB_CONN_STRING_PERSISTENCE, the variable init_db reads)
+ak-team --backend postgres --postgres-conn-string postgresql://akgentic:secret@localhost:5432/akgentic list
 ```
 
 ## Examples

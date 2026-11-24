@@ -1,7 +1,8 @@
 """MongoEventStore: MongoDB-backed EventStore via [mongo] optional extra.
 
-Persists team data to MongoDB collections using pymongo. Satisfies the
-EventStore protocol via structural subtyping (no explicit inheritance).
+Persists team data to MongoDB collections using pymongo. Declares the
+EventStore protocol as an explicit base, so mypy checks every method against
+the contract at the class definition.
 
 Collection layout::
 
@@ -46,7 +47,7 @@ from akgentic.team.models import (
     Process,
     TeamStatus,
 )
-from akgentic.team.ports import EventNotFoundError
+from akgentic.team.ports import EventNotFoundError, EventStore
 from akgentic.team.projection import hash_agent_card, storable_agent_card
 from akgentic.team.repositories._description import (
     description_update_fields,
@@ -182,14 +183,14 @@ def ensure_indexes(
             )
 
 
-class MongoEventStore:
+class MongoEventStore(EventStore):
     """MongoDB-backed EventStore using pymongo collections.
 
-    Satisfies the ``EventStore`` protocol via structural subtyping without
-    inheriting from it. Uses four collections: ``teams`` (upsert by team_id),
-    ``events`` (append-only, indexed by team_id + sequence),
-    ``agent_states`` (upsert by team_id + agent_id) and ``agent_cards``
-    (upsert by card_hash, shared across teams and never deleted).
+    Declares the ``EventStore`` protocol as an explicit base. Uses four
+    collections: ``teams`` (upsert by team_id), ``events`` (append-only,
+    indexed by team_id + sequence), ``agent_states`` (upsert by team_id +
+    agent_id) and ``agent_cards`` (upsert by card_hash, shared across teams
+    and never deleted).
 
     Args:
         db: A pymongo Database instance connected to the target MongoDB server.
