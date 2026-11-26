@@ -105,13 +105,15 @@ def _make_member(
     )
 
 
-def _make_team_card() -> TeamCard:
+def _make_team_card(
+    metadata_type: type[SerializableBaseModel] | None = AcmeMetadata,
+) -> TeamCard:
     """An entry point with a subordinate — two spawn layers, one card."""
     return TeamCard(
         name="acme-support",
         description="Test team",
         entry_point=_make_member("lead", "Lead", members=[_make_member("helper", "Helper")]),
-        metadata_type=AcmeMetadata,
+        metadata_type=metadata_type,
     )
 
 
@@ -276,8 +278,10 @@ class TestMetadataIsVisibleAtSpawnTime:
     def test_a_team_without_metadata_spawns_with_none(
         self, actor_system: ActorSystem, manager: TeamManager
     ) -> None:
-        """AC3: no metadata is not an error — the member simply sees None."""
-        runtime = manager.create_team(_make_team_card(), user_id=USER_ID, user_email=USER_EMAIL)
+        """AC3: an untyped team carries no metadata — the member simply sees None."""
+        runtime = manager.create_team(
+            _make_team_card(metadata_type=None), user_id=USER_ID, user_email=USER_EMAIL
+        )
 
         record = _spawn_record(actor_system, runtime.entry_addr)
         assert record.seen_metadata is None

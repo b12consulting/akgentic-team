@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pykka
 import pytest
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
@@ -42,6 +43,7 @@ from akgentic.team.manager import TeamManager
 from akgentic.team.metadata import TeamMetadata, derive_metadata_indexes
 from akgentic.team.models import Process, TeamCard, TeamCardMember, TeamRuntime, TeamStatus
 from akgentic.team.ports import NullServiceRegistry
+from akgentic.team.reference_metadata import FolderTeamMetadata, ReferenceTeamMetadata
 from tests.conftest import projection_kwargs
 from tests.services.conftest import InMemoryEventStore, record_orchestrator_metadata_writes
 
@@ -331,11 +333,11 @@ class TestCreateTeamMetadata:
         assert event_store.save_team_calls == 0
         registry.register_team.assert_not_called()
 
-    def test_without_metadata_persists_none_and_empty_index(
+    def test_untyped_card_without_metadata_persists_none_and_empty_index(
         self, manager: TeamManager, event_store: CountingEventStore, actor_system: ActorSystem
     ) -> None:
-        """AC 7: the default keeps every existing call site working unchanged."""
-        runtime = manager.create_team(_make_team_card())
+        """An untyped card stores no metadata — the only legal value there is None."""
+        runtime = manager.create_team(_make_team_card(metadata_type=None))
 
         process = event_store.load_team(runtime.id)
         assert process is not None
@@ -343,22 +345,58 @@ class TestCreateTeamMetadata:
         assert process.metadata_indexes == []
         assert _read_orchestrator_metadata(actor_system, runtime) is None
 
-    def test_without_metadata_performs_no_write_to_the_orchestrator(
+    def test_untyped_card_without_metadata_performs_no_write_to_the_orchestrator(
         self, manager: TeamManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """AC 7: no metadata means no orchestrator round-trip at all.
+        """No metadata means no orchestrator round-trip at all — on an UNTYPED card.
 
         Neither writer runs: not the build's ``set_metadata`` (guarded on
         ``metadata is not None``, the same guard restore uses) and not
-        ``_push_metadata``, which the create path no longer calls at all.
+        ``_push_metadata``, which the create path no longer calls at all. A typed
+        card is different: it always carries an instance, which is written once.
         """
         writes = record_orchestrator_metadata_writes(monkeypatch)
 
         with patch.object(TeamManager, "_push_metadata", autospec=True) as push:
-            manager.create_team(_make_team_card())
+            manager.create_team(_make_team_card(metadata_type=None))
 
         assert writes == []
         push.assert_not_called()
+
+    def test_typed_card_without_metadata_materialises_the_defaults(
+        self, manager: TeamManager, event_store: CountingEventStore, actor_system: ActorSystem
+    ) -> None:
+        """A declared all-defaults type always materialises, so its indexed
+        defaults land and the team is findable by them."""
+        runtime = manager.create_team(_make_team_card(metadata_type=FolderTeamMetadata))
+
+        process = event_store.load_team(runtime.id)
+        assert process is not None
+        assert type(process.metadata) is FolderTeamMetadata
+        assert process.metadata.folder == "Documents"
+        assert process.metadata_indexes == ["folder|documents"]
+        live = _read_orchestrator_metadata(actor_system, runtime)
+        assert type(live) is FolderTeamMetadata
+        assert live == process.metadata
+
+    def test_typed_card_without_metadata_and_a_required_field_creates_nothing(
+        self, actor_system: ActorSystem, event_store: CountingEventStore
+    ) -> None:
+        """A declared type with a required field rejects an absent value — before
+        any actor is spawned or anything is written."""
+        registry = MagicMock(spec=NullServiceRegistry)
+        mgr = TeamManager(
+            actor_system=actor_system, event_store=event_store, service_registry=registry
+        )
+        actors_before = len(pykka.ActorRegistry.get_all())
+
+        with pytest.raises(ValidationError):
+            mgr.create_team(_make_team_card(metadata_type=ReferenceTeamMetadata))
+
+        assert len(pykka.ActorRegistry.get_all()) == actors_before
+        assert event_store.teams == {}
+        assert event_store.save_team_calls == 0
+        registry.register_team.assert_not_called()
 
     def test_the_orchestrator_is_written_exactly_once(
         self, manager: TeamManager, monkeypatch: pytest.MonkeyPatch
@@ -473,20 +511,69 @@ class TestUpdateTeamMetadata:
         assert stored.metadata.case_ref is None
         assert stored.metadata_indexes == ["tenant|acme", "channel|email"]
 
-    def test_none_clears_the_metadata_and_its_index(
+    def test_none_on_an_all_defaults_type_resets_to_the_defaults(
         self, manager: TeamManager, event_store: CountingEventStore
     ) -> None:
-        """AC 11: clearing is the degenerate case of replace."""
+        """On a typed team None is the empty document: every field returns to its
+        default, and the index is re-derived from that instance — in one write."""
+        runtime = manager.create_team(
+            _make_team_card(metadata_type=FolderTeamMetadata),
+            metadata=FolderTeamMetadata(folder="Archive"),
+        )
+        writes_before = event_store.save_team_calls
+
+        result = manager.update_team_metadata(runtime.id, None)
+
+        stored = event_store.load_team(runtime.id)
+        assert stored is not None
+        assert type(stored.metadata) is FolderTeamMetadata
+        assert stored.metadata.folder == "Documents"
+        assert stored.metadata_indexes == ["folder|documents"]
+        assert result == stored
+        assert event_store.save_team_calls == writes_before + 1
+
+    def test_none_on_a_type_with_a_required_field_is_rejected_and_nothing_written(
+        self,
+        manager: TeamManager,
+        event_store: CountingEventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """None cannot clear a typed team whose type has a required field.
+
+        The snapshot is taken BEFORE the rejected call, for the same reason as in
+        ``test_wrong_concrete_type_rejected_and_nothing_written``.
+        """
         runtime = manager.create_team(
             _make_team_card(), metadata=AcmeCaseMetadata(tenant="acme", channel="email")
         )
+        before = event_store.load_team(runtime.id)
+        assert before is not None
+        snapshot = before.model_dump()
+        writes_before = event_store.save_team_calls
+        pushes = record_orchestrator_metadata_writes(monkeypatch)
 
-        manager.update_team_metadata(runtime.id, None)
+        with pytest.raises(ValidationError):
+            manager.update_team_metadata(runtime.id, None)
+
+        after = event_store.load_team(runtime.id)
+        assert after is not None
+        assert after.model_dump() == snapshot
+        assert event_store.save_team_calls == writes_before
+        assert pushes == []
+
+    def test_none_on_an_untyped_team_stores_none(
+        self, manager: TeamManager, event_store: CountingEventStore
+    ) -> None:
+        """On an untyped team None is the only legal value, and it stores None."""
+        runtime = manager.create_team(_make_team_card(metadata_type=None))
+
+        result = manager.update_team_metadata(runtime.id, None)
 
         stored = event_store.load_team(runtime.id)
         assert stored is not None
         assert stored.metadata is None
         assert stored.metadata_indexes == []
+        assert result == stored
 
     def test_writes_exactly_once(
         self, manager: TeamManager, event_store: CountingEventStore
@@ -807,13 +894,32 @@ class TestResumeRepopulatesOrchestrator:
         assert after.metadata_indexes == ["tenant|acme", "channel|voice", "case_ref|c-9"]
         assert after.status == TeamStatus.RUNNING
 
-    def test_resume_without_metadata_leaves_the_orchestrator_empty(
-        self, manager: TeamManager, actor_system: ActorSystem
+    def test_a_typed_record_persisted_without_metadata_still_resumes(
+        self,
+        manager: TeamManager,
+        event_store: CountingEventStore,
+        actor_system: ActorSystem,
     ) -> None:
-        """AC 3: a team that carries no metadata resumes with none, and no error."""
-        runtime = manager.create_team(_make_team_card())
+        """The typed-metadata presence rule is write-path only.
+
+        A record persisted with ``metadata=None`` on a typed card whose type has a
+        required field (written before that rule existed) resumes without
+        raising. Resume neither re-validates nor backfills: the orchestrator
+        carries no metadata and the stored record keeps ``None``.
+        """
+        runtime = manager.create_team(
+            _make_team_card(), metadata=AcmeCaseMetadata(tenant="acme", channel="email")
+        )
         manager.stop_team(runtime.id)
+        stopped = event_store.load_team(runtime.id)
+        assert stopped is not None
+        event_store.save_team(stopped.model_copy(update={"metadata": None, "metadata_indexes": []}))
 
         resumed_runtime = manager.resume_team(runtime.id)
 
         assert _read_orchestrator_metadata(actor_system, resumed_runtime) is None
+        after = event_store.load_team(runtime.id)
+        assert after is not None
+        assert after.metadata is None
+        assert after.metadata_indexes == []
+        assert after.status == TeamStatus.RUNNING

@@ -86,36 +86,39 @@ class TeamManager:
         The single validation site for both write paths, so create and update can
         never diverge on what a team's metadata is allowed to be (ADR-24 §D7).
 
-        ``None`` is always accepted, including on a team that declares a type:
-        metadata is optional, and a declared type constrains its shape, not its
-        presence.
+        A declared type governs presence as well as shape (ADR-24 §D9): an absent
+        value validates as the empty document, so the type's defaults land and its
+        required fields are enforced. On an untyped card ``None`` is the only
+        legal value.
 
         Args:
             metadata_type: The declared contract, or ``None``. Create reads it
                 off the incoming ``TeamCard``; update reads it off the persisted
                 ``Process`` — the type declared at creation, never an argument,
                 so it cannot change for a live team.
-            metadata: The candidate value, or ``None``.
+            metadata: The candidate value, or ``None`` for "no value supplied".
             team_name: The team's name, for the error message only.
 
         Returns:
-            The validated value as an instance of the declared type, or ``None``.
+            An instance of the declared type whenever one is declared; ``None``
+            only for an untyped card.
 
         Raises:
             ValueError: If a value is supplied but the team declares no
                 ``metadata_type``.
-            pydantic.ValidationError: If the value does not validate against the
-                declared type — propagates unchanged.
+            pydantic.ValidationError: If the value — or, when absent, the empty
+                document — does not validate against the declared type, e.g. a
+                required field has no value. Propagates unchanged.
         """
-        if metadata is None:
-            return None
         if metadata_type is None:
-            msg = (
-                f"Team card '{team_name}' declares no metadata_type; "
-                f"metadata cannot be supplied"
-            )
-            raise ValueError(msg)
-        return metadata_type.model_validate(metadata)
+            if metadata is not None:
+                msg = (
+                    f"Team card '{team_name}' declares no metadata_type; "
+                    f"metadata cannot be supplied"
+                )
+                raise ValueError(msg)
+            return None
+        return metadata_type.model_validate(metadata if metadata is not None else {})
 
     def _push_metadata(
         self,
@@ -181,8 +184,11 @@ class TeamManager:
                 namespace this team was instantiated from. Stored verbatim on
                 the persisted ``Process``; ``akgentic-team`` does not interpret
                 it. Consumers read it back via ``get_team(team_id)``.
-            metadata: Optional business metadata, an instance of the card's
-                declared ``metadata_type``. Validated FIRST, before any actor is
+            metadata: Business metadata, an instance of the card's declared
+                ``metadata_type``. On a typed card, omitting it yields an
+                instance built from the type's defaults, or a
+                ``ValidationError`` if the type has a required field; on an
+                untyped card it must stay ``None``. Validated FIRST, before any actor is
                 started or any ``Process`` written, so a rejected value never
                 leaves a half-created team behind. Then handed to
                 ``TeamFactory.build``, which sets it on the orchestrator before
@@ -198,7 +204,8 @@ class TeamManager:
             ValueError: If the TeamCard is invalid (e.g. entry_point headcount != 1),
                 or if ``metadata`` is supplied for a card declaring no ``metadata_type``.
             pydantic.ValidationError: If ``metadata`` does not validate against the
-                card's declared ``metadata_type``.
+                card's declared ``metadata_type``, including when it is omitted and
+                the type has a required field. Nothing is created.
             Exception: Any exception from TeamFactory.build propagates unchanged.
         """
         # Validate before anything is built or written — no half-created team.
@@ -533,7 +540,9 @@ class TeamManager:
 
         **Replace, never merge.** ``metadata`` is a complete document that must
         validate on its own; a field set before and absent now is gone from both
-        the stored value and its index. ``None`` clears the metadata entirely.
+        the stored value and its index. On a typed team ``None`` resets every
+        field to its default (rejected if a field is required); on an untyped team
+        ``None`` is the only legal value and stores ``None``.
 
         The value is validated against the ``metadata_type`` the ``TeamCard``
         declared at creation — read off the persisted ``Process``, so the type
@@ -541,7 +550,8 @@ class TeamManager:
 
         Args:
             team_id: The team whose metadata is being replaced.
-            metadata: The complete new value, or ``None`` to clear it.
+            metadata: The complete new value, or ``None`` — the type's defaults
+                on a typed team, no metadata on an untyped one.
 
         Returns:
             The persisted ``Process``, carrying the new value and its index.
@@ -549,8 +559,9 @@ class TeamManager:
         Raises:
             ValueError: If the team is not found, has been deleted, or the card
                 declares no ``metadata_type`` while a value is supplied.
-            pydantic.ValidationError: If the value does not validate against the
-                declared ``metadata_type``. Nothing is written in either case.
+            pydantic.ValidationError: If the value — or, when ``None``, the empty
+                document — does not validate against the declared
+                ``metadata_type``. Nothing is written in either case.
         """
         process = self._event_store.load_team(team_id)
         if process is None:
