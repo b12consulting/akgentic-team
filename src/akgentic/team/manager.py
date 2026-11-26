@@ -188,8 +188,8 @@ class TeamManager:
                 ``metadata_type``. On a typed card, omitting it yields an
                 instance built from the type's defaults, or a
                 ``ValidationError`` if the type has a required field; on an
-                untyped card it must stay ``None``. Validated FIRST, before any actor is
-                started or any ``Process`` written, so a rejected value never
+                untyped card it must stay ``None``. Validated FIRST, before any
+                actor is started or any ``Process`` written, so a rejected value never
                 leaves a half-created team behind. Then handed to
                 ``TeamFactory.build``, which sets it on the orchestrator before
                 spawning any member, and finally persisted alongside its derived

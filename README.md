@@ -749,7 +749,9 @@ process = manager.update_team_metadata(
     SupportCaseMetadata(tenant="acme", case_ref="C-1234", channel="phone"),
 )
 
-manager.update_team_metadata(runtime.id, None)  # resets to the type's defaults
+# None is the empty document: SupportCaseMetadata requires tenant and case_ref,
+# so this raises pydantic.ValidationError and nothing is written
+manager.update_team_metadata(runtime.id, None)
 ```
 
 **Replace, never merge.** The value you pass is the complete document and must

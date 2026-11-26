@@ -2587,6 +2587,11 @@ class TestRestoreRepopulatesMetadata:
         runtime = restorer.restore(process)
 
         assert _read_orchestrator_metadata(actor_system, runtime) is None
+        # No backfill: the stored record still carries no metadata and no index.
+        stored = event_store.load_team(team_id)
+        assert stored is not None
+        assert stored.metadata is None
+        assert stored.metadata_indexes == []
 
     def test_metadata_restored_with_an_empty_snapshot_store(
         self,
