@@ -2566,6 +2566,33 @@ class TestRestoreRepopulatesMetadata:
         assert _read_orchestrator_metadata(actor_system, runtime) is None
         assert runtime.addrs["lead"].is_alive()
 
+    def test_typed_record_without_metadata_restores_without_validation(
+        self,
+        actor_system: ActorSystem,
+        event_store: InMemoryEventStore,
+    ) -> None:
+        """A typed card persisted with no metadata still restores.
+
+        The typed-metadata presence rule binds the write paths only: restore reads
+        the ``Process`` and never re-validates it, so a record written before the
+        rule -- ``metadata=None`` although the type has required fields -- loads.
+        """
+        tc = _make_team_card()
+        tc.metadata_type = AcmeSupportMetadata
+        team_id, process = _populate_stopped_team(event_store, tc)
+        assert process.metadata is None
+        assert process.metadata_type is AcmeSupportMetadata
+
+        restorer = TeamRestorer(actor_system, event_store)
+        runtime = restorer.restore(process)
+
+        assert _read_orchestrator_metadata(actor_system, runtime) is None
+        # No backfill: the stored record still carries no metadata and no index.
+        stored = event_store.load_team(team_id)
+        assert stored is not None
+        assert stored.metadata is None
+        assert stored.metadata_indexes == []
+
     def test_metadata_restored_with_an_empty_snapshot_store(
         self,
         actor_system: ActorSystem,

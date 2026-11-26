@@ -726,6 +726,12 @@ team_card = TeamCard(
 metadata rather than ignoring it: supplying a value raises `ValueError`, so a
 value can never be silently dropped.
 
+A card that **does** declare a type always carries an instance of it. Omitting
+the value at creation validates the empty document: an all-defaults type is
+built from its defaults (and its indexed defaults land in the index, so the
+team is findable by them), while a type with a required field raises
+`pydantic.ValidationError` and nothing is created.
+
 ### Setting and updating the value
 
 Pass the value at creation, and replace it afterwards through
@@ -743,12 +749,17 @@ process = manager.update_team_metadata(
     SupportCaseMetadata(tenant="acme", case_ref="C-1234", channel="phone"),
 )
 
-manager.update_team_metadata(runtime.id, None)  # clears the metadata entirely
+# None is the empty document: SupportCaseMetadata requires tenant and case_ref,
+# so this raises pydantic.ValidationError and nothing is written
+manager.update_team_metadata(runtime.id, None)
 ```
 
 **Replace, never merge.** The value you pass is the complete document and must
 validate on its own; a field that was set before and is absent now is gone from
-both the stored value and its index. `None` clears the metadata.
+both the stored value and its index. On a typed card, `None` is the empty
+document: it resets every field to its default, or raises
+`pydantic.ValidationError` when a field is required. Only an untyped card can
+hold no metadata, and there `None` is the only legal value.
 
 The value is validated against the `metadata_type` the card declared *at
 creation* — read back off the persisted team — so `metadata_type` cannot be
